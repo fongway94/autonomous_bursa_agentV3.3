@@ -209,3 +209,352 @@ def get_scan_window(last_scan_iso: Optional[str]) -> tuple[date, date]:
 #   - process_corporate_actions(actions) -> dict with summary stats
 #       (calls trading_engine.apply_split_to_trade for each affected position)
 # ---------------------------------------------------------------------------
+
+
+
+# ===========================================================================
+# Phase 2 — Detection layer
+# ===========================================================================
+#
+# Two backends, same output:
+#   1. Moomoo OpenD via request_rehab() — preferred when available
+#   2. yfinance — fallback (always available, works on Streamlit Cloud)
+#
+# Both share the data_provider port-pre-check / sticky-demote pattern: if
+# Moomoo OpenD isn't reachable (no listener on 11111), we don't even try
+# the SDK call. After MAX_CONSECUTIVE_MOOMOO_FAILURES consecutive failures
+# we permanently fall back to yfinance for the rest of the process.
+# ---------------------------------------------------------------------------
+
+import threading
+from typing import Optional
+
+try:
+    from logger import get_logger
+    _log = get_logger("corporate_actions")
+except Exception:  # pragma: no cover
+    import logging
+    _log = logging.getLogger("corporate_actions")
+
+
+# State for the sticky-demote pattern (mirrors data_provider.py).
+_moomoo_lock = threading.Lock()
+_moomoo_state: dict = {
+    "available": None,        # None = not probed; True/False = probed
+    "consecutive_failures": 0,
+    "init_error": None,
+}
+MAX_CONSECUTIVE_MOOMOO_FAILURES = 3
+
+
+# ---------------------------------------------------------------------------
+# Moomoo path
+# ---------------------------------------------------------------------------
+
+def _moomoo_available() -> bool:
+    """Cheap probe: is the data_provider's Moomoo path live?
+
+    We piggyback on data_provider's port-pre-check + connection state so we
+    don't double-probe OpenD or spawn duplicate retry threads."""
+    with _moomoo_lock:
+        cached = _moomoo_state["available"]
+        if cached is not None:
+            return cached
+        try:
+            import data_provider as _dp
+            _dp.ensure_probed()
+            cached = bool(_dp._moomoo_available)
+            _moomoo_state["available"] = cached
+            if not cached:
+                _moomoo_state["init_error"] = _dp._init_error
+            return cached
+        except Exception as e:
+            _moomoo_state["available"] = False
+            _moomoo_state["init_error"] = f"data_provider probe failed: {e}"
+            return False
+
+
+def _moomoo_demote(reason: str) -> None:
+    with _moomoo_lock:
+        _moomoo_state["consecutive_failures"] += 1
+        n = _moomoo_state["consecutive_failures"]
+    _log.warning("corporate_actions: Moomoo failed (%s) [%d/%d]",
+                 reason, n, MAX_CONSECUTIVE_MOOMOO_FAILURES)
+    if n >= MAX_CONSECUTIVE_MOOMOO_FAILURES:
+        with _moomoo_lock:
+            _moomoo_state["available"] = False
+            _moomoo_state["init_error"] = f"demoted: {reason}"
+        _log.warning("corporate_actions: Moomoo demoted — using yfinance for rest of process")
+
+
+def _moomoo_success() -> None:
+    with _moomoo_lock:
+        if _moomoo_state["consecutive_failures"] > 0:
+            _moomoo_state["consecutive_failures"] = 0
+
+
+def _to_moomoo_code(ticker: str) -> Optional[str]:
+    """0166.KL → MY.0166 (mirrors data_provider._to_moomoo_code)."""
+    if not ticker:
+        return None
+    t = ticker.strip().upper()
+    if t.endswith(".KL"):
+        return f"MY.{t[:-3]}"
+    return None  # Non-Bursa: skip Moomoo, use yfinance
+
+
+def _detect_moomoo(ticker: str,
+                   start: date,
+                   end: date,
+                   timeout: float = 10.0) -> Optional[list[CorporateAction]]:
+    """
+    Returns a list of CorporateActions detected via Moomoo request_rehab.
+    Returns None on failure (caller should fall back to yfinance).
+    Returns [] if Moomoo succeeded but found no events in the window.
+    """
+    code = _to_moomoo_code(ticker)
+    if code is None:
+        return None
+
+    if not _moomoo_available():
+        return None
+
+    # Run the SDK call in a thread with a join timeout (data_provider pattern).
+    result: dict = {"df": None, "err": None}
+
+    def _worker():
+        try:
+            import data_provider as _dp
+            ctx = _dp._quote_ctx
+            if ctx is None:
+                result["err"] = "no quote_ctx"
+                return
+            ret, data = ctx.request_rehab(code)
+            if ret != 0:
+                result["err"] = f"ret={ret} data={data}"
+                return
+            result["df"] = data
+        except Exception as e:
+            result["err"] = repr(e)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=max(1.0, float(timeout)))
+
+    if t.is_alive():
+        _moomoo_demote(f"request_rehab timeout {timeout}s")
+        return None
+    if result["err"]:
+        _moomoo_demote(result["err"])
+        return None
+
+    df = result["df"]
+    if df is None or len(df) == 0:
+        _moomoo_success()
+        return []
+
+    events: list[CorporateAction] = []
+    # Moomoo request_rehab returns columns including:
+    #   ex_div_date, split_ratio, bonus_div_ratio, per_cash_div,
+    #   forward_adj_factorA, forward_adj_factorB
+    # See the protobuf Qot_RequestRehab spec.
+    start_s, end_s = str(start), str(end)
+    for _, row in df.iterrows():
+        try:
+            ex_date = str(row.get("ex_div_date") or row.get("ex_date") or "")[:10]
+            if not ex_date or ex_date < start_s or ex_date > end_s:
+                continue
+
+            split_ratio = float(row.get("split_ratio") or 1.0)
+            bonus_ratio = float(row.get("bonus_div_ratio") or 0.0)
+            cash_div = float(row.get("per_cash_div") or 0.0)
+
+            # Forward split: split_ratio > 1.0 means "1 old → N new"
+            if split_ratio and split_ratio > 1.0001:
+                events.append(CorporateAction(
+                    ticker=ticker, ex_date=ex_date,
+                    event_type="SPLIT", ratio=split_ratio,
+                    source="moomoo", raw=dict(row),
+                ))
+            # Reverse split: split_ratio < 1.0
+            elif split_ratio and split_ratio < 0.9999:
+                events.append(CorporateAction(
+                    ticker=ticker, ex_date=ex_date,
+                    event_type="SPLIT", ratio=split_ratio,
+                    source="moomoo", raw=dict(row),
+                ))
+
+            # Bonus issue: bonus_div_ratio > 0 means "N free new for each held"
+            # We convert to the same ratio convention as SPLIT.
+            # bonus_div_ratio=0.5 means 1 free for every 2 → ratio = 1.5
+            if bonus_ratio and bonus_ratio > 0:
+                events.append(CorporateAction(
+                    ticker=ticker, ex_date=ex_date,
+                    event_type="BONUS", ratio=1.0 + bonus_ratio,
+                    source="moomoo", raw=dict(row),
+                ))
+
+            # Cash dividend
+            if cash_div and cash_div > 0:
+                events.append(CorporateAction(
+                    ticker=ticker, ex_date=ex_date,
+                    event_type="DIVIDEND", amount_per_share=cash_div,
+                    source="moomoo", raw=dict(row),
+                ))
+        except (ValueError, TypeError, KeyError) as e:
+            _log.warning("corporate_actions: skipping malformed Moomoo row for %s: %s",
+                         ticker, e)
+            continue
+
+    _moomoo_success()
+    return events
+
+
+# ---------------------------------------------------------------------------
+# yfinance path (always-available fallback)
+# ---------------------------------------------------------------------------
+
+def _detect_yfinance(ticker: str,
+                     start: date,
+                     end: date,
+                     timeout: float = 15.0) -> list[CorporateAction]:
+    """
+    Returns CorporateActions from yfinance's Stock Splits and Dividends
+    columns. Always returns a list (possibly empty); never returns None.
+    """
+    try:
+        import yfinance as yf
+        # Pull enough history to cover the window. We use period that covers
+        # the window plus a 5-day buffer for safety. For windows > 1y we just
+        # use period='max'.
+        days_window = (end - start).days
+        if days_window <= 30:
+            period = "1mo"
+        elif days_window <= 90:
+            period = "3mo"
+        elif days_window <= 180:
+            period = "6mo"
+        elif days_window <= 365:
+            period = "1y"
+        elif days_window <= 730:
+            period = "2y"
+        else:
+            period = "max"
+
+        df = yf.Ticker(ticker).history(period=period, timeout=timeout)
+    except Exception as e:
+        _log.warning("corporate_actions: yfinance fetch failed for %s: %s", ticker, e)
+        return []
+
+    if df is None or df.empty:
+        return []
+
+    events: list[CorporateAction] = []
+    start_s, end_s = str(start), str(end)
+
+    # Splits column
+    if "Stock Splits" in df.columns:
+        splits = df[df["Stock Splits"] != 0]["Stock Splits"]
+        for ts, ratio in splits.items():
+            ex_date = ts.strftime("%Y-%m-%d")
+            if ex_date < start_s or ex_date > end_s:
+                continue
+            try:
+                events.append(CorporateAction(
+                    ticker=ticker, ex_date=ex_date,
+                    event_type="SPLIT", ratio=float(ratio),
+                    source="yfinance",
+                ))
+            except ValueError as e:
+                _log.warning("corporate_actions: bad split for %s on %s: %s",
+                             ticker, ex_date, e)
+
+    # Dividends column
+    if "Dividends" in df.columns:
+        divs = df[df["Dividends"] > 0]["Dividends"]
+        for ts, amt in divs.items():
+            ex_date = ts.strftime("%Y-%m-%d")
+            if ex_date < start_s or ex_date > end_s:
+                continue
+            try:
+                events.append(CorporateAction(
+                    ticker=ticker, ex_date=ex_date,
+                    event_type="DIVIDEND", amount_per_share=float(amt),
+                    source="yfinance",
+                ))
+            except ValueError as e:
+                _log.warning("corporate_actions: bad dividend for %s on %s: %s",
+                             ticker, ex_date, e)
+
+    return events
+
+
+# ---------------------------------------------------------------------------
+# Public API — provider-agnostic detection with auto-fallback
+# ---------------------------------------------------------------------------
+
+def detect_for_ticker(ticker: str,
+                      start: date,
+                      end: date,
+                      timeout: float = 15.0) -> list[CorporateAction]:
+    """
+    Detect all corporate actions for a single ticker between [start, end].
+
+    Strategy:
+      1. Try Moomoo's request_rehab if available.
+      2. If Moomoo returns None (failure / unreachable), fall back to yfinance.
+      3. If Moomoo returns [] (success, no events), trust it — don't double-check.
+
+    Returns a list of CorporateActions (possibly empty).
+    """
+    moomoo_events = _detect_moomoo(ticker, start, end, timeout=timeout)
+    if moomoo_events is not None:
+        return moomoo_events  # success — even if empty, Moomoo confirmed nothing happened
+    # Moomoo failed for this call (or unavailable) — fall back
+    return _detect_yfinance(ticker, start, end, timeout=timeout)
+
+
+def detect_for_tickers(tickers: list[str],
+                       start: date,
+                       end: date,
+                       timeout_per_ticker: float = 15.0) -> list[CorporateAction]:
+    """
+    Detect corporate actions across multiple tickers. Used by the scheduler
+    to scan all active-trade tickers in one pass.
+
+    Returns the flattened list of all CorporateActions across tickers, in
+    arbitrary order. Caller is responsible for deduplication / sorting.
+    """
+    all_events: list[CorporateAction] = []
+    for t in tickers:
+        try:
+            evs = detect_for_ticker(t, start, end, timeout=timeout_per_ticker)
+            all_events.extend(evs)
+        except Exception as e:
+            # One ticker's failure must not poison the whole scan.
+            _log.warning("corporate_actions: detect_for_ticker(%s) raised: %s", t, e)
+            continue
+    return all_events
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics (for the Settings tab — Phase 5)
+# ---------------------------------------------------------------------------
+
+def detection_health() -> dict:
+    """Snapshot of the Moomoo detection state. Used by the UI."""
+    with _moomoo_lock:
+        return {
+            "moomoo_available": _moomoo_state["available"],
+            "moomoo_consecutive_failures": _moomoo_state["consecutive_failures"],
+            "moomoo_init_error": _moomoo_state["init_error"],
+            "max_consecutive_failures_before_demote": MAX_CONSECUTIVE_MOOMOO_FAILURES,
+        }
+
+
+def reset_detection_state() -> None:
+    """Forget Moomoo probe state. For tests + UI re-probe button."""
+    with _moomoo_lock:
+        _moomoo_state["available"] = None
+        _moomoo_state["consecutive_failures"] = 0
+        _moomoo_state["init_error"] = None
