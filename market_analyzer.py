@@ -16,7 +16,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from data_provider import get_history
 import joblib
 from datetime import datetime, timezone, timedelta
 from sklearn.ensemble import GradientBoostingClassifier
@@ -63,7 +63,7 @@ def _robust_write_json(path, data):
 
 def get_klci_data(period: str = "3mo") -> pd.DataFrame:
     try:
-        df = yf.Ticker(KLCI_TICKER).history(period=period, timeout=15)
+        df = get_history(KLCI_TICKER, period=period, timeout=15)
     except Exception as e:
         log.warning(f"yf KLCI fail: {e}")
         df = pd.DataFrame()
@@ -179,7 +179,7 @@ def calculate_sector_momentum(lookback: int = 20) -> dict:
         rets, rsis = [], []
         for t in tickers[:2]:
             try:
-                df = yf.Ticker(t).history(period="3mo", timeout=10)
+                df = get_history(t, period="3mo", timeout=10)
                 if df is None or df.empty or len(df) < lookback + 5:
                     continue
                 ok, _ = validate_ohlcv(df, t, min_rows=lookback + 5)
@@ -237,7 +237,7 @@ def calculate_relative_strength(ticker: str,
                                 klci_df: pd.DataFrame | None = None,
                                 period: int = 20) -> dict | None:
     try:
-        df = yf.Ticker(ticker).history(period="3mo", timeout=10)
+        df = get_history(ticker, period="3mo", timeout=10)
         if df is None or df.empty or len(df) < period + 5:
             return None
         ok, _ = validate_ohlcv(df, ticker, min_rows=period + 5)
@@ -366,7 +366,7 @@ def train_market_regime_classifier(persist: bool = True):
     rows = []
     for t in tickers:
         try:
-            df = yf.Ticker(t).history(period="3y", timeout=15)
+            df = get_history(t, period="3y", timeout=15)
             if df is None or df.empty or len(df) < 250:
                 continue
             ok, _ = validate_ohlcv(df, t, min_rows=250)
