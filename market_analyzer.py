@@ -307,11 +307,11 @@ def get_full_market_analysis(force_refresh: bool = False) -> dict:
     conv = regime_data["conviction"]
 
     if regime == "BULL":
-        pos_mult, risk_adj, max_pos, thr = 1.0, 1.0, 8, 0.60
+        pos_mult, risk_adj, max_pos, thr = 1.0, 1.0, 8, 0.65
     elif regime == "NEUTRAL":
-        pos_mult, risk_adj, max_pos, thr = 0.75, 0.8, 5, 0.70
+        pos_mult, risk_adj, max_pos, thr = 0.75, 0.8, 5, 0.65
     else:
-        pos_mult, risk_adj, max_pos, thr = 0.50, 0.6, 3, 0.80
+        pos_mult, risk_adj, max_pos, thr = 0.50, 0.6, 3, 0.65
     effective = pos_mult * (0.5 + conv / 100)
 
     hot, cold = [], []
