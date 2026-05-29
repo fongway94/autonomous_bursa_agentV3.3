@@ -4,6 +4,79 @@ Complete changelog from v1 through the current release.
 
 ---
 
+## v3.5 (current)
+
+**Focus:** Corporate-action handling — splits, bonus issues, and cash dividends no longer silently corrupt open trades.
+
+### Why
+Before v3.5 the agent had a silent failure mode: a stock doing a 1-for-5 split mid-position made stored `entry_price` / `stop_loss` / `qty` all wrong relative to the post-split market price. The agent would interpret this as an 80% crash and trigger a stop-loss at the wrong price; the learner would then train on garbage data. Handbook gap #2 (corporate actions handling) is now closed for splits and bonus issues; cash dividends are detected and alerted (full P&L adjustment deferred to v6).
+
+### Changes
+
+**Schema (Phase 1):**
+- `trades.cumulative_split_factor` column (default 1.0) — audit trail for compose-ability of multiple splits on the same trade
+- `corporate_actions_processed` table — idempotency guard with `UNIQUE(ticker, ex_date, event_type)`
+- `scheduler_state.corp_action_autoadjust` (default ON) — Settings toggle for auto-adjustment
+- `scheduler_state.last_corp_action_scan_at` — drives the scan window
+- 3 ALTER TABLE migrations for live DBs (restored from Gist with old schema)
+
+**Detection (Phase 2):** new `corporate_actions.py` module (~830 LOC)
+- `CorporateAction` frozen dataclass with strict validation
+- `_detect_moomoo`: `request_rehab()` via OpenD with port-pre-check, thread-join timeout, sticky-demote after 3 consecutive failures
+- `_detect_yfinance`: `Stock Splits` + `Dividends` columns
+- `detect_for_ticker` / `detect_for_tickers`: provider-agnostic with per-ticker isolation
+- `detection_health` / `reset_detection_state`: UI diagnostics
+- Symmetric with `data_provider.py`'s Moomoo→yfinance pattern
+
+**Adjustment (Phase 3):** new `trading_engine.apply_split_to_trade()` (~200 LOC)
+- Atomic single-transaction adjustment
+- 10 per-share price fields divided by ratio (entry, stop, tp1/2/3, trailing, highest, lowest, exit, risk_per_share)
+- 3 share-count fields multiplied by ratio (shares, shares_remaining, lots)
+- Cost / fee / total_outlay / PnL / pct fields preserved (the cash invariant)
+- `cumulative_split_factor` composes across multiple splits
+- Cash-conservation invariant verified within RM 1.00 or refuses to apply
+- Audit note appended to `trade.notes`
+- Defensive rejection: nonexistent trade, non-ACTIVE status, bad ratio, race condition (closed between SELECT and UPDATE)
+
+**Orchestrator (Phase 4):** `process_corporate_actions()` in `corporate_actions.py`
+- Scans only tickers with active trades (typically 0-8, not all 74) → cheap on data-source quota
+- Events sorted by `ex_date` so multiple splits compose in chronological order
+- Per-event failure isolation: one bad split doesn't abort the batch
+- Best-effort Telegram + Email alerts via `notifier.dispatch`
+- `scheduler._run_one_cycle` calls it as Step 0 (before regime/scan/settle) via the new `_run_corporate_actions_step` helper, so stop-loss math uses post-split prices on the same cycle
+
+**UI (Phase 5):** `app.py`
+- Settings tab → 🏢 Corporate Actions panel: auto-adjust toggle, last-scan timestamp, detection-health expander, manual "Scan now" button
+- Logs tab → new 🏢 Corporate Actions sub-tab: audit trail of `corporate_actions_processed` + CORP_ACTIONS scheduler events, both with CSV download
+
+**Tests:** 113 new tests across 4 test files
+- Phase 1 (data model): 27 tests
+- Phase 2 (detection): 33 tests
+- Phase 3 (adjustment, the riskiest phase): 29 tests including 7 parameterized cash-invariant cases
+- Phase 4 (orchestrator): 13 tests
+- Phase 6 (end-to-end via real scheduler): 11 tests
+- conftest.py updated to truncate `corporate_actions_processed` and reset the new scheduler_state columns between tests
+
+**Refactor (during Phase 7):** extracted the inline corp-actions block in `scheduler._run_one_cycle` into a `_run_corporate_actions_step` helper. Removed dead imports.
+
+### Test count: **329 passing in ~41 seconds** (was 216 → +113)
+
+### Settings defaults (live)
+- `corp_action_autoadjust`: ON (set via Phase 1 schema default)
+- Scan-window initial lookback: 7 days
+- Sticky-demote threshold (Moomoo): 3 consecutive failures
+- Cash-invariant tolerance: RM 1.00
+
+### Bugs fixed during this release
+- conftest test-isolation: `corp_action_autoadjust` and `last_corp_action_scan_at` weren't being reset between tests, causing state leak between test classes. Caught by Phase 6 integration tests.
+
+### Known gaps for v6 (corporate actions)
+- Dividend P&L credit is deferred (alert-only in v3.5)
+- Rights issues are not handled (detected but treated as no-op)
+- Historical trades closed before v3.5 are NOT retroactively split-adjusted (would require destructive backfill; current learner copes with stale priors via fading)
+
+---
+
 ## v3.4 (current)
 
 **Focus:** Pluggable data-source abstraction with Moomoo OpenD ↔ yfinance auto-fallback.
