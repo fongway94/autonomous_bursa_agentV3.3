@@ -113,8 +113,14 @@ def _next_run_at(interval_sec: int) -> datetime:
 
 
 def _is_market_hours() -> bool:
-    tw = check_trading_time_window()
-    return tw["allowed"]
+    """
+    True when the exchange is open for trading (scans + exits should run).
+    Uses is_market_open() from market_calendar — NOT check_trading_time_window(),
+    which also blocks on the safe-entry window (16:00+). The safe-entry check
+    is applied separately inside _run_one_cycle for new entries only.
+    """
+    from market_calendar import is_market_open
+    return is_market_open()
 
 
 def _explain_cycle_outcome(summary: dict, df, regime: dict,
