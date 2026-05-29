@@ -193,7 +193,7 @@ def _explain_cycle_outcome(summary: dict, df, regime: dict,
 
         return (f"{len(gold_buys_all)} GOLD BUY signal(s) found, but the "
                 f"highest confidence was {best_conf:.0f}/100 — below the "
-                f"{regime_name} regime threshold of {threshold:.0f}. "
+                f"signal threshold of {threshold:.0f}. "
                 f"Agent stays defensive.{trend_note}")
 
     # 5. Position cap
@@ -391,7 +391,11 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
                 except Exception:
                     pass
                 continue
-            sized_shares = int(target_shares * risk_check["size_multiplier"])
+            # Apply regime position-size multiplier (BEAR=0.5, NEUTRAL=0.75, BULL=1.0)
+            regime_size_mult = regime.get("position_rules", {}).get(
+                "position_size_mult", 1.0)
+            sized_shares = int(target_shares * risk_check["size_multiplier"]
+                               * regime_size_mult)
             sized_shares = (sized_shares // 100) * 100
             if sized_shares < 100:
                 continue
