@@ -16,7 +16,7 @@ Fixes vs v1
 
 import pandas as pd
 import numpy as np
-import yfinance as yf
+from data_provider import get_history
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from watchlist import get_all_tickers, get_ticker_sector, get_ticker_name
@@ -140,7 +140,7 @@ def get_recent_5day_analysis(df: pd.DataFrame, params: dict) -> list[dict]:
 def fetch_and_calculate(ticker: str, params: dict):
     """Fetch 1y of daily bars, validate, compute indicators."""
     try:
-        df = yf.Ticker(ticker).history(period="1y", timeout=15)
+        df = get_history(ticker, period="1y", timeout=15)
     except Exception as e:
         log.warning(f"fetch failure {ticker}: {e}")
         return ticker, None
