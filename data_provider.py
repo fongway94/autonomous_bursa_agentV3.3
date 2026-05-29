@@ -436,6 +436,17 @@ def provider_name() -> str:
     return _last_served_by
 
 
+def ensure_probed() -> None:
+    """
+    Public alias for the internal probe. Safe to call from UI code (e.g.
+    the Settings tab Data Source panel) to make sure `health()` and
+    `provider_name()` report the actually-active provider rather than "auto".
+
+    No-op if a probe has already happened in this process.
+    """
+    _ensure_provider_decided()
+
+
 def health() -> dict:
     """Diagnostic snapshot for the Settings tab."""
     return {
