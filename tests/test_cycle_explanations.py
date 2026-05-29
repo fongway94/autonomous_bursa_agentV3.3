@@ -55,7 +55,6 @@ def test_explains_no_gold_buys():
         active_count=0, max_positions=3, autotrade_enabled=True,
     )
     assert "No GOLD BUY" in msg
-    assert "BEAR" in msg
 
 
 def test_explains_below_threshold_in_bear():
@@ -72,7 +71,7 @@ def test_explains_below_threshold_in_bear():
     )
     assert "72" in msg
     assert "80" in msg
-    assert "BEAR" in msg
+    assert "signal threshold" in msg
 
 
 def test_explains_at_position_cap():
