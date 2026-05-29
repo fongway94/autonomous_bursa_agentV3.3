@@ -4,6 +4,44 @@ Complete changelog from v1 through the current release.
 
 ---
 
+## v3.4 (current)
+
+**Focus:** Pluggable data-source abstraction with Moomoo OpenD ↔ yfinance auto-fallback.
+
+### Why
+The agent was hard-wired to yfinance — a single point of failure (handbook gap #1). A yfinance outage made the scanner go blind, and there was no path to real-time data when running the agent locally with Moomoo Desktop. Both problems are solved by routing all OHLCV fetches through a single `data_provider` abstraction.
+
+### Changes
+- **NEW: `data_provider.py`** (~470 LOC) — unified market-data provider with:
+  - Auto-detection of Moomoo OpenD on `127.0.0.1:11111`, sticky fallback to yfinance
+  - **Raw TCP port pre-check** before instantiating `OpenQuoteContext` (prevents the moomoo SDK's internal reconnect-thread from spamming `ECONNREFUSED` on environments without OpenD — e.g. Streamlit Cloud)
+  - Per-call fallback on Moomoo exceptions, sticky demotion after 5 consecutive failures
+  - Thread-join timeout wraps the SDK's `request_history_kline` (the SDK has no native `timeout=` — honors handbook rule #15)
+  - Internal ticker conversion: `0166.KL ↔ MY.0166`, `^KLSE → MY.800000`
+  - Output shape is byte-compatible with yfinance (`Open/High/Low/Close/Volume`, tz-aware `DatetimeIndex` named `Date`) — existing `data_quality.validate_ohlcv` and all indicator code work unmodified
+  - Env override: `BURSA_DATA_PROVIDER=yfinance|moomoo|auto` (default `auto`)
+  - Public API: `get_history()`, `provider_name()`, `health()`, `reset()`, `ensure_probed()`
+- **`screener.py`** — `yf.Ticker(t).history()` → `get_history(t)` (1 call site)
+- **`market_analyzer.py`** — same swap (4 call sites)
+- **`scheduler.py`** — user-facing error strings now say "data-source outage" instead of "yfinance outage" (provider-agnostic)
+- **`app.py`** — new **📡 Data Source** panel in Settings tab: shows active provider, full health dict, and a re-probe button
+- **`requirements.txt`** — added `moomoo-api>=8.0.0` as optional dep (auto-fallback handles missing or unreachable cleanly)
+- **`evaluation.py` + `learner.py` deliberately untouched** — they pull 3y histories which may exceed Moomoo's history quota; staying on yfinance is the conservative choice
+
+### Architecture impact
+- Same code now runs in 3 environments:
+  - **Streamlit Cloud** → port pre-check fails → yfinance (identical to v3.3 behaviour)
+  - **Local PC, no Moomoo Desktop** → port pre-check fails → yfinance
+  - **Local PC, Moomoo Desktop + OpenD running** → real-time Moomoo data, auto-detected
+- Zero behavioural change on Streamlit Cloud — paper trading, learning, scanning all run exactly as before
+
+### Test count: **216 passing** (was 191; +25 new tests in `test_data_provider.py`)
+
+### Bugs fixed during this release
+- **moomoo SDK reconnect-loop spam (v3.4 hotfix)** — discovered on first Streamlit Cloud deploy: the SDK's `OpenQuoteContext()` constructor spawns a background reconnect thread that cannot be cleanly killed and spams `ECONNREFUSED` once per second forever on environments without OpenD. Fixed by pre-checking the TCP port with a raw socket probe; only construct the context if the port is open. Regression test `TestPortPreCheck::test_port_closed_skips_opend_construction` guards this (uses a fake `OpenQuoteContext` that throws if constructed).
+
+---
+
 ## v3.3 (current)
 
 **Focus:** Code cleanup, system audit, unused import sweep.
