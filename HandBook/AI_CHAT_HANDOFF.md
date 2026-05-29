@@ -16,11 +16,11 @@ I'm building an autonomous AI swing-trading agent for Bursa Malaysia (KLSE). The
 - When making changes, output the **complete file** for direct copy-paste to GitHub (no diffs)
 - **Question infrastructure assumptions early** — for long-running systems, ask "what kills the data?" and "what kills the loop?" before adding features
 
-### Project: BursaAI Swing Agent v3.4
+### Project: BursaAI Swing Agent v3.5
 
 **Mission:** Autonomous paper-trading agent that scans ~74 Bursa stocks hourly, picks GOLD BUY breakout/pullback setups, manages exits via SL/TP/trailing stops, and sends Telegram alerts so I can mirror trades in Moomoo manually. Self-learns from outcomes via Bayesian posteriors. Designed to run **indefinitely** with growing memory.
 
-**Status:** Live on Streamlit Cloud, **216 tests passing in ~40 s**, **~9,646 LOC** across **20 Python modules**.
+**Status:** Live on Streamlit Cloud, **329 tests passing in ~41 s**, **~11,214 LOC** across **22 Python modules**.
 
 **Repo location:** GitHub (https://github.com/fongway94/autonomous_bursa_agentV3.1)
 
@@ -62,6 +62,7 @@ notifier → Telegram + Email (when live_trigger fires)
 16. **Simplified scheduler lifecycle (v3.2)** — `start()` orphans all stale threads and spawns fresh. No ADOPT_THREAD path. `stop()` does NOT set `kill_switch` (only `engage_kill_switch()` does). `ensure_started()` is just `if not is_running(): start()`.
 17. **Gist backup** is critical — `persistence.py` backs up the whole DB to a private GitHub Gist. Without `GITHUB_TOKEN`, the brain wipes on every container reset.
 18. **All 21 tables created by `init_db()`** — including `risk_params` (moved from lazy creation in v3.3).
+19. **Corporate actions auto-adjust trades atomically** (v3.5) — splits/bonus mutate qty×ratio + prices÷ratio in a single SQLite transaction; cash-conservation invariant verified within RM 1.00 or rolled back. `corporate_actions_processed` table guarantees idempotency via UNIQUE(ticker, ex_date, event_type). Detection symmetric with `data_provider`: Moomoo `request_rehab` preferred, yfinance Stock Splits / Dividends fallback. Toggle via `scheduler_state.corp_action_autoadjust` (default ON).
 
 ### Defaults (live)
 
@@ -100,6 +101,8 @@ notifier → Telegram + Email (when live_trigger fires)
 | `live_trigger.py` | Filter+dedup+format trade events into alerts |
 | `broker_adapter.py` | Moomoo stub (v4-ready) |
 | `data_provider.py` | Pluggable market-data provider — Moomoo OpenD ↔ yfinance auto-fallback (v3.4) |
+| `corporate_actions.py` | Split / bonus / dividend detection + atomic trade adjustment (v3.5) |
+| `verify_moomoo.py` | Standalone diagnostic for local Moomoo OpenD setup (v3.4) |
 | `persistence.py` | Gist-backed DB backup + restore |
 | `maintenance_reminders.py` | Holiday/PAT/WFO renewal reminders |
 
@@ -107,6 +110,7 @@ notifier → Telegram + Email (when live_trigger fires)
 
 - Hourly scanning during Bursa sessions (09:00-12:30, 14:30-17:00)
 - **Pluggable data source** (v3.4): Moomoo OpenD auto-detect → yfinance fallback. Same code runs on Streamlit Cloud (yfinance) and local PC (Moomoo real-time).
+- **Corporate-actions handling** (v3.5): splits and bonus issues auto-adjust open positions atomically before each cycle's signal scan; cash dividends alerted to Telegram + Email; idempotent across cycles.
 - Lunch break + public holiday awareness
 - Auto-exit on SL/TP3/trailing/time
 - Bayesian state-prior updates on every closed trade
@@ -115,10 +119,11 @@ notifier → Telegram + Email (when live_trigger fires)
 - BEAR regime defensive behaviour
 - Scheduler self-recovers from stuck loops within 10 min via watchdog
 - Start/Stop/Force Restart always works (v3.2 fix)
-- All 216 tests pass
+- All 329 tests pass
 
-### Recent changes (v3.2 → v3.4)
+### Recent changes (v3.2 → v3.5)
 
+- v3.5: NEW `corporate_actions.py` — splits/bonus/dividend detection (Moomoo `request_rehab` + yfinance fallback) with atomic `trading_engine.apply_split_to_trade`. Scheduler runs corp-actions BEFORE regime/scan/settle on every cycle. Cash-conservation invariant verified within RM 1.00. 113 new tests including 7 parameterized cash-invariant cases and 11 end-to-end integration tests via real scheduler. Settings tab toggle + Logs tab audit trail.
 - v3.4: NEW `data_provider.py` — Moomoo OpenD ↔ yfinance auto-fallback abstraction. `screener.py`, `market_analyzer.py`, `scheduler.py`, `app.py` migrated. Raw TCP port pre-check prevents moomoo SDK reconnect-thread spam on Streamlit Cloud. Added 📡 Data Source panel in Settings tab. 25 new tests.
 - v3.3: Unused import cleanup (9 imports across 8 modules), `risk_params` added to schema, `screener.py` `fut.result(timeout=30)`, `db.executemany()` removed
 - v3.2: Scheduler lifecycle refactor — removed ADOPT_THREAD, simplified start/stop/ensure_started, separated kill_switch from stop()
@@ -127,6 +132,7 @@ notifier → Telegram + Email (when live_trigger fires)
 
 ### Known gaps (deliberately deferred)
 - ~~Single data source (yfinance)~~ → **solved in v3.4**: pluggable via `data_provider.py`. (Adding Stooq as a 2nd free fallback for full redundancy is still open.)
+- ~~No corporate actions handling~~ → **partially solved in v3.5**: splits/bonus auto-adjusted, cash dividends alerted. Full dividend P&L credit and rights issues deferred to v6.
 - No corporate actions handling (splits/bonuses)
 - Slippage is heuristic, not real fills
 - Moomoo broker adapter is stubbed
@@ -155,10 +161,11 @@ app.py, scheduler.py, screener.py, trading_engine.py, risk_manager.py,
 learner.py, market_analyzer.py, market_calendar.py, evaluation.py,
 data_quality.py, repository.py, db.py, logger.py, watchlist.py,
 notifier.py, live_trigger.py, broker_adapter.py, persistence.py,
-maintenance_reminders.py, data_provider.py, ai_parameters.json,
-requirements.txt, .streamlit/config.toml
+maintenance_reminders.py, data_provider.py, corporate_actions.py,
+verify_moomoo.py, ai_parameters.json, requirements.txt,
+.streamlit/config.toml
 
-tests/ (25 test files, 216 tests)
+tests/ (31 test files, 329 tests)
 HandBook/ (PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md)
 SETUP_GUIDE.md, USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, REVISION_HISTORY.md
 ```
