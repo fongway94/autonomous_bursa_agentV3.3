@@ -670,16 +670,16 @@ with tab_portfolio:
     total_active_value = 0.0
     enriched = []
     for t in active:
-        px = price_lookup.get(t["ticker"], {}).get("price", t["entry_price"])
+        live_px = price_lookup.get(t["ticker"], {}).get("price", t["entry_price"])
         shares_r = t.get("shares_remaining") or t.get("shares") or 0
-        mv = px * shares_r
+        mv = live_px * shares_r
         upnl = mv - (t.get("entry_price") * shares_r)
         try:
             d = (get_myt_now().replace(tzinfo=None)
                  - pd.to_datetime(t["logged_at"]).replace(tzinfo=None)).days
         except Exception:
             d = 0
-        enriched.append({**t, "live_price": px, "market_val": mv,
+        enriched.append({**t, "live_price": live_px, "market_val": mv,
                          "unrealized_pnl": upnl, "days_held": d,
                          "shares_remaining": shares_r})
         total_active_value += mv
@@ -748,16 +748,16 @@ with tab_portfolio:
                                   for t in active if t["id"] == i))
         if sel_id:
             t = get_trade(sel_id)
-            px = price_lookup.get(t["ticker"], {}).get("price", t["entry_price"])
+            live_px = price_lookup.get(t["ticker"], {}).get("price", t["entry_price"])
             c1, c2, c3 = st.columns(3)
             if c1.button("✅ Close as WIN", use_container_width=True):
-                ok, msg = execute_full_exit(sel_id, px, reason="Manual",
+                ok, msg = execute_full_exit(sel_id, live_px, reason="Manual",
                                             outcome="WIN", actor="USER")
                 if ok:
                     learn_from_trade_outcome(get_trade(sel_id))
                     st.success(msg); st.rerun()
             if c2.button("❌ Close as LOSS", use_container_width=True):
-                ok, msg = execute_full_exit(sel_id, px, reason="Manual",
+                ok, msg = execute_full_exit(sel_id, live_px, reason="Manual",
                                             outcome="LOSS", actor="USER")
                 if ok:
                     learn_from_trade_outcome(get_trade(sel_id))
@@ -765,7 +765,7 @@ with tab_portfolio:
             half = round_to_lot(t["shares_remaining"] // 2)
             if half > 0 and c3.button(f"½ Partial @ live ({half} sh)",
                                        use_container_width=True):
-                ok, msg = execute_partial_exit(sel_id, "MANUAL_PARTIAL", px, half,
+                ok, msg = execute_partial_exit(sel_id, "MANUAL_PARTIAL", live_px, half,
                                                 reason="Manual partial",
                                                 actor="USER")
                 if ok:
