@@ -1217,7 +1217,8 @@ with tab_logs:
     sub = st.radio("Log type",
                    ["Trade executions", "Robo-Trader scheduler",
                     "Learning & parameter changes",
-                    "Bias updates", "Data quality"],
+                    "Bias updates", "Data quality",
+                    "🏢 Corporate Actions"],
                    horizontal=True)
 
     if sub == "Trade executions":
@@ -1309,6 +1310,51 @@ with tab_logs:
                          height=500)
         else:
             st.caption("✅ No data quality issues recorded.")
+
+    elif sub == "🏢 Corporate Actions":
+        st.markdown("**Recent corporate actions processed** (splits, bonus issues, dividends)")
+        from db import connect as _c
+        with _c(readonly=True) as cc:
+            rows = cc.execute(
+                "SELECT ticker, ex_date, event_type, ratio, amount_per_share, "
+                "source, detected_at, action_taken, affected_trade_ids_json, "
+                "error_message "
+                "FROM corporate_actions_processed "
+                "ORDER BY detected_at DESC LIMIT 200"
+            ).fetchall()
+        if rows:
+            df = pd.DataFrame([dict(r) for r in rows])
+            df["trades"] = df["affected_trade_ids_json"].apply(
+                lambda x: json.loads(x) if x else [])
+            df = df.drop(columns=["affected_trade_ids_json"])
+            st.dataframe(df, hide_index=True, use_container_width=True,
+                         height=500)
+            st.download_button(
+                "⬇️ Download CSV",
+                df.to_csv(index=False).encode(),
+                file_name="corporate_actions.csv",
+            )
+        else:
+            st.caption(
+                "✅ No corporate actions processed yet. "
+                "The agent scans for splits/bonuses/dividends on every cycle "
+                "for all tickers with active positions."
+            )
+
+        st.markdown("---")
+        st.markdown("**Scheduler log filtered to CORP_ACTIONS events**")
+        sch = get_scheduler_log(limit=500)
+        if sch:
+            df_sch = pd.DataFrame(sch)
+            df_sch = df_sch[df_sch["event"].str.startswith("CORP_ACTION")]
+            if not df_sch.empty:
+                df_sch["payload"] = df_sch["payload_json"].apply(
+                    lambda x: json.loads(x) if x else {})
+                df_sch = df_sch.drop(columns=["payload_json"])
+                st.dataframe(df_sch, hide_index=True,
+                             use_container_width=True, height=300)
+            else:
+                st.caption("No CORP_ACTIONS scheduler events yet.")
 
 
 # =========================================================================
@@ -1769,4 +1815,97 @@ with tab_settings:
         "it always serves yfinance. When running this agent on your local PC "
         "with Moomoo Desktop + OpenD on port 11111, real-time data is used "
         "automatically."
+    )
+
+    # -----------------------------------------------------------------
+    # Corporate Actions (v3.5 — auto-handling of splits / bonus / dividends)
+    # -----------------------------------------------------------------
+    st.markdown("### 🏢 Corporate Actions")
+    from corporate_actions import (
+        detection_health as ca_health,
+        reset_detection_state as ca_reset,
+        process_corporate_actions as ca_run,
+    )
+
+    _ca_state = get_scheduler_state()
+    _autoadjust_now = bool(_ca_state.get("corp_action_autoadjust", 1))
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        new_aa = st.checkbox(
+            "✅ Auto-adjust active trades for splits / bonus issues",
+            value=_autoadjust_now,
+            help=(
+                "When ON (default), the scheduler automatically adjusts "
+                "shares × ratio, prices ÷ ratio for any split/bonus event "
+                "detected on a ticker you hold. Cash-conservation invariant "
+                "is preserved within RM 1.00. "
+                "When OFF (shadow mode), the agent only alerts you — you "
+                "must manually adjust trades."
+            ),
+        )
+        if new_aa != _autoadjust_now:
+            update_scheduler_state(corp_action_autoadjust=int(new_aa))
+            st.success(
+                f"Auto-adjust {'enabled ✅' if new_aa else 'disabled ⚠️'}. "
+                "Takes effect on the next cycle."
+            )
+            st.rerun()
+
+    with c2:
+        _last_scan = _ca_state.get("last_corp_action_scan_at")
+        if _last_scan:
+            st.caption(f"📅 Last scan: {_last_scan}")
+        else:
+            st.caption("📅 Last scan: never (will scan on next cycle)")
+
+    # Detection health (Moomoo vs yfinance status)
+    with st.expander("🔍 Detection health (Moomoo vs yfinance)", expanded=False):
+        st.json(ca_health())
+        st.caption(
+            "Detection uses Moomoo OpenD when available, falls back to "
+            "yfinance's Stock Splits / Dividends columns. Both produce the "
+            "same CorporateAction shape — Moomoo is preferred only because "
+            "it's more authoritative for Bursa-specific events."
+        )
+
+    # Manual scan button — useful when you've just opened a new position
+    # and want to check for events that happened before the next hourly cycle.
+    if st.button("🔄 Scan now (manual)"):
+        with st.spinner("Scanning for corporate actions..."):
+            try:
+                summary = ca_run(
+                    autoadjust=_autoadjust_now,
+                    last_scan_iso=_last_scan,
+                    actor="USER_MANUAL",
+                )
+                update_scheduler_state(
+                    last_corp_action_scan_at=get_myt_now().isoformat()
+                )
+                if summary["events_detected"] == 0:
+                    st.success(
+                        f"✅ No corporate actions in window "
+                        f"{summary['scan_window']}. "
+                        f"Scanned {summary['tickers_scanned']} tickers."
+                    )
+                else:
+                    st.success(
+                        f"📊 {summary['events_detected']} events detected: "
+                        f"{summary['splits_adjusted']} adjusted, "
+                        f"{summary['splits_alerted_only']} alerted-only, "
+                        f"{summary['dividends_alerted']} dividends, "
+                        f"{summary['skipped_dupes']} dupes, "
+                        f"{summary['failures']} failures."
+                    )
+                    with st.expander("Details", expanded=True):
+                        st.json(summary["details"])
+            except Exception as e:
+                st.error(f"Manual scan failed: {e}")
+            ca_reset()  # so the detection-health panel re-probes on next view
+
+    st.caption(
+        "💡 The scheduler automatically scans for corporate actions at the "
+        "start of every cycle (before scanning for signals). Only tickers "
+        "with active positions are scanned, so this is cheap on data-source "
+        "quota. See the 📜 Logs tab → 🏢 Corporate Actions for the audit trail."
     )
