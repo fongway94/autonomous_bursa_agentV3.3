@@ -1,0 +1,88 @@
+# .github/workflows/tests.yml
+#
+# Runs the full pytest suite on every push to main and every pull request.
+# v3.5: 329 tests, ~41s on a clean install.
+#
+# Why this exists
+# ---------------
+# The author maintains this repo without a local Python environment — every
+# commit goes straight to GitHub via the web UI, and Streamlit Cloud rebuilds
+# unconditionally. Before this workflow, a missing brace or typo in app.py
+# would only surface when the app failed to load in production.
+#
+# Now: GitHub Actions runs the full suite within ~1-2 min of every push.
+# A red ❌ on the commit means "do not trust this deploy".
+#
+# Behaviour
+# ---------
+# - Single Python version (3.11) to match Streamlit Cloud.
+# - Ubuntu only.
+# - Pip cache keyed on requirements.txt — saves ~90s on unchanged-deps runs.
+# - 10-minute hard timeout (full suite normally finishes in ~1 min).
+# - Runs the same pytest command we run locally: `pytest tests/ -q`.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Manual trigger button in the Actions tab — useful for re-running flaky tests.
+  workflow_dispatch:
+
+# Cancel in-progress runs on the same branch when a new commit lands.
+# Prevents wasted CI minutes if you push twice in quick succession.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python 3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Built-in pip cache, keyed automatically on requirements.txt hash
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Show Python + pip versions
+        run: |
+          python --version
+          pip --version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # moomoo-api may have transient PyPI mirror hiccups — retry once
+          # so a flaky network doesn't kill the run.
+          pip install -r requirements.txt || pip install -r requirements.txt
+
+      - name: Show installed package versions
+        run: pip freeze
+
+      - name: Run pytest
+        run: |
+          pytest tests/ -q --tb=short --durations=10
+
+      # Surface a clear summary at the bottom of the run for at-a-glance review.
+      - name: Test summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ All tests passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Tests FAILED — do not trust this commit's Streamlit Cloud deploy" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
