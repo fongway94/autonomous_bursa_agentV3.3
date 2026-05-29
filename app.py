@@ -60,6 +60,7 @@ from logger import (
     get_parameter_history, get_bias_history, get_data_quality_log,
 )
 from evaluation import full_evaluation_report
+from data_provider import health as data_provider_health, reset as data_provider_reset, provider_name
 import scheduler as sched
 
 from db import get_myt_now
@@ -1731,3 +1732,36 @@ with tab_settings:
                 cc.execute("DELETE FROM scan_cache")
             reset_account(new_cap)
             st.warning("All trades cleared."); st.rerun()
+
+    # -----------------------------------------------------------------
+    # Data Source (read-only diagnostic — added in v3.4)
+    # -----------------------------------------------------------------
+    st.markdown("### 📡 Data Source")
+    _dp_health = data_provider_health()
+    _active = provider_name()
+    _moomoo_ok = bool(_dp_health.get("moomoo_available"))
+
+    cA, cB = st.columns([1, 2])
+    with cA:
+        if _moomoo_ok:
+            st.success(f"Active: **{_active}**  (Moomoo OpenD connected)")
+        elif _active == "yfinance":
+            st.info(f"Active: **yfinance**  (Moomoo OpenD unavailable — fallback)")
+        else:
+            st.info(f"Active: **{_active}**  (auto-detect on first data call)")
+
+    with cB:
+        with st.expander("Details", expanded=False):
+            st.json(_dp_health)
+
+    if st.button("🔄 Re-probe data provider"):
+        data_provider_reset()
+        st.success("Provider state reset. Next data call will re-probe Moomoo OpenD.")
+        st.rerun()
+
+    st.caption(
+        "💡 Streamlit Cloud cannot reach Moomoo OpenD (no desktop app) — "
+        "it always serves yfinance. When running this agent on your local PC "
+        "with Moomoo Desktop + OpenD on port 11111, real-time data is used "
+        "automatically."
+    )
