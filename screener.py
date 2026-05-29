@@ -218,8 +218,6 @@ def analyze_stock_setup(ticker, df, params,
     is_below_trend = close < ema_trend
 
     regime = (market_regime or {}).get("regime_data", {}).get("regime", "NEUTRAL")
-    regime_mult = {"BULL": 1.0, "NEUTRAL": 0.85, "BEAR": 0.6,
-                   "UNCERTAIN": 0.7}.get(regime, 1.0)
 
     rs_rank = rs_signal = rs_ratio = None
     if rs_data and ticker in rs_data:
@@ -315,7 +313,10 @@ def analyze_stock_setup(ticker, df, params,
     if sector in sec_biases:
         bias_adj += (sec_biases[sector] - 1.0) * 10.0
 
-    base_confidence = base_confidence * regime_mult + bias_adj
+    # Confidence is regime-independent (pure signal quality).
+    # Regime risk is handled by position sizing + position cap in
+    # risk_manager and scheduler (not by crushing the score here).
+    base_confidence = base_confidence + bias_adj
     base_confidence = float(np.clip(base_confidence, 5.0, 99.0))
 
     # Stop / TP
