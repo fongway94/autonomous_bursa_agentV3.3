@@ -3,7 +3,7 @@
 **Living reference document.** Update as the project evolves.
 Single source of truth for: architecture decisions, why things were built the way they are, known issues, operational runbooks, and the rationale behind every design choice.
 
-Last updated: 2026-05-29 (v3.3)
+Last updated: 2026-05-29 (v3.4)
 
 ---
 
@@ -45,15 +45,16 @@ Last updated: 2026-05-29 (v3.3)
 
 | | |
 |---|---|
-| **Codebase version** | v3.3 |
-| **Deployment** | Streamlit Cloud (live) |
+| **Codebase version** | v3.4 |
+| **Deployment** | Streamlit Cloud (live, on yfinance) + optional local PC mode (Moomoo OpenD for real-time) |
 | **Database** | SQLite WAL at `~/.bursa_agent_data/bursa_agent.db` |
 | **DB persistence** | **GitHub Gist backup (private)** — survives container resets |
-| **Source LOC** | ~9,065 across **19 Python modules** |
-| **Test count** | **191 passing in ~40 seconds** |
+| **Source LOC** | ~9,646 across **20 Python modules** |
+| **Test count** | **216 passing in ~40 seconds** |
 | **Documentation files** | SETUP_GUIDE.md, USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, REVISION_HISTORY.md, PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md |
 | **Capital (paper)** | RM 20,000 default (user adjustable) |
 | **Brokers supported** | NOOP (notification only), MoomooAdapter stub (v4 ready) |
+| **Data sources** | yfinance (always) + Moomoo OpenD (auto-detect; v3.4) — pluggable via `data_provider.py` |
 
 ---
 
@@ -748,7 +749,7 @@ Each bug has a regression test guarding against its return.
 
 | Gap | Impact | Why deferred |
 |---|---|---|
-| Single data source (yfinance) | Agent blind during outages | User explicitly deferred. Secondary source hook in `market_analyzer._try_secondary_klci()` |
+| ~~Single data source (yfinance)~~ → **partially solved in v3.4** | Now pluggable via `data_provider.py`; real-time Moomoo when OpenD is running locally, yfinance fallback otherwise. Adding a 2nd free provider (e.g. Stooq) for redundancy is still on the v4 list. | — |
 | No corporate actions (splits, bonuses) | ~5% of small caps affected/year | Manual JSON workaround possible |
 | Slippage model is heuristic | Real fills may differ for very thin stocks | Volume-aware version covers most cases |
 | No real broker execution | Notification only | Moomoo adapter stubbed; user wants 6-month validation first |
@@ -759,7 +760,7 @@ Each bug has a regression test guarding against its return.
 
 ### v4 candidates (when user is ready)
 
-1. **Moomoo OpenAPI integration** — fill in `broker_adapter.MoomooAdapter` methods, add `broker_mode = "EXECUTE"` toggle in live_trigger.py
+1. **Moomoo OpenAPI integration** — ✅ *data layer done in v3.4 (`data_provider.py`)*. Still TODO: fill in `broker_adapter.MoomooAdapter` execution methods, add `broker_mode = "EXECUTE"` toggle in live_trigger.py
 2. **Live capital tracking** — separate `live_account` table that records real-broker mirror trades
 3. **Calibration-driven auto-mode-switch** — only enable EXECUTE mode if calibration chart shows <5% deviation
 4. **GitHub Actions CI** — auto-run pytest on every push
