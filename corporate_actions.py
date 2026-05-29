@@ -558,3 +558,299 @@ def reset_detection_state() -> None:
         _moomoo_state["available"] = None
         _moomoo_state["consecutive_failures"] = 0
         _moomoo_state["init_error"] = None
+
+
+
+# ===========================================================================
+# Phase 4 — Orchestrator: process_corporate_actions
+# ===========================================================================
+#
+# Called by the scheduler at the start of each cycle. Pulls active-trade
+# tickers, scans the window since last_corp_action_scan_at for events, and
+# for each event either:
+#   - SPLIT/BONUS  → calls trading_engine.apply_split_to_trade (auto-adjust)
+#   - DIVIDEND     → alert-only (no P&L adjustment in v3.5)
+#
+# All failures are caught per-event so one bad split doesn't abort the
+# whole scan. Each event is recorded in corporate_actions_processed via
+# record_processed() — idempotent if the same event is seen twice.
+# ---------------------------------------------------------------------------
+
+def _get_active_trade_tickers() -> list[str]:
+    """Distinct list of tickers that currently have at least one ACTIVE trade."""
+    from db import connect
+    with connect(readonly=True) as c:
+        rows = c.execute(
+            "SELECT DISTINCT ticker FROM trades WHERE status='ACTIVE'"
+        ).fetchall()
+    return [r["ticker"] for r in rows]
+
+
+def _get_active_trade_ids_for_ticker(ticker: str) -> list[int]:
+    """All active trade ids for a given ticker (could be more than one)."""
+    from db import connect
+    with connect(readonly=True) as c:
+        rows = c.execute(
+            "SELECT id FROM trades WHERE ticker=? AND status='ACTIVE'",
+            (ticker,),
+        ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _send_alert(subject: str, body: str,
+                ticker: Optional[str] = None) -> None:
+    """
+    Best-effort Telegram + Email alert via notifier.dispatch.
+    Honors the user's live_trigger_config channel preferences but is NOT
+    gated by the live_trigger 'enabled' flag — corporate actions are
+    system-event alerts, separate from trade-signal alerts.
+
+    Never raises.
+    """
+    try:
+        from notifier import dispatch
+        from live_trigger import load_config as _load_lt_config
+        cfg = _load_lt_config()
+        channels = {
+            "telegram": bool(cfg.get("telegram_enabled", 1)),
+            "email": bool(cfg.get("email_enabled", 0)),
+            "dashboard": True,
+        }
+        recipients = []
+        if channels["email"]:
+            raw = (cfg.get("email_recipients") or "").strip()
+            recipients = [r.strip() for r in raw.split(",") if r.strip()]
+
+        # Plain-text body for Telegram, simple HTML for email.
+        html_body = body.replace("\n", "<br/>")
+        dispatch(
+            event_type="CORPORATE_ACTION",
+            message_text=f"{subject}\n\n{body}",
+            message_html=f"<h3>{subject}</h3><p>{html_body}</p>",
+            subject=subject,
+            trade_id=None,
+            ticker=ticker,
+            channels=channels,
+            recipients=recipients,
+        )
+    except Exception as e:
+        # Alerts are best-effort. Log but never raise — must not abort
+        # the corporate-action scan because of a notifier glitch.
+        try:
+            _log.warning("corporate_actions: alert dispatch failed: %s", e)
+        except Exception:
+            pass
+
+
+def process_corporate_actions(
+    *,
+    autoadjust: bool = True,
+    last_scan_iso: Optional[str] = None,
+    actor: str = "SCHEDULER",
+) -> dict:
+    """
+    Full cycle: detect events for all active-trade tickers, then apply
+    splits / alert dividends. Returns a summary dict for logging.
+
+    Parameters
+    ----------
+    autoadjust    : if False, splits are detected & alerted but NOT applied.
+                    Useful for shadow-mode rollout (set via Settings toggle).
+    last_scan_iso : ISO timestamp of last successful scan. None → 7-day lookback.
+    actor         : string for audit logs (defaults to 'SCHEDULER').
+
+    Returns
+    -------
+    {
+        "tickers_scanned":   int,
+        "events_detected":   int,
+        "splits_adjusted":   int,
+        "splits_alerted_only": int,   # autoadjust=False or already_processed
+        "dividends_alerted": int,
+        "failures":          int,
+        "skipped_dupes":     int,
+        "details":           list[dict],   # per-event outcome
+        "scan_window":       (start_iso, end_iso),
+    }
+    """
+    from db import myt_iso
+    from datetime import datetime as _dt
+
+    tickers = _get_active_trade_tickers()
+    summary = {
+        "tickers_scanned": len(tickers),
+        "events_detected": 0,
+        "splits_adjusted": 0,
+        "splits_alerted_only": 0,
+        "dividends_alerted": 0,
+        "failures": 0,
+        "skipped_dupes": 0,
+        "details": [],
+        "scan_window": None,
+    }
+
+    if not tickers:
+        # No active trades → nothing to scan. Cheap exit.
+        return summary
+
+    start, end = get_scan_window(last_scan_iso)
+    summary["scan_window"] = (str(start), str(end))
+
+    try:
+        events = detect_for_tickers(tickers, start, end)
+    except Exception as e:
+        _log.error("process_corporate_actions: detect_for_tickers failed: %s", e)
+        return summary
+
+    summary["events_detected"] = len(events)
+
+    # Sort events: oldest first so multiple splits on same trade compose in order.
+    events.sort(key=lambda e: e.ex_date)
+
+    for ev in events:
+        per_event = {
+            "ticker": ev.ticker,
+            "ex_date": ev.ex_date,
+            "event_type": ev.event_type,
+            "ratio": ev.ratio,
+            "amount_per_share": ev.amount_per_share,
+            "source": ev.source,
+            "outcome": None,
+            "trade_ids": [],
+            "error": None,
+        }
+
+        # Idempotency: skip if we already processed this event.
+        if already_processed(ev):
+            per_event["outcome"] = "skipped_already_processed"
+            summary["skipped_dupes"] += 1
+            summary["details"].append(per_event)
+            continue
+
+        trade_ids = _get_active_trade_ids_for_ticker(ev.ticker)
+        per_event["trade_ids"] = trade_ids
+
+        if not trade_ids:
+            # No active position on this ticker — just record & move on.
+            record_processed(ev, action_taken="SKIPPED_NO_POSITION",
+                             affected_trade_ids=[])
+            per_event["outcome"] = "no_active_position"
+            summary["details"].append(per_event)
+            continue
+
+        try:
+            if ev.event_type == "DIVIDEND":
+                # Alert-only — no P&L adjustment in v3.5
+                _send_alert(
+                    subject=f"💰 Bursa dividend: {ev.ticker}",
+                    body=(
+                        f"{ev.describe()}\n"
+                        f"Affected active trades: {trade_ids}\n"
+                        f"Source: {ev.source}\n"
+                        f"v3.5 policy: no automatic P&L adjustment.\n"
+                        f"Mirror this dividend manually in Moomoo if you trade live."
+                    ),
+                )
+                record_processed(ev, action_taken="ALERTED_ONLY",
+                                 affected_trade_ids=trade_ids)
+                per_event["outcome"] = "dividend_alerted"
+                summary["dividends_alerted"] += 1
+
+            elif ev.event_type in ("SPLIT", "BONUS"):
+                if not autoadjust:
+                    # Shadow mode: detect + alert but don't touch trades.
+                    _send_alert(
+                        subject=f"⚠️ {ev.event_type} detected (auto-adjust OFF): {ev.ticker}",
+                        body=(
+                            f"{ev.describe()}\n"
+                            f"Affected active trades: {trade_ids}\n"
+                            f"Source: {ev.source}\n"
+                            f"Auto-adjustment is disabled in Settings — "
+                            f"you must manually adjust these trades."
+                        ),
+                    )
+                    record_processed(ev, action_taken="ALERTED_ONLY",
+                                     affected_trade_ids=trade_ids)
+                    per_event["outcome"] = "alerted_only_autoadjust_off"
+                    summary["splits_alerted_only"] += 1
+
+                else:
+                    # Live adjustment: apply split atomically to each trade.
+                    from trading_engine import apply_split_to_trade
+                    adjusted: list[int] = []
+                    errors: list[str] = []
+                    for tid in trade_ids:
+                        try:
+                            apply_split_to_trade(
+                                tid, ratio=ev.ratio, ex_date=ev.ex_date,
+                                note=f"auto via {ev.source}",
+                            )
+                            adjusted.append(tid)
+                        except Exception as ee:
+                            errors.append(f"trade_id={tid}: {ee}")
+
+                    if errors and not adjusted:
+                        # Total failure: don't mark as processed so next cycle retries.
+                        per_event["outcome"] = "failed"
+                        per_event["error"] = "; ".join(errors)
+                        summary["failures"] += 1
+                        _send_alert(
+                            subject=f"🚨 {ev.event_type} ADJUSTMENT FAILED: {ev.ticker}",
+                            body=(
+                                f"{ev.describe()}\n"
+                                f"All adjustments failed — trades left unchanged.\n"
+                                f"Errors: {per_event['error']}\n"
+                                f"Will retry next cycle. Fix manually if needed."
+                            ),
+                        )
+                    else:
+                        # Partial or full success → record it (won't retry).
+                        # We record even partial success because the failed trades
+                        # are now in an inconsistent state and need manual review.
+                        record_processed(
+                            ev,
+                            action_taken="ADJUSTED",
+                            affected_trade_ids=adjusted,
+                            error_message="; ".join(errors) if errors else None,
+                        )
+                        summary["splits_adjusted"] += 1
+                        per_event["outcome"] = (
+                            "adjusted_partial" if errors else "adjusted"
+                        )
+                        per_event["error"] = "; ".join(errors) if errors else None
+
+                        # Success alert
+                        _send_alert(
+                            subject=f"✅ {ev.event_type} auto-adjusted: {ev.ticker}",
+                            body=(
+                                f"{ev.describe()}\n"
+                                f"Adjusted trades: {adjusted}\n"
+                                f"Source: {ev.source}\n"
+                                + (f"⚠️ Failed: {per_event['error']}\n" if errors else "")
+                                + "Mirror this in Moomoo if you're trading live."
+                            ),
+                        )
+
+        except Exception as e:
+            # Catch-all so one bad event doesn't poison the rest of the batch
+            per_event["outcome"] = "exception"
+            per_event["error"] = repr(e)
+            summary["failures"] += 1
+            _log.error("process_corporate_actions: unhandled error on %s: %s",
+                       ev.describe(), e)
+
+        summary["details"].append(per_event)
+
+    return summary
+
+
+# Public alias for symmetry with scheduler imports
+__all__ = [
+    "CorporateAction", "EventType", "SourceType", "ActionTaken",
+    "INITIAL_LOOKBACK_DAYS", "MAX_CONSECUTIVE_MOOMOO_FAILURES",
+    "already_processed", "record_processed",
+    "get_scan_window",
+    "detect_for_ticker", "detect_for_tickers",
+    "detection_health", "reset_detection_state",
+    "process_corporate_actions",
+]
