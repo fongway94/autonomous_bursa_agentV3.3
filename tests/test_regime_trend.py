@@ -99,7 +99,7 @@ def test_cycle_explanation_includes_trend_in_bear():
     )
 
     # Should include the bad news (below threshold)
-    assert "below the BEAR" in msg
+    assert "below the signal threshold" in msg
     assert "44" in msg
     # Should include the good news (trend weakening)
     assert "conviction" in msg.lower()
