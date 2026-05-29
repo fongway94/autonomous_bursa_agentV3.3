@@ -144,7 +144,7 @@ def _explain_cycle_outcome(summary: dict, df, regime: dict,
 
     # 2. Scan returned nothing
     if df is None or len(df) == 0:
-        return ("Scanner returned 0 results — likely a yfinance data outage. "
+        return ("Scanner returned 0 results — likely a data-source outage. "
                 "Check 📜 Logs → Data Quality.")
 
     # 3. Count GOLD BUYs at all
@@ -448,7 +448,7 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
     elif autotrade:
         log_scheduler_event(
             "AUTO_ENTRY_END",
-            "0 entries — Scanner returned 0 results. Likely yfinance "
+            "0 entries — Scanner returned 0 results. Likely a data-source "
             "outage; check 📜 Logs → Data Quality.",
             payload={"reason": "empty_scan"})
     else:
@@ -512,7 +512,7 @@ def _watchdog_loop(my_pid: int):
                         last_error=(
                             f"Cycle exceeded {WATCHDOG_CYCLE_TIMEOUT_SEC}s "
                             f"(ran {age:.0f}s). Watchdog forced handoff. "
-                            "Likely a yfinance / network hang."
+                            "Likely a data-source / network hang."
                         ),
                     )
                     try:
