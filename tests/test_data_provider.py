@@ -381,6 +381,55 @@ class TestDiagnostics:
         assert dp._moomoo_available is True
         assert dp._quote_ctx is first_ctx  # same ctx, no re-probe
 
+    def test_last_moomoo_error_surfaced_in_health(self, monkeypatch, dp):
+        """
+        v3.6: per-call Moomoo failure reasons (e.g. 'Unsupported quote market')
+        must be visible in health() so users can diagnose without grepping logs.
+        """
+        _install_fake_moomoo(
+            monkeypatch,
+            connect_ok=True,
+            kline_raises=RuntimeError("Unsupported quote market"),
+        )
+        with mock.patch.object(dp.yf, "Ticker") as MockTicker:
+            MockTicker.return_value.history.return_value = _fake_yf_df(5)
+            dp.get_history("0166.KL", period="1y")
+
+        h = dp.health()
+        assert "last_moomoo_error" in h
+        assert h["last_moomoo_error"] is not None
+        assert "Unsupported quote market" in h["last_moomoo_error"]
+        assert h["moomoo_consecutive_failures"] == 1
+
+    def test_last_moomoo_error_cleared_on_success(self, monkeypatch, dp):
+        """A successful Moomoo call must clear the prior error string."""
+        # First a failing ctx
+        _install_fake_moomoo(monkeypatch, connect_ok=True,
+                             kline_raises=RuntimeError("transient hiccup"))
+        with mock.patch.object(dp.yf, "Ticker") as MockTicker:
+            MockTicker.return_value.history.return_value = _fake_yf_df(5)
+            dp.get_history("0166.KL", period="1y")
+        assert dp.health()["last_moomoo_error"] is not None
+
+        # Now swap in a healthy ctx and re-fetch
+        _install_fake_moomoo(monkeypatch, connect_ok=True)
+        dp._quote_ctx = sys.modules["moomoo"].OpenQuoteContext(host="127.0.0.1", port=11111)
+        dp.get_history("0166.KL", period="1y")
+
+        assert dp.health()["last_moomoo_error"] is None
+
+    def test_last_moomoo_error_cleared_on_reset(self, monkeypatch, dp):
+        """reset() must also clear last_moomoo_error."""
+        _install_fake_moomoo(monkeypatch, connect_ok=True,
+                             kline_raises=RuntimeError("Unsupported quote market"))
+        with mock.patch.object(dp.yf, "Ticker") as MockTicker:
+            MockTicker.return_value.history.return_value = _fake_yf_df(5)
+            dp.get_history("0166.KL", period="1y")
+        assert dp.health()["last_moomoo_error"] is not None
+
+        dp.reset()
+        assert dp._last_moomoo_error is None
+
 
 # ---------------------------------------------------------------------------
 # TCP pre-check (prevents moomoo SDK retry-thread spawn on Streamlit Cloud)
