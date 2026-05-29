@@ -50,7 +50,9 @@ def _reset_db_between_tests():
                     "scheduler_log", "learning_events", "parameter_history",
                     "bias_history", "state_priors", "data_quality_log",
                     "scan_cache", "alert_log", "maintenance_state",
-                    "regime_history", "meta", "custom_watchlist"):
+                    "regime_history", "meta", "custom_watchlist",
+                    # v3.5: corporate-action audit trail
+                    "corporate_actions_processed"):
             c.execute(f"DELETE FROM {tbl}")
         # Reset scheduler_state singleton to v3 defaults.
         # v3.1.10: also clears cycle_started_at (added for the watchdog).
