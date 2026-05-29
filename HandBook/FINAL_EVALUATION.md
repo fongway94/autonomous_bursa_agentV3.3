@@ -1,9 +1,9 @@
-# BursaAI Swing Agent v3.1.7 — Final Evaluation Report
+# BursaAI Swing Agent v3.3 — Evaluation Report
 
-**Date:** 2026-05-28
+**Date:** 2026-05-29
 **Reviewer:** Senior SWE + swing-trader perspective
-**Codebase version evaluated:** v3.1.7
-**Status:** Live on Streamlit Cloud, 145/145 tests passing
+**Codebase version evaluated:** v3.3
+**Status:** Live on Streamlit Cloud, 191/191 tests passing
 
 ---
 
@@ -23,13 +23,13 @@
 
 | Metric | Value | What it indicates |
 |---|---|---|
-| Source LOC | ~8,400 across 19 modules | Mid-size codebase — substantial but not bloated |
-| Test count | **145 passing in ~3.5s** | Strong coverage for critical paths |
-| Test-to-source ratio | ~17 % | Above industry median (10-15 %) |
-| Versions shipped | 7 (v1 → v3.1.7) | Genuine iterative refinement, not "first try shipped" |
-| Bugs caught + fixed | 17 with regression tests each | Disciplined engineering process |
+| Source LOC | ~9,065 across 19 modules | Mid-size codebase — substantial but not bloated |
+| Test count | **191 passing in ~40s** | Strong coverage for critical paths |
+| Test-to-source ratio | ~49 % | Above industry median (10-15 %) |
+| Versions shipped | 10 (v1 → v3.3) | Genuine iterative refinement, not "first try shipped" |
+| Bugs caught + fixed | 23 with regression tests each | Disciplined engineering process |
 | Critical infrastructure failures | 1 (caught + fixed) | The v3.1.5 persistence oversight |
-| Documentation files | 7 (~1,200 LOC of .md) | Heavy documentation discipline |
+| Documentation files | 6 (~1,500 LOC of .md) | Heavy documentation discipline |
 | Streamlit Cloud uptime | Live, self-healing | Production-deployed |
 
 ---
