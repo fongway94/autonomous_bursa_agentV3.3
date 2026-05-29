@@ -338,3 +338,22 @@ class TestDiagnostics:
         dp.reset()
         assert dp._moomoo_available is None
         assert dp._quote_ctx is None
+
+    def test_ensure_probed_triggers_detection(self, monkeypatch, dp):
+        """ensure_probed() must populate _moomoo_available so the UI panel
+        can show the actually-active provider instead of 'auto'."""
+        _uninstall_moomoo(monkeypatch)
+        assert dp._moomoo_available is None  # not probed yet
+        dp.ensure_probed()
+        assert dp._moomoo_available is False  # probed and decided
+
+    def test_ensure_probed_is_idempotent(self, monkeypatch, dp):
+        """Calling ensure_probed() multiple times must not re-probe or change state."""
+        _install_fake_moomoo(monkeypatch, connect_ok=True)
+        dp.ensure_probed()
+        assert dp._moomoo_available is True
+        first_ctx = dp._quote_ctx
+        dp.ensure_probed()
+        dp.ensure_probed()
+        assert dp._moomoo_available is True
+        assert dp._quote_ctx is first_ctx  # same ctx, no re-probe
