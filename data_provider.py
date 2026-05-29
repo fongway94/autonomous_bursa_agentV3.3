@@ -122,12 +122,43 @@ def _to_moomoo_code(ticker: str) -> Optional[str]:
 # Moomoo connection lifecycle
 # ---------------------------------------------------------------------------
 
+def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
+    """
+    Raw TCP probe: is anything listening on host:port?
+
+    We do this *before* instantiating OpenQuoteContext because the moomoo
+    SDK spawns a background reconnect thread in its constructor that will
+    spam ECONNREFUSED forever on environments without OpenD (Streamlit Cloud,
+    VPS without Moomoo Desktop, etc.) — even if we close the context.
+
+    Returns True only if the port accepts a TCP connection within `timeout` s.
+    """
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def _try_init_moomoo() -> bool:
     """
     Probe whether Moomoo OpenD is reachable. Sets module state.
 
     This is called at most once per process (unless `reset()` is called).
     Returns True if Moomoo is usable, False otherwise.
+
+    Critical: we pre-check the TCP port with a raw socket BEFORE creating
+    OpenQuoteContext, because the moomoo SDK's constructor spawns a
+    background reconnect thread that cannot be cleanly killed and will
+    spam ECONNREFUSED to logs forever on environments without OpenD.
     """
     global _quote_ctx, _moomoo_available, _init_error
 
@@ -146,6 +177,14 @@ def _try_init_moomoo() -> bool:
         log.info("data_provider: moomoo-api not installed, using yfinance")
         return False
 
+    # Pre-check: is the OpenD port even open? Skip all the SDK gymnastics if not.
+    if not _is_port_open(_MOOMOO_HOST, _MOOMOO_PORT, timeout=1.0):
+        _moomoo_available = False
+        _init_error = f"OpenD port {_MOOMOO_HOST}:{_MOOMOO_PORT} not open (no listener)"
+        log.info("data_provider: %s — using yfinance", _init_error)
+        return False
+
+    # Port is open — safe to instantiate the SDK context (won't spawn zombie threads).
     try:
         ctx = OpenQuoteContext(host=_MOOMOO_HOST, port=_MOOMOO_PORT)
         # Cheap liveness check: get_global_state is documented & fast.
