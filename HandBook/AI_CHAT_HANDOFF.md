@@ -16,11 +16,11 @@ I'm building an autonomous AI swing-trading agent for Bursa Malaysia (KLSE). The
 - When making changes, output the **complete file** for direct copy-paste to GitHub (no diffs)
 - **Question infrastructure assumptions early** — for long-running systems, ask "what kills the data?" and "what kills the loop?" before adding features
 
-### Project: BursaAI Swing Agent v3.3
+### Project: BursaAI Swing Agent v3.4
 
 **Mission:** Autonomous paper-trading agent that scans ~74 Bursa stocks hourly, picks GOLD BUY breakout/pullback setups, manages exits via SL/TP/trailing stops, and sends Telegram alerts so I can mirror trades in Moomoo manually. Self-learns from outcomes via Bayesian posteriors. Designed to run **indefinitely** with growing memory.
 
-**Status:** Live on Streamlit Cloud, **191 tests passing in ~40 s**, **~9,065 LOC** across **19 Python modules**.
+**Status:** Live on Streamlit Cloud, **216 tests passing in ~40 s**, **~9,646 LOC** across **20 Python modules**.
 
 **Repo location:** GitHub (https://github.com/fongway94/autonomous_bursa_agentV3.1)
 
@@ -99,12 +99,14 @@ notifier → Telegram + Email (when live_trigger fires)
 | `notifier.py` | Telegram (plain text) + Email (HTML) |
 | `live_trigger.py` | Filter+dedup+format trade events into alerts |
 | `broker_adapter.py` | Moomoo stub (v4-ready) |
+| `data_provider.py` | Pluggable market-data provider — Moomoo OpenD ↔ yfinance auto-fallback (v3.4) |
 | `persistence.py` | Gist-backed DB backup + restore |
 | `maintenance_reminders.py` | Holiday/PAT/WFO renewal reminders |
 
 ### What's working
 
 - Hourly scanning during Bursa sessions (09:00-12:30, 14:30-17:00)
+- **Pluggable data source** (v3.4): Moomoo OpenD auto-detect → yfinance fallback. Same code runs on Streamlit Cloud (yfinance) and local PC (Moomoo real-time).
 - Lunch break + public holiday awareness
 - Auto-exit on SL/TP3/trailing/time
 - Bayesian state-prior updates on every closed trade
@@ -113,17 +115,18 @@ notifier → Telegram + Email (when live_trigger fires)
 - BEAR regime defensive behaviour
 - Scheduler self-recovers from stuck loops within 10 min via watchdog
 - Start/Stop/Force Restart always works (v3.2 fix)
-- All 191 tests pass
+- All 216 tests pass
 
-### Recent changes (v3.2 + v3.3)
+### Recent changes (v3.2 → v3.4)
 
-- v3.2: Scheduler lifecycle refactor — removed ADOPT_THREAD, simplified start/stop/ensure_started, separated kill_switch from stop()
+- v3.4: NEW `data_provider.py` — Moomoo OpenD ↔ yfinance auto-fallback abstraction. `screener.py`, `market_analyzer.py`, `scheduler.py`, `app.py` migrated. Raw TCP port pre-check prevents moomoo SDK reconnect-thread spam on Streamlit Cloud. Added 📡 Data Source panel in Settings tab. 25 new tests.
 - v3.3: Unused import cleanup (9 imports across 8 modules), `risk_params` added to schema, `screener.py` `fut.result(timeout=30)`, `db.executemany()` removed
+- v3.2: Scheduler lifecycle refactor — removed ADOPT_THREAD, simplified start/stop/ensure_started, separated kill_switch from stop()
 - Test file renames: removed version numbers from test file names
 - Documentation rewrite: USER_GUIDE.md, SETUP_GUIDE.md, REVISION_HISTORY.md (replaces CHANGES_V2_TO_V3.md + CHANGES_V3_TO_V3_1.md)
 
 ### Known gaps (deliberately deferred)
-- Single data source (yfinance) — secondary source hook exists but empty
+- ~~Single data source (yfinance)~~ → **solved in v3.4**: pluggable via `data_provider.py`. (Adding Stooq as a 2nd free fallback for full redundancy is still open.)
 - No corporate actions handling (splits/bonuses)
 - Slippage is heuristic, not real fills
 - Moomoo broker adapter is stubbed
@@ -152,10 +155,10 @@ app.py, scheduler.py, screener.py, trading_engine.py, risk_manager.py,
 learner.py, market_analyzer.py, market_calendar.py, evaluation.py,
 data_quality.py, repository.py, db.py, logger.py, watchlist.py,
 notifier.py, live_trigger.py, broker_adapter.py, persistence.py,
-maintenance_reminders.py, ai_parameters.json, requirements.txt,
-.streamlit/config.toml
+maintenance_reminders.py, data_provider.py, ai_parameters.json,
+requirements.txt, .streamlit/config.toml
 
-tests/ (24 test files, 191 tests)
+tests/ (25 test files, 216 tests)
 HandBook/ (PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md)
 SETUP_GUIDE.md, USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, REVISION_HISTORY.md
 ```
