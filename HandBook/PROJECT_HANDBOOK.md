@@ -3,7 +3,7 @@
 **Living reference document.** Update as the project evolves.
 Single source of truth for: architecture decisions, why things were built the way they are, known issues, operational runbooks, and the rationale behind every design choice.
 
-Last updated: 2026-05-29 (v3.4)
+Last updated: 2026-05-29 (v3.5)
 
 ---
 
@@ -45,16 +45,17 @@ Last updated: 2026-05-29 (v3.4)
 
 | | |
 |---|---|
-| **Codebase version** | v3.4 |
+| **Codebase version** | v3.5 |
 | **Deployment** | Streamlit Cloud (live, on yfinance) + optional local PC mode (Moomoo OpenD for real-time) |
 | **Database** | SQLite WAL at `~/.bursa_agent_data/bursa_agent.db` |
 | **DB persistence** | **GitHub Gist backup (private)** — survives container resets |
-| **Source LOC** | ~9,646 across **20 Python modules** |
-| **Test count** | **216 passing in ~40 seconds** |
+| **Source LOC** | ~11,214 across **22 Python modules** |
+| **Test count** | **329 passing in ~41 seconds** |
 | **Documentation files** | SETUP_GUIDE.md, USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, REVISION_HISTORY.md, PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md |
 | **Capital (paper)** | RM 20,000 default (user adjustable) |
 | **Brokers supported** | NOOP (notification only), MoomooAdapter stub (v4 ready) |
 | **Data sources** | yfinance (always) + Moomoo OpenD (auto-detect; v3.4) — pluggable via `data_provider.py` |
+| **Corporate actions** | Splits / bonus issues auto-adjusted; cash dividends alerted (v3.5) — `corporate_actions.py` |
 
 ---
 
@@ -750,7 +751,7 @@ Each bug has a regression test guarding against its return.
 | Gap | Impact | Why deferred |
 |---|---|---|
 | ~~Single data source (yfinance)~~ → **partially solved in v3.4** | Now pluggable via `data_provider.py`; real-time Moomoo when OpenD is running locally, yfinance fallback otherwise. Adding a 2nd free provider (e.g. Stooq) for redundancy is still on the v4 list. | — |
-| No corporate actions (splits, bonuses) | ~5% of small caps affected/year | Manual JSON workaround possible |
+| ~~No corporate actions (splits, bonuses)~~ → **solved in v3.5** | Splits/bonus auto-adjusted via `corporate_actions.py`; cash dividends alert-only (full P&L credit deferred to v6). Rights issues still not handled. | — |
 | Slippage model is heuristic | Real fills may differ for very thin stocks | Volume-aware version covers most cases |
 | No real broker execution | Notification only | Moomoo adapter stubbed; user wants 6-month validation first |
 | Public holiday list expires after 2027 | Must update yearly | Hardcoded in `market_calendar.MY_PUBLIC_HOLIDAYS` |
