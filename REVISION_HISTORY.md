@@ -1,3 +1,5 @@
+[![Tests](https://github.com/fongway94/autonomous_bursa_agentV3.3/actions/workflows/tests.yml/badge.svg)](https://github.com/fongway94/autonomous_bursa_agentV3.3/actions/workflows/tests.yml)
+
 # BursaAI Swing Agent — Revision History
 
 Complete changelog from v1 through the current release.
