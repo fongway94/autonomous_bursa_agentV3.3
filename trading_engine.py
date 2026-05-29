@@ -560,3 +560,204 @@ def tag_trade(trade_id: int, tag: str) -> bool:
         tags.append(tag)
         update_trade(trade_id, {"tags": tags})
     return True
+
+
+
+# ===========================================================================
+# v3.5 — Corporate-action adjustment (splits & bonus issues)
+# ===========================================================================
+#
+# Called by the scheduler when corporate_actions.detect_for_tickers() finds a
+# SPLIT or BONUS event on a ticker we hold. Splits don't move cash — they
+# only restructure the per-share basis and share count — so the cash-
+# conservation invariant is preserved by construction.
+#
+# Conventions (mirror corporate_actions.CorporateAction):
+#
+#   ratio = new_shares / old_shares
+#
+#   1-for-5 forward split      → ratio = 5.0  → shares × 5, prices ÷ 5
+#   5-for-1 reverse split      → ratio = 0.2  → shares × 0.2 (rounded), prices × 5
+#   1-for-2 bonus issue        → ratio = 1.5  → shares × 1.5, prices ÷ 1.5
+#
+# Atomicity: ALL field updates happen inside a single SQLite transaction.
+# Any error rolls back the entire adjustment and re-raises so the caller
+# (corporate_actions.process_corporate_actions) can record the failure and
+# fire a Telegram alert.
+#
+# Idempotency: each trade's cumulative_split_factor is multiplied by the
+# applied ratio. The caller (corporate_actions.already_processed) guarantees
+# we never call apply_split_to_trade twice for the same (ticker, ex_date,
+# event_type), but as a defence-in-depth we also verify the trade is still
+# ACTIVE before adjusting.
+# ---------------------------------------------------------------------------
+
+from typing import Optional
+
+
+# Fields that scale DOWN with the ratio (per-share prices).
+# When ratio=5 (1-for-5 forward split), each of these gets divided by 5.
+_PRICE_FIELDS_INVERSE = (
+    "entry_price",
+    "stop_loss",
+    "tp1", "tp2", "tp3",
+    "trailing_stop",
+    "highest_price",
+    "lowest_price",
+    "exit_price",
+    "risk_per_share",
+)
+
+# Fields that scale UP with the ratio (share counts).
+# When ratio=5, each of these gets multiplied by 5.
+_SHARE_FIELDS_FORWARD = (
+    "shares",
+    "shares_remaining",
+    "lots",
+)
+
+# Fields explicitly NOT touched by a split (sanity-check reference):
+#   cost, fee, total_outlay   — total RM amounts, invariant
+#   realized_pnl, unrealized_pnl, closed_pnl  — total RM, invariant
+#   mae_pct, mfe_pct, slippage_pct, actual_risk_pct  — percentages, invariant
+#   ticker, name, sector, status, phase, notes  — non-numeric
+
+
+def apply_split_to_trade(trade_id: int, ratio: float,
+                         ex_date: str,
+                         note: Optional[str] = None) -> dict:
+    """
+    Atomically adjust one trade for a stock split (or bonus issue).
+
+    Parameters
+    ----------
+    trade_id : the trade.id to adjust
+    ratio    : new_shares / old_shares. Must be > 0 and != 1.0.
+    ex_date  : ISO date of the split (for audit / note text)
+    note     : optional extra context appended to trade.notes
+
+    Returns
+    -------
+    dict with the BEFORE and AFTER values of every adjusted field, plus
+    cash_invariant_delta_rm (must be ~0 within rounding).
+
+    Raises
+    ------
+    ValueError  : invalid ratio, trade not found, or trade not ACTIVE
+    Any other exception is propagated AFTER the SQLite rollback so the
+    caller can record the failure and alert the user.
+    """
+    if ratio is None or ratio <= 0:
+        raise ValueError(f"ratio must be positive, got {ratio!r}")
+    if abs(ratio - 1.0) < 1e-9:
+        raise ValueError(f"ratio=1.0 is a no-op, refusing to apply")
+
+    from db import connect, myt_iso
+
+    with connect() as c:
+        # Read BEFORE snapshot inside the same connection so we have a
+        # consistent view. SQLite's default isolation gives us an implicit
+        # transaction here (autocommit=False via the connect() helper).
+        row = c.execute(
+            "SELECT * FROM trades WHERE id=?", (trade_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"trade_id={trade_id} not found")
+
+        before = dict(row)
+
+        # Defence-in-depth: only adjust trades that are still ACTIVE.
+        # A closed trade has historical entry_price/exit_price/cost that we
+        # MUST NOT touch — adjusting them would corrupt P&L history.
+        if before["status"] != "ACTIVE":
+            raise ValueError(
+                f"trade_id={trade_id} status={before['status']!r}; "
+                f"can only adjust ACTIVE trades"
+            )
+
+        # Compute AFTER values.
+        after: dict = {}
+
+        # Price fields: divide by ratio
+        for f in _PRICE_FIELDS_INVERSE:
+            v = before.get(f)
+            if v is None:
+                after[f] = None
+                continue
+            try:
+                after[f] = round(float(v) / ratio, 4)  # 4 dp for sub-sen precision
+            except (TypeError, ValueError):
+                after[f] = v  # leave alone if non-numeric
+
+        # Share fields: multiply by ratio. Shares stay INTEGER, lots stay INTEGER.
+        for f in _SHARE_FIELDS_FORWARD:
+            v = before.get(f)
+            if v is None:
+                after[f] = None
+                continue
+            try:
+                # Round to nearest share (Bursa allows odd lots after splits
+                # so we don't force lot-alignment here; the next user trade
+                # will re-align via round_to_lot when needed).
+                after[f] = int(round(float(v) * ratio))
+            except (TypeError, ValueError):
+                after[f] = v
+
+        # cumulative_split_factor: multiply (so 2 splits compose correctly).
+        prev_factor = float(before.get("cumulative_split_factor") or 1.0)
+        after["cumulative_split_factor"] = round(prev_factor * ratio, 6)
+
+        # Append an audit note.
+        old_notes = before.get("notes") or ""
+        audit_note = (
+            f"[{myt_iso()}] v3.5 SPLIT applied: ratio={ratio:g} ex_date={ex_date} "
+            f"(shares {before['shares']} → {after['shares']}, "
+            f"entry_price {before['entry_price']} → {after['entry_price']})"
+        )
+        if note:
+            audit_note += f" | {note}"
+        after["notes"] = (old_notes + "\n" + audit_note).lstrip("\n")
+
+        # ---- Cash-conservation invariant check ----
+        # entry_price * shares should be unchanged (it's the cost basis in RM).
+        # We compute the delta as a sanity check; any value > RM 1.00
+        # indicates a math bug and we abort.
+        before_basis = float(before["entry_price"]) * float(before["shares"])
+        after_basis = float(after["entry_price"]) * float(after["shares"])
+        cash_invariant_delta = round(after_basis - before_basis, 2)
+        if abs(cash_invariant_delta) > 1.00:
+            raise ValueError(
+                f"cash-invariant violation: basis changed by "
+                f"RM {cash_invariant_delta:.2f} (before={before_basis:.2f}, "
+                f"after={after_basis:.2f}). Refusing to apply split."
+            )
+
+        # ---- Build and execute the UPDATE ----
+        set_clauses = []
+        values = []
+        for f, v in after.items():
+            set_clauses.append(f"{f}=?")
+            values.append(v)
+        values.append(trade_id)
+        sql = f"UPDATE trades SET {', '.join(set_clauses)} WHERE id=? AND status='ACTIVE'"
+
+        cur = c.execute(sql, values)
+        if cur.rowcount == 0:
+            # Race condition: trade was closed between our SELECT and UPDATE.
+            raise ValueError(
+                f"trade_id={trade_id} no longer ACTIVE (closed mid-adjustment); "
+                f"rolled back"
+            )
+
+    # Transaction committed by connect() context exit.
+
+    # Return a structured diff for logging / alerting.
+    return {
+        "trade_id": trade_id,
+        "ratio": ratio,
+        "ex_date": ex_date,
+        "before": {f: before.get(f) for f in _PRICE_FIELDS_INVERSE + _SHARE_FIELDS_FORWARD},
+        "after": {f: after.get(f) for f in _PRICE_FIELDS_INVERSE + _SHARE_FIELDS_FORWARD},
+        "cumulative_split_factor": after["cumulative_split_factor"],
+        "cash_invariant_delta_rm": cash_invariant_delta,
+    }
