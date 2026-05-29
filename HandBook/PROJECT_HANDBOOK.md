@@ -3,7 +3,7 @@
 **Living reference document.** Update as the project evolves.
 Single source of truth for: architecture decisions, why things were built the way they are, known issues, operational runbooks, and the rationale behind every design choice.
 
-Last updated: 2026-05-28 (v3.1.10)
+Last updated: 2026-05-29 (v3.3)
 
 ---
 
@@ -35,7 +35,7 @@ Last updated: 2026-05-28 (v3.1.10)
 - **Fully auditable** — every state change leaves a row in a log table.
 - **Real Bursa mechanics** — 100-share lots, 0.15% fees, volume-aware slippage, real session hours, public holidays.
 - **Durable memory** — the brain persists indefinitely via Gist backup, surviving every container reset.
-- **Self-healing scheduler** — orphan-thread registry + runaway-cycle watchdog ensure the loop can't get permanently stuck (v3.1.10).
+- **Self-healing scheduler** — simplified lifecycle (v3.2): orphan-all-and-start-fresh design, runaway-cycle watchdog, no ADOPT_THREAD complexity.
 - **Light theme only** — enforced by both Streamlit config and CSS override.
 - **Defaults err on safety** — 1% risk/trade, auto-trade ON but with conservative thresholds.
 
@@ -45,13 +45,13 @@ Last updated: 2026-05-28 (v3.1.10)
 
 | | |
 |---|---|
-| **Codebase version** | v3.1.10 |
+| **Codebase version** | v3.3 |
 | **Deployment** | Streamlit Cloud (live) |
 | **Database** | SQLite WAL at `~/.bursa_agent_data/bursa_agent.db` |
 | **DB persistence** | **GitHub Gist backup (private)** — survives container resets |
-| **Source LOC** | ~8,700 across **19 Python modules** |
-| **Test count** | **168 passing in ~30 seconds** (was 145 at v3.1.7) |
-| **Documentation files** | SETUP_GUIDE.md, USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, CHANGES_V2_TO_V3.md, CHANGES_V3_TO_V3_1.md, PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md |
+| **Source LOC** | ~9,065 across **19 Python modules** |
+| **Test count** | **191 passing in ~40 seconds** |
+| **Documentation files** | SETUP_GUIDE.md, USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, REVISION_HISTORY.md, PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md |
 | **Capital (paper)** | RM 20,000 default (user adjustable) |
 | **Brokers supported** | NOOP (notification only), MoomooAdapter stub (v4 ready) |
 
@@ -65,8 +65,8 @@ Last updated: 2026-05-28 (v3.1.10)
                          │  Hourly daemon thread           │
                          │  PID-owned, self-healing        │
                          │  Boot-debounced                 │
-                         │  + 🦴 Orphan registry  (v3.1.10)│
-                         │  + ⏱️ Runaway watchdog (v3.1.10)│
+                         │  + 🦴 Orphan-all-and-restart    │
+                         │  + ⏱️ Runaway watchdog          │
                          └──────────────┬─────────────────┘
                                         │
    ┌────────────────────────────────────┼─────────────────────────────────┐
@@ -237,6 +237,24 @@ Every decision below has a deliberate rationale. Don't change them without under
 
 ---
 
+
+### 4.20 Simplified scheduler lifecycle (v3.2) ⭐
+
+The ADOPT_THREAD path in `start()` was the root cause of the permanently-STOPPED bug: it adopted a still-alive thread but never wrote `running=1, kill_switch=0` to the DB. v3.2 removes the ADOPT_THREAD path entirely:
+
+- `start()`: orphan ALL stale threads, then spawn fresh. 1 guard instead of 8.
+- `stop()`: does NOT set `kill_switch` (only `engage_kill_switch()` does).
+- `ensure_started()`: just `if not is_running(): start()`. No 5-case tree.
+- No ADOPT_THREAD. No multi-guard complexity. If in doubt, start fresh.
+
+### 4.21 All external calls must have explicit timeout (reinforced v3.3)
+
+The `screener.py` ThreadPoolExecutor `fut.result()` was missing a timeout — meaning one hung yfinance call could block the entire 74-ticker scan indefinitely. Fixed with `fut.result(timeout=30)`. The watchdog is the safety net, not the first line of defence.
+
+### 4.22 Schema consistency (v3.3)
+
+`risk_params` table was previously created lazily by `risk_manager._ensure_risk_row()` instead of being in `db.py` SCHEMA. Moved to SCHEMA for consistency — all 21 tables are now created by `init_db()`.
+
 ## 5. Module-by-Module Reference
 
 | Module | Purpose | Critical functions |
@@ -263,7 +281,7 @@ Every decision below has a deliberate rationale. Don't change them without under
 
 **Note:** `learning_engine.py` was removed in v3.1.3 — it was a 40-line backwards-compat shim from the v1→v2 refactor with zero remaining imports.
 
-### Scheduler invariants (v3.1.10)
+### Scheduler invariants (v3.2+)
 
 The scheduler module guarantees:
 1. **At most one** `bursa-scheduler` thread per process is treated as "live and authoritative". Zombies in the orphan registry are excluded from this count.
@@ -716,6 +734,14 @@ Each bug has a regression test guarding against its return.
 
 ---
 
+
+- **v3.2: ADOPT_THREAD path didn't write DB state → permanently STOPPED** ⭐ — `start()` adopted an alive thread but never set `running=1` or cleared `kill_switch=1`. Combined with `stop()` setting `kill_switch=1`, `force_restart()` left the scheduler permanently STOPPED. Fixed by removing ADOPT_THREAD entirely; `start()` now orphans all stale threads and spawns fresh.
+- **v3.2: `stop()` set `kill_switch=1` unconditionally** — meant `force_restart()` → `stop()` → `start()` left `kill_switch=1` for any thread to self-kill. Fixed: `stop()` no longer sets `kill_switch`; new `engage_kill_switch()` is the only way to set it.
+- **v3.2: `ensure_started()` deferred to dead containers** — Gist restore brought back `owner_pid` from a dead container with a fresh heartbeat; `ensure_started()` Case 1 deferred for up to 5 minutes. Fixed: simplified to `if not is_running(): start()`.
+- **v3.3: `screener.py` `fut.result()` had no timeout** — a single hung yfinance call would block the entire scan. Fixed with `timeout=30`.
+- **v3.3: `risk_params` table not in `db.py` SCHEMA** — created lazily; moved to SCHEMA for consistency.
+- **v3.3: 9 unused imports across 8 modules** — removed (`math`, `yfinance`, `numpy`, `Any`, `get_myt_now`, `myt_iso`, `datetime/timezone/timedelta`).
+
 ## 11. Known Gaps & v4 Roadmap
 
 ### Known gaps (deliberately deferred)
@@ -902,7 +928,7 @@ streamlit run app.py
 python -m scheduler --interval 3600
 
 # Run tests
-pytest tests/ -q
+pytest tests/ -q                         # 191 tests, ~40s
 pytest tests/test_trading_engine.py -v   # specific file
 pytest tests/ -k "cash_conservation"      # match by name
 pytest tests/test_zombie_thread_recovery.py -v        # v3.1.10 regression
