@@ -133,7 +133,8 @@ CREATE TABLE IF NOT EXISTS trades (
     shares_remaining INTEGER NOT NULL,
     slippage_pct    REAL DEFAULT 0,
     notes           TEXT DEFAULT '',
-    tags_json       TEXT DEFAULT '[]'
+    tags_json       TEXT DEFAULT '[]',
+    cumulative_split_factor REAL DEFAULT 1.0  -- v3.5: product of all split ratios applied to this trade
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -348,6 +349,26 @@ CREATE TABLE IF NOT EXISTS custom_watchlist (
 );
 
 -- Risk parameters (was lazy-created by risk_manager, now in schema for consistency)
+-- v3.5: Corporate actions (splits, bonus issues, dividends)
+-- corporate_actions_processed: idempotency guard. Prevents applying the same
+-- split twice across multiple cycles. Key = (ticker, ex_date, event_type).
+CREATE TABLE IF NOT EXISTS corporate_actions_processed (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT NOT NULL,
+    ex_date         TEXT NOT NULL,
+    event_type      TEXT NOT NULL,  -- 'SPLIT' | 'DIVIDEND' | 'BONUS'
+    ratio           REAL,           -- for SPLIT/BONUS: new_shares / old_shares (e.g. 5.0 for 1-for-5)
+    amount_per_share REAL,          -- for DIVIDEND: cash per share in RM
+    source          TEXT,           -- 'moomoo' | 'yfinance'
+    detected_at     TEXT NOT NULL,
+    action_taken    TEXT NOT NULL,  -- 'ADJUSTED' | 'ALERTED_ONLY' | 'SKIPPED_NO_POSITION' | 'FAILED'
+    affected_trade_ids_json TEXT DEFAULT '[]',
+    error_message   TEXT,
+    UNIQUE(ticker, ex_date, event_type)
+);
+CREATE INDEX IF NOT EXISTS idx_corp_actions_ticker ON corporate_actions_processed(ticker);
+CREATE INDEX IF NOT EXISTS idx_corp_actions_ex_date ON corporate_actions_processed(ex_date);
+
 CREATE TABLE IF NOT EXISTS risk_params (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     payload     TEXT,
@@ -371,6 +392,14 @@ def init_db():
             # NULL when no cycle is in flight; ISO timestamp when one is running.
             "ALTER TABLE scheduler_state ADD COLUMN cycle_started_at TEXT",
             "ALTER TABLE trades ADD COLUMN executed_in_window TEXT",
+            # v3.5: corporate-action audit trail. Default 1.0 means "never split".
+            # When a 1-for-N split is applied, this becomes N (or product of N's).
+            "ALTER TABLE trades ADD COLUMN cumulative_split_factor REAL DEFAULT 1.0",
+            # v3.5: toggle for auto-adjustment behaviour. Default ON.
+            "ALTER TABLE scheduler_state ADD COLUMN corp_action_autoadjust INTEGER NOT NULL DEFAULT 1",
+            # v3.5: last time we scanned for corporate actions (ISO timestamp).
+            # NULL means "never scanned" → first scan looks back 7 days.
+            "ALTER TABLE scheduler_state ADD COLUMN last_corp_action_scan_at TEXT",
         ):
             try:
                 c.execute(sql)
