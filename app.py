@@ -1737,18 +1737,23 @@ with tab_settings:
     # Data Source (read-only diagnostic — added in v3.4)
     # -----------------------------------------------------------------
     st.markdown("### 📡 Data Source")
+
+    # Force a probe so we report the *actually active* provider, not "auto".
+    # ensure_probed() is a no-op if a probe has already happened.
+    from data_provider import ensure_probed as _dp_ensure_probed
+    _dp_ensure_probed()
+
     _dp_health = data_provider_health()
-    _active = provider_name()
     _moomoo_ok = bool(_dp_health.get("moomoo_available"))
+    _active = "moomoo" if _moomoo_ok else "yfinance"
 
     cA, cB = st.columns([1, 2])
     with cA:
         if _moomoo_ok:
-            st.success(f"Active: **{_active}**  (Moomoo OpenD connected)")
-        elif _active == "yfinance":
-            st.info(f"Active: **yfinance**  (Moomoo OpenD unavailable — fallback)")
+            st.success(f"✅ Active: **Moomoo** (real-time, OpenD connected)")
         else:
-            st.info(f"Active: **{_active}**  (auto-detect on first data call)")
+            reason = _dp_health.get("init_error") or "OpenD not reachable"
+            st.info(f"📊 Active: **yfinance** (fallback — {reason})")
 
     with cB:
         with st.expander("Details", expanded=False):
@@ -1756,11 +1761,11 @@ with tab_settings:
 
     if st.button("🔄 Re-probe data provider"):
         data_provider_reset()
-        st.success("Provider state reset. Next data call will re-probe Moomoo OpenD.")
+        st.success("Provider state reset. Re-probing now…")
         st.rerun()
 
     st.caption(
-        "💡 Streamlit Cloud cannot reach Moomoo OpenD (no desktop app) — "
+        "💡 Streamlit Cloud cannot reach Moomoo OpenD (no desktop app there) — "
         "it always serves yfinance. When running this agent on your local PC "
         "with Moomoo Desktop + OpenD on port 11111, real-time data is used "
         "automatically."
