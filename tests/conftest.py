@@ -63,7 +63,9 @@ def _reset_db_between_tests():
             "consecutive_failures=0, last_error=NULL, "
             "autotrade_enabled=1, autoexit_enabled=1, kill_switch=0, "
             "exploration_mode=1, exploration_trades_target=50, "
-            "owner_pid=0, cycle_started_at=NULL "
+            "owner_pid=0, cycle_started_at=NULL, "
+            # v3.5: reset corp-action toggle to default ON and clear scan ts
+            "corp_action_autoadjust=1, last_corp_action_scan_at=NULL "
             "WHERE id=1"
         )
         # Reset live_trigger_config singleton
