@@ -673,9 +673,6 @@ def process_corporate_actions(
         "scan_window":       (start_iso, end_iso),
     }
     """
-    from db import myt_iso
-    from datetime import datetime as _dt
-
     tickers = _get_active_trade_tickers()
     summary = {
         "tickers_scanned": len(tickers),
