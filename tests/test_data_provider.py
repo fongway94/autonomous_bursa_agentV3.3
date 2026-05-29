@@ -70,8 +70,20 @@ def _install_fake_moomoo(monkeypatch, *,
                          global_state_ret=0,
                          kline_ret=0,
                          kline_df=None,
-                         kline_raises=None):
-    """Install a fake `moomoo` module into sys.modules."""
+                         kline_raises=None,
+                         port_open=True):
+    """
+    Install a fake `moomoo` module into sys.modules.
+
+    Also patches data_provider._is_port_open to return `port_open` so the
+    new TCP pre-check doesn't block tests that want to exercise the
+    OpenQuoteContext path.
+    """
+    # Patch the port pre-check so OpenQuoteContext construction proceeds
+    # when the test wants to simulate "OpenD is up".
+    import data_provider as _dp
+    monkeypatch.setattr(_dp, "_is_port_open",
+                        lambda host, port, timeout=1.0: port_open)
 
     fake = types.ModuleType("moomoo")
 
@@ -203,8 +215,16 @@ class TestProviderDetection:
         assert dp._moomoo_available is False
         assert "not installed" in (dp._init_error or "")
 
-    def test_moomoo_opend_unreachable_falls_back(self, monkeypatch, dp):
-        _install_fake_moomoo(monkeypatch, connect_ok=False)
+    def test_moomoo_opend_port_closed_falls_back(self, monkeypatch, dp):
+        """OpenD port not listening — most common case (Streamlit Cloud, no Desktop)."""
+        _install_fake_moomoo(monkeypatch, port_open=False)
+        dp._ensure_provider_decided()
+        assert dp._moomoo_available is False
+        assert "not open" in (dp._init_error or "")
+
+    def test_moomoo_opend_port_open_but_constructor_fails_falls_back(self, monkeypatch, dp):
+        """Port is listening but OpenD construction throws (mismatched version, etc.)."""
+        _install_fake_moomoo(monkeypatch, connect_ok=False, port_open=True)
         dp._ensure_provider_decided()
         assert dp._moomoo_available is False
         assert "connect failed" in (dp._init_error or "")
@@ -226,7 +246,10 @@ class TestGetHistoryMoomooHappyPath:
 
         df = dp.get_history("0166.KL", period="1y")
         assert not df.empty
-        assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+        # Moomoo path returns exactly OHLCV (we normalise to this shape).
+        # yfinance path may add Dividends/Stock Splits — both are fine for
+        # downstream consumers, but the moomoo path is strict.
+        assert {"Open", "High", "Low", "Close", "Volume"}.issubset(set(df.columns))
         assert df.index.name == "Date"
         assert dp.provider_name() == "moomoo"
 
@@ -357,3 +380,60 @@ class TestDiagnostics:
         dp.ensure_probed()
         assert dp._moomoo_available is True
         assert dp._quote_ctx is first_ctx  # same ctx, no re-probe
+
+
+# ---------------------------------------------------------------------------
+# TCP pre-check (prevents moomoo SDK retry-thread spawn on Streamlit Cloud)
+# ---------------------------------------------------------------------------
+
+class TestPortPreCheck:
+    def test_port_closed_skips_opend_construction(self, monkeypatch, dp):
+        """
+        Critical regression test: if the OpenD port is closed, we must NOT
+        instantiate OpenQuoteContext (its constructor spawns a background
+        reconnect thread that spams ECONNREFUSED forever).
+        """
+        # Install a moomoo fake whose constructor would explode if called —
+        # this proves we never reached it.
+        ctx_construct_count = {"n": 0}
+
+        import sys, types
+        fake = types.ModuleType("moomoo")
+        fake.RET_OK = 0
+        class _KLType: K_DAY = "K_DAY"
+        class _AuType: QFQ = "QFQ"
+        fake.KLType = _KLType
+        fake.AuType = _AuType
+
+        class _CtxThatShouldNeverBeCalled:
+            def __init__(self, *a, **kw):
+                ctx_construct_count["n"] += 1
+                raise AssertionError(
+                    "OpenQuoteContext was constructed even though port was closed!"
+                )
+        fake.OpenQuoteContext = _CtxThatShouldNeverBeCalled
+        monkeypatch.setitem(sys.modules, "moomoo", fake)
+
+        # Force the port check to report closed.
+        monkeypatch.setattr(dp, "_is_port_open",
+                            lambda host, port, timeout=1.0: False)
+
+        dp._ensure_provider_decided()
+
+        assert dp._moomoo_available is False
+        assert ctx_construct_count["n"] == 0, "OpenQuoteContext was constructed!"
+        assert "not open" in (dp._init_error or "")
+
+    def test_port_open_proceeds_to_opend_check(self, monkeypatch, dp):
+        """When the port IS open, we DO instantiate OpenQuoteContext."""
+        _install_fake_moomoo(monkeypatch, connect_ok=True)
+        monkeypatch.setattr(dp, "_is_port_open",
+                            lambda host, port, timeout=1.0: True)
+        dp._ensure_provider_decided()
+        assert dp._moomoo_available is True
+
+    def test_is_port_open_with_unreachable_host(self, dp):
+        """The TCP probe itself: a closed port should return False quickly."""
+        # 127.0.0.1:1 is reserved and never listening in test envs.
+        result = dp._is_port_open("127.0.0.1", 1, timeout=0.5)
+        assert result is False
