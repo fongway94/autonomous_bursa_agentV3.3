@@ -87,6 +87,7 @@ _moomoo_available: Optional[bool] = None   # None = not yet probed
 _moomoo_failures = 0
 _last_served_by = "yfinance"   # for diagnostics
 _init_error: Optional[str] = None
+_last_moomoo_error: Optional[str] = None  # v3.6: surface per-call failure reason in health()
 
 
 # ---------------------------------------------------------------------------
@@ -385,9 +386,10 @@ def _fetch_moomoo(ticker: str,
 
 
 def _moomoo_failure_signal(reason: str) -> None:
-    global _moomoo_failures
+    global _moomoo_failures, _last_moomoo_error
     with _state_lock:
         _moomoo_failures += 1
+        _last_moomoo_error = reason
         failures = _moomoo_failures
     log.warning("data_provider: Moomoo call failed (%s) [%d/%d]",
                 reason, failures, MOOMOO_MAX_CONSECUTIVE_FAILURES)
@@ -397,10 +399,11 @@ def _moomoo_failure_signal(reason: str) -> None:
 
 
 def _moomoo_success_signal() -> None:
-    global _moomoo_failures
-    if _moomoo_failures != 0:
+    global _moomoo_failures, _last_moomoo_error
+    if _moomoo_failures != 0 or _last_moomoo_error is not None:
         with _state_lock:
             _moomoo_failures = 0
+            _last_moomoo_error = None
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +499,9 @@ def health() -> dict:
         "moomoo_consecutive_failures": _moomoo_failures,
         "last_served_by": _last_served_by,
         "init_error": _init_error,
+        # v3.6: per-call failure reason (e.g. "Unsupported quote market")
+        # Distinct from init_error (which is connect-time failure).
+        "last_moomoo_error": _last_moomoo_error,
     }
 
 
@@ -504,7 +510,8 @@ def reset() -> None:
     Forget detection state. Mainly for tests; also useful from the Settings
     tab if the user starts OpenD after the app already booted.
     """
-    global _quote_ctx, _moomoo_available, _moomoo_failures, _init_error, _last_served_by
+    global _quote_ctx, _moomoo_available, _moomoo_failures, _init_error
+    global _last_served_by, _last_moomoo_error
     with _state_lock:
         if _quote_ctx is not None:
             try:
@@ -516,3 +523,4 @@ def reset() -> None:
         _moomoo_failures = 0
         _init_error = None
         _last_served_by = "yfinance"
+        _last_moomoo_error = None
