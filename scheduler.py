@@ -257,7 +257,59 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
     from repository import get_trade
 
     summary = {"scan_count": 0, "settled": 0, "partials": 0,
-               "auto_entries": 0, "rejected": 0, "errors": []}
+               "auto_entries": 0, "rejected": 0, "errors": [],
+               # v3.5: corporate-action stats added to summary
+               "corp_actions_detected": 0, "corp_actions_adjusted": 0,
+               "corp_actions_failed": 0}
+
+    # ---------------------------------------------------------------
+    # v3.5 Step 0 — Corporate actions (splits, bonuses, dividends)
+    # Runs BEFORE regime/scan/settle so that stop-loss math uses
+    # post-split prices instead of triggering a false 80%-crash exit.
+    # ---------------------------------------------------------------
+    try:
+        from corporate_actions import process_corporate_actions
+        state_now = get_scheduler_state()
+        autoadjust = bool(state_now.get("corp_action_autoadjust", 1))
+        last_scan = state_now.get("last_corp_action_scan_at")
+
+        ca_summary = process_corporate_actions(
+            autoadjust=autoadjust,
+            last_scan_iso=last_scan,
+            actor="SCHEDULER",
+        )
+
+        summary["corp_actions_detected"] = ca_summary["events_detected"]
+        summary["corp_actions_adjusted"] = ca_summary["splits_adjusted"]
+        summary["corp_actions_failed"] = ca_summary["failures"]
+
+        # Persist the scan timestamp so next cycle's window starts here.
+        update_scheduler_state(last_corp_action_scan_at=myt_iso())
+
+        if ca_summary["events_detected"] > 0:
+            log_scheduler_event(
+                "CORP_ACTIONS",
+                (f"detected={ca_summary['events_detected']} "
+                 f"adjusted={ca_summary['splits_adjusted']} "
+                 f"alerted={ca_summary['splits_alerted_only']} "
+                 f"divs={ca_summary['dividends_alerted']} "
+                 f"dupes={ca_summary['skipped_dupes']} "
+                 f"failed={ca_summary['failures']}"),
+                payload={
+                    "window": ca_summary["scan_window"],
+                    "autoadjust": autoadjust,
+                    "details": ca_summary["details"][:20],  # cap to keep payload small
+                },
+            )
+    except Exception as e:
+        # Corporate-action processing failure must NOT abort the cycle.
+        # Log it and continue with normal scan/settle.
+        log_scheduler_event(
+            "CORP_ACTIONS_ERROR",
+            f"process_corporate_actions raised: {e}",
+            "ERROR",
+            payload={"traceback": traceback.format_exc()},
+        )
 
     t0 = time.time()
     log_scheduler_event("SCAN_START", "Starting market scan")
