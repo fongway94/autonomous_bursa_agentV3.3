@@ -1,0 +1,212 @@
+# BursaAI Swing Agent — Revision History
+
+Complete changelog from v1 through the current release.
+
+---
+
+## v3.3 (current)
+
+**Focus:** Code cleanup, system audit, unused import sweep.
+
+### Changes
+- **Removed unused imports** across 8 modules: `math` and `yfinance` from `trading_engine.py`, `numpy` from `data_quality.py`, `Any` from `repository.py` and `risk_manager.py`, `get_myt_now` from `live_trigger.py`, `myt_iso` from `persistence.py`, `datetime/timezone/timedelta` from `learner.py`
+- **Added `risk_params` table to `db.py` SCHEMA** — was previously created lazily by `risk_manager._ensure_risk_row()`, now created with all other tables for consistency
+- **Added `fut.result(timeout=30)`** in `screener.py` — ThreadPoolExecutor results had no timeout, violating the project's own design rule #24 (all external calls must have explicit timeouts)
+- **Added regression test** `test_screener_futures_have_timeout` guarding the timeout fix
+- **Removed `db.executemany()`** — zero callers across the entire codebase
+
+### Test count: 191 passing (~40 s)
+
+---
+
+## v3.2
+
+**Focus:** Scheduler lifecycle refactor — fixed the permanently-STOPPED bug.
+
+### Root cause
+The `ADOPT_THREAD` path in `start()` adopted a still-alive thread but never wrote `running=1, kill_switch=0` to the DB. Combined with `stop()` unconditionally setting `kill_switch=1`, this created a death spiral where `force_restart()` left the scheduler permanently STOPPED.
+
+### Changes
+- **`scheduler.py` rewritten** (1,359 → 1,077 LOC):
+  - `start()`: 8 guards + ADOPT_THREAD → 1 guard + orphan-all + start fresh
+  - `stop()`: no longer sets `kill_switch=1` (was the root cause)
+  - New `engage_kill_switch()`: dedicated function for the kill-switch button
+  - `ensure_started()`: simplified from 5-case tree to `if not is_running(): start()`
+- **`app.py`**: Kill-Switch button calls `sched.engage_kill_switch()`, clearer Start button feedback
+- **Test file renames** (removed version numbers):
+  - `test_v3_features.py` → `test_defaults.py`
+  - `test_v32_lifecycle_regression.py` → `test_scheduler_lifecycle.py`
+  - `test_watchdog_lifecycle_v3_1_11.py` → `test_watchdog_lifecycle.py`
+  - `test_schema_migration_after_restore.py` → `test_schema_migration.py`
+- **7 new regression tests** in `test_scheduler_lifecycle.py`
+
+### Test count: 190 passing
+
+---
+
+## v3.1.10
+
+**Focus:** Zombie thread recovery + runaway-cycle watchdog.
+
+### Changes
+- `_ORPHANED_THREAD_IDS` registry lets `start()` skip threads that `stop()` requested to exit but couldn't kill within join timeout
+- `_watchdog_loop` thread (every 60 s) detects cycles exceeding 10 min and forces clean handoff
+- `cycle_started_at` column added to `scheduler_state`
+- All `evaluation.py` yfinance calls given explicit `timeout=`
+- `conftest.py` resets scheduler module-level state between tests
+
+---
+
+## v3.1.9
+
+**Focus:** Crash-recoverable start guards.
+
+### Changes
+- `start()` Guards 2/3 only block on local alive threads, not stale DB state
+- Gist ID stored in SQLite `meta` table (survives container resets)
+- `GIST_ID` env var as fallback when local marker lost
+- `custom_watchlist` table moved into `db.py` SCHEMA
+
+---
+
+## v3.1.8
+
+**Focus:** Duplicate worker loop prevention.
+
+### Changes
+- Ghost threads from Streamlit reruns exit silently (no log spam)
+- `ensure_started()` conservative — doesn't spawn when another live owner detected
+- Per-minute log dedup for HEARTBEAT/SKIP storms
+
+---
+
+## v3.1.7
+
+**Focus:** Long-term maintenance reminders.
+
+### Changes
+- `maintenance_reminders.py` added — surfaces banners for holiday list renewal, GitHub PAT rotation, walk-forward optimization
+- "I rotated the token" button resets the PAT timer
+- Maintenance status panel in Settings tab
+
+---
+
+## v3.1.6
+
+**Focus:** ML classifier persistence.
+
+### Changes
+- ML classifier `.pkl` included in Gist backup alongside DB
+- Auto-train on boot if `.pkl` missing (background thread)
+
+---
+
+## v3.1.5
+
+**Focus:** Brain persistence via GitHub Gist.
+
+### Changes
+- `persistence.py` added — gzip + base64 encode DB → private Gist
+- Backup on every closed trade + hourly heartbeat
+- Auto-restore on boot before scheduler starts
+- `boot_restore_once()` is idempotent — only runs once per process, skips if local DB has data
+
+---
+
+## v3.1.4
+
+**Focus:** Regime trend tracking.
+
+### Changes
+- `regime_history` table for per-cycle KLCI regime snapshots
+- Cycle explanations include regime trend direction (weakening/strengthening)
+- KLCI 200-EMA distance shown in cycle logs
+
+---
+
+## v3.1.3
+
+**Focus:** Boot debounce + dead code cleanup.
+
+### Changes
+- Scheduler sleeps until next scheduled boundary on startup (no immediate scan on GitHub push)
+- Removed deprecated `learning_engine.py` shim
+- Several unused helper functions deleted
+
+---
+
+## v3.1.2
+
+**Focus:** Bursa-accurate market calendar.
+
+### Changes
+- `market_calendar.py` added with real sessions (09:00–12:30, 14:30–17:00)
+- Lunch break (12:30–14:00) correctly blocks scans
+- Public holidays hardcoded through 2027
+- Safe-entry window cutoff at 16:00
+
+---
+
+## v3.1.1
+
+**Focus:** Maintenance task idempotency.
+
+### Changes
+- `maintenance_state` table with SQL CAS for daily tasks
+- Fixed: ML classifier was retraining 8× per night
+
+---
+
+## v3.1
+
+**Focus:** Live trigger / notification system.
+
+### Changes
+- `notifier.py`, `live_trigger.py`, `broker_adapter.py` added
+- Telegram (plain text) + Email (HTML) alerts on qualifying trades
+- Configurable filters: confidence, mode, per-event toggles
+- 🔔 Live Alerts tab added to dashboard
+- `MoomooAdapter` stub for future real-broker integration
+- Live alerts OFF by default (user opts in)
+
+### Test count: 63 passing
+
+---
+
+## v3
+
+**Focus:** Autonomy hardening + cold-start learning.
+
+### Changes
+- Auto-trade ON by default (`autotrade_enabled=1`)
+- Exploration mode (Thompson sampling) → Exploitation (LCB) auto-switch at 50 trades
+- Volume-aware slippage model (base + size-linear + liquidity penalty, capped 80 bps)
+- Default `max_risk_per_trade_pct` lowered from 2.0% → 1.0%
+- Shariah-compliant filter option
+- Self-healing `ensure_started` (force-restart on stale heartbeat)
+- No entries after 16:00 MYT
+- Nightly ML retrain at 01:00 MYT
+
+### Test count: 47 passing
+
+---
+
+## v2
+
+**Focus:** Complete rebuild — honest learning, real risk management, production-grade storage.
+
+### Changes from v1
+- **Learning:** Q-learning EMA → Bayesian Beta(α,β) posteriors
+- **Storage:** JSON files → SQLite with WAL mode
+- **Risk:** size_multiplier actually enforced, 100-share lot rounding
+- **Execution:** added slippage model, MAE/MFE tracking
+- **Evaluation:** Sharpe, Sortino, max DD, profit factor, calibration, KLCI benchmark
+- **Logging:** 6 dedicated audit streams (trade, scheduler, learning, bias, parameter, data quality)
+- **Theme:** dark → forced light
+- **Tests:** 0 → 36
+
+---
+
+## v1
+
+**Original prototype.** Had "Q-learning" that was a single-step EMA, JSON file storage with race conditions, no slippage, no lot enforcement, no real risk management.
