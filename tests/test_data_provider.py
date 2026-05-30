@@ -166,8 +166,17 @@ class TestTickerConversion:
     def test_klci_index(self, dp):
         assert dp._to_moomoo_code("^KLSE") == "MY.800000"
 
+    def test_us_equity(self, dp):
+        # v3.6: bare symbols map to the US market for Moomoo OpenD.
+        assert dp._to_moomoo_code("AAPL") == "US.AAPL"
+        assert dp._to_moomoo_code("SPY") == "US.SPY"
+        assert dp._to_moomoo_code("aapl") == "US.AAPL"
+
     def test_unknown_returns_none(self, dp):
-        assert dp._to_moomoo_code("AAPL") is None
+        # Non-KLSE indices (^SPX, ^IXIC, ^VIX…) are not mappable to a
+        # Moomoo MARKET.CODE — caller must fall back to yfinance.
+        assert dp._to_moomoo_code("^SPX") is None
+        assert dp._to_moomoo_code("^IXIC") is None
         assert dp._to_moomoo_code("") is None
         assert dp._to_moomoo_code(None) is None
 
@@ -241,10 +250,15 @@ class TestProviderDetection:
 # ---------------------------------------------------------------------------
 
 class TestGetHistoryMoomooHappyPath:
+    # NOTE (v3.6): the live Moomoo path is the *US* market. MY is gated off
+    # via MY_PROFILE.moomoo_available=False (Moomoo OpenAPI has no MY coverage
+    # yet), so MY always routes to yfinance. These tests therefore use a US
+    # ticker to exercise the real Moomoo OpenD path. MY-gating behaviour is
+    # covered separately in TestMarketGating below.
     def test_returns_yfinance_shaped_df(self, monkeypatch, dp):
         _install_fake_moomoo(monkeypatch, connect_ok=True)
 
-        df = dp.get_history("0166.KL", period="1y")
+        df = dp.get_history("AAPL", period="1y")
         assert not df.empty
         # Moomoo path returns exactly OHLCV (we normalise to this shape).
         # yfinance path may add Dividends/Stock Splits — both are fine for
@@ -254,18 +268,21 @@ class TestGetHistoryMoomooHappyPath:
         assert dp.provider_name() == "moomoo"
 
     def test_unknown_ticker_uses_yfinance(self, monkeypatch, dp):
+        # A non-mappable index symbol (^SPX) can't be served by Moomoo, so
+        # even with OpenD up the provider must fall back to yfinance.
         _install_fake_moomoo(monkeypatch, connect_ok=True)
 
         with mock.patch.object(dp.yf, "Ticker") as MockTicker:
             MockTicker.return_value.history.return_value = _fake_yf_df(30)
-            df = dp.get_history("AAPL", period="1y")
+            df = dp.get_history("^SPX", period="1y")
 
         assert not df.empty
         assert dp.provider_name() == "yfinance"
-        MockTicker.assert_called_once_with("AAPL")
+        MockTicker.assert_called_once_with("^SPX")
 
 
 class TestGetHistoryFallback:
+    # v3.6: exercised against a US ticker (the live Moomoo path).
     def test_per_call_fallback_on_exception(self, monkeypatch, dp):
         _install_fake_moomoo(
             monkeypatch,
@@ -274,7 +291,7 @@ class TestGetHistoryFallback:
         )
         with mock.patch.object(dp.yf, "Ticker") as MockTicker:
             MockTicker.return_value.history.return_value = _fake_yf_df(40)
-            df = dp.get_history("0166.KL", period="1y")
+            df = dp.get_history("AAPL", period="1y")
 
         assert not df.empty
         assert dp.provider_name() == "yfinance"
@@ -291,7 +308,7 @@ class TestGetHistoryFallback:
         with mock.patch.object(dp.yf, "Ticker") as MockTicker:
             MockTicker.return_value.history.return_value = _fake_yf_df(10)
             for _ in range(dp.MOOMOO_MAX_CONSECUTIVE_FAILURES):
-                dp.get_history("0166.KL", period="1y")
+                dp.get_history("AAPL", period="1y")
 
         assert dp._moomoo_available is False
         assert "demoted" in (dp._init_error or "")
@@ -305,8 +322,8 @@ class TestGetHistoryFallback:
         )
         with mock.patch.object(dp.yf, "Ticker") as MockTicker:
             MockTicker.return_value.history.return_value = _fake_yf_df(5)
-            dp.get_history("0166.KL", period="1y")
-            dp.get_history("0166.KL", period="1y")
+            dp.get_history("AAPL", period="1y")
+            dp.get_history("AAPL", period="1y")
         assert dp._moomoo_failures == 2
 
         # Swap in a healthy context (simulate OpenD recovering).
@@ -316,7 +333,7 @@ class TestGetHistoryFallback:
             host="127.0.0.1", port=11111
         )
 
-        df = dp.get_history("0166.KL", period="1y")
+        df = dp.get_history("AAPL", period="1y")
         assert not df.empty
         assert dp._moomoo_failures == 0
         assert dp.provider_name() == "moomoo"
@@ -329,9 +346,68 @@ class TestGetHistoryFallback:
         )
         with mock.patch.object(dp.yf, "Ticker") as MockTicker:
             MockTicker.return_value.history.return_value = _fake_yf_df(20)
-            df = dp.get_history("0166.KL", period="1y")
+            df = dp.get_history("AAPL", period="1y")
         assert not df.empty
         assert dp.provider_name() == "yfinance"
+
+
+# ---------------------------------------------------------------------------
+# Market gating (v3.6) — the per-market moomoo_available switch
+# ---------------------------------------------------------------------------
+
+class TestMarketGating:
+    """The design contract for the dual-market data source:
+
+      * BOTH markets fall back to yfinance when Moomoo OpenD is absent.
+      * US uses Moomoo when OpenD is connected.
+      * MY *always* uses yfinance today, because Moomoo OpenAPI has no MY
+        coverage — gated off via MY_PROFILE.moomoo_available = False.
+      * The day Moomoo enables MY: flip that one flag to True and MY auto-
+        goes-live on Moomoo with zero other code changes. These tests guard
+        that promise so it can never silently regress.
+    """
+
+    def test_my_ticker_always_uses_yfinance_even_with_opend_up(
+            self, monkeypatch, dp):
+        """MY is gated off: even with a healthy OpenD, 0166.KL → yfinance and
+        Moomoo is never called (no failure recorded)."""
+        _install_fake_moomoo(monkeypatch, connect_ok=True)
+        with mock.patch.object(dp.yf, "Ticker") as MockTicker:
+            MockTicker.return_value.history.return_value = _fake_yf_df(30)
+            df = dp.get_history("0166.KL", period="1y")
+
+        assert not df.empty
+        assert dp.provider_name() == "yfinance"
+        # Gated off BEFORE the Moomoo call, so no failure is recorded.
+        assert dp._moomoo_failures == 0
+        assert dp.health()["last_moomoo_error"] is None
+
+    def test_my_gate_honoured_by_market_supports_moomoo(self, dp):
+        """The gate is read live from the profile flag, not hardcoded."""
+        assert dp._market_supports_moomoo("0166.KL") is False
+        assert dp._market_supports_moomoo("AAPL") is True
+
+    def test_my_goes_live_when_coverage_flag_flipped(self, monkeypatch, dp):
+        """Future-proofing: the day Moomoo adds MY coverage, flipping
+        MY_PROFILE.moomoo_available = True must route MY tickers to Moomoo
+        with no other code change."""
+        import dataclasses
+        from market_profiles import my_profile
+
+        # Simulate Moomoo announcing MY support: produce a copy of the MY
+        # profile with moomoo_available flipped on. MarketProfile is a frozen
+        # dataclass, so we use dataclasses.replace and swap the singleton.
+        live_my = dataclasses.replace(my_profile.MY_PROFILE,
+                                      moomoo_available=True)
+        monkeypatch.setattr(my_profile, "MY_PROFILE", live_my)
+
+        # Gate now opens for MY.
+        assert dp._market_supports_moomoo("0166.KL") is True
+
+        _install_fake_moomoo(monkeypatch, connect_ok=True)
+        df = dp.get_history("0166.KL", period="1y")
+        assert not df.empty
+        assert dp.provider_name() == "moomoo"
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +469,7 @@ class TestDiagnostics:
         )
         with mock.patch.object(dp.yf, "Ticker") as MockTicker:
             MockTicker.return_value.history.return_value = _fake_yf_df(5)
-            dp.get_history("0166.KL", period="1y")
+            dp.get_history("AAPL", period="1y")
 
         h = dp.health()
         assert "last_moomoo_error" in h
@@ -408,13 +484,13 @@ class TestDiagnostics:
                              kline_raises=RuntimeError("transient hiccup"))
         with mock.patch.object(dp.yf, "Ticker") as MockTicker:
             MockTicker.return_value.history.return_value = _fake_yf_df(5)
-            dp.get_history("0166.KL", period="1y")
+            dp.get_history("AAPL", period="1y")
         assert dp.health()["last_moomoo_error"] is not None
 
         # Now swap in a healthy ctx and re-fetch
         _install_fake_moomoo(monkeypatch, connect_ok=True)
         dp._quote_ctx = sys.modules["moomoo"].OpenQuoteContext(host="127.0.0.1", port=11111)
-        dp.get_history("0166.KL", period="1y")
+        dp.get_history("AAPL", period="1y")
 
         assert dp.health()["last_moomoo_error"] is None
 
@@ -424,7 +500,7 @@ class TestDiagnostics:
                              kline_raises=RuntimeError("Unsupported quote market"))
         with mock.patch.object(dp.yf, "Ticker") as MockTicker:
             MockTicker.return_value.history.return_value = _fake_yf_df(5)
-            dp.get_history("0166.KL", period="1y")
+            dp.get_history("AAPL", period="1y")
         assert dp.health()["last_moomoo_error"] is not None
 
         dp.reset()
