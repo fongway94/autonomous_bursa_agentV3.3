@@ -300,9 +300,12 @@ def test_broker_adapter_us_simulate_returns_moomoo_us(isolated_home, monkeypatch
     ba.reset_adapter_cache()
     a = ba.get_broker_adapter(mode="SIMULATE")
     assert a.name == "moomoo_us"
-    # Skeleton in Block 4 — calling connect() should explicitly NotImplementedError
-    with pytest.raises(NotImplementedError):
-        a.connect()
+    # v3.6 Block 5: MoomooUSAdapter.connect() is now implemented.
+    # In tests, no OpenD is running so connect() returns False (does NOT raise).
+    # Full happy-path connection coverage lives in tests/test_moomoo_us_adapter.py.
+    result = a.connect()
+    assert result is False, "connect must return False when OpenD is not reachable"
+    assert "not listening" in (a.last_error() or "")
 
 
 def test_broker_adapter_mirror_hooks_are_noop_in_noop_mode(isolated_home, monkeypatch):
