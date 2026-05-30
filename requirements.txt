@@ -8,6 +8,7 @@ scipy>=1.10.0
 joblib>=1.2.0
 pytest>=7.4.0
 requests>=2.28.0
+pandas_market_calendars>=4.4.0
 # Optional: real-time Bursa data when Moomoo OpenD is running
 # locally on 127.0.0.1:11111. Falls back to yfinance automatically.
 moomoo-api>=8.0.0
