@@ -1,0 +1,141 @@
+"""
+market_profiles — Multi-market abstraction layer for autonomous_bursa_agent.
+
+Each market (MY / US / future: HK / SG) is described by a single MarketProfile
+implementation exposing a fixed surface (lot size, calendar, watchlist,
+broker adapter class, ticker formats, fee/slippage model, etc.).
+
+Business modules (screener.py, trading_engine.py, scheduler.py, etc.)
+import `active_profile()` instead of hard-coding Bursa constants.
+
+Adding a new market = drop in a new `<market>_profile.py` that satisfies
+the MarketProfile Protocol — zero changes elsewhere.
+
+Active profile selection priority (first match wins):
+    1. Environment variable `MARKET_MODE` (one of: MY, US)
+    2. `meta` table key `market` (set via Settings tab sidebar switcher)
+    3. Default = MY (preserves v3.3 behaviour for existing deployments)
+
+This module deliberately has NO imports from any business module to avoid
+circular imports. Profiles import their own dependencies.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import Optional
+
+from market_profiles.base import MarketProfile
+
+# Lazy-loaded, cached profile. Reset via set_active_market() on switch.
+_ACTIVE_PROFILE: Optional[MarketProfile] = None
+_LOCK = threading.RLock()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def active_profile() -> MarketProfile:
+    """Return the currently active MarketProfile (thread-safe, cached).
+
+    Resolution order:
+        1. env var MARKET_MODE
+        2. meta table key 'market' (if db importable)
+        3. default 'MY'
+    """
+    global _ACTIVE_PROFILE
+    with _LOCK:
+        if _ACTIVE_PROFILE is None:
+            _ACTIVE_PROFILE = _resolve_profile(_detect_market_code())
+        return _ACTIVE_PROFILE
+
+
+def set_active_market(market_code: str, persist: bool = True) -> MarketProfile:
+    """Switch the active market profile at runtime.
+
+    Args:
+        market_code: 'MY' or 'US' (case-insensitive)
+        persist: if True, write to meta table so next boot picks it up
+
+    Returns:
+        The newly-activated MarketProfile.
+
+    Raises:
+        ValueError: if market_code is unknown.
+    """
+    global _ACTIVE_PROFILE
+    code = market_code.upper().strip()
+    new_profile = _resolve_profile(code)
+    with _LOCK:
+        _ACTIVE_PROFILE = new_profile
+    if persist:
+        _persist_market_to_meta(code)
+    return new_profile
+
+
+def available_markets() -> list[str]:
+    """All market codes this build supports."""
+    return ["MY", "US"]
+
+
+def reset_cache() -> None:
+    """Force re-resolution on next active_profile() call. For tests."""
+    global _ACTIVE_PROFILE
+    with _LOCK:
+        _ACTIVE_PROFILE = None
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _detect_market_code() -> str:
+    # 1. env var wins
+    env = os.environ.get("MARKET_MODE", "").upper().strip()
+    if env in available_markets():
+        return env
+
+    # 2. meta table (optional — db.py may not be importable in tests yet)
+    try:
+        from db import get_meta  # type: ignore
+        meta_value = get_meta("market")
+        if meta_value and meta_value.upper() in available_markets():
+            return meta_value.upper()
+    except Exception:
+        # db not initialised, or in a test fixture — that's fine, fall through
+        pass
+
+    # 3. default
+    return "MY"
+
+
+def _resolve_profile(code: str) -> MarketProfile:
+    if code == "MY":
+        from market_profiles.my_profile import MY_PROFILE
+        return MY_PROFILE
+    if code == "US":
+        from market_profiles.us_profile import US_PROFILE
+        return US_PROFILE
+    raise ValueError(
+        f"Unknown market code {code!r}. Available: {available_markets()}"
+    )
+
+
+def _persist_market_to_meta(code: str) -> None:
+    try:
+        from db import set_meta  # type: ignore
+        set_meta("market", code)
+    except Exception:
+        # best-effort — UI layer should surface failures if needed
+        pass
+
+
+__all__ = [
+    "MarketProfile",
+    "active_profile",
+    "set_active_market",
+    "available_markets",
+    "reset_cache",
+]
