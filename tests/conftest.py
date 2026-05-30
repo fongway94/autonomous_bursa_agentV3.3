@@ -100,19 +100,8 @@ def _reset_market_cache_between_tests():
         pass
 
 
-@pytest.fixture(autouse=True)
-def _reset_db_between_tests():
-    """Truncate all volatile tables AND reset singletons before each test.
-
-    v3.6: ensure init_db() is called for whatever the currently-active
-    market's DB is, so per-test market switches don't crash this fixture
-    when truncating tables of a never-initialised DB.
-    """
-    try:
-        from db import init_db
-        init_db()
-    except Exception:
-        pass
+def _reset_one_db():
+    """Helper: truncate volatile tables + reset singletons on the ACTIVE DB."""
     from db import connect
     with connect() as c:
         for tbl in ("trades", "partial_exits", "trade_log",
@@ -202,3 +191,39 @@ def _reset_db_between_tests():
     except Exception:
         # scheduler may not be importable in some collection paths; skip
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_db_between_tests():
+    """v3.6: reset ALL per-market DBs (MY + US) before each test.
+
+    Tests that flip MARKET_MODE=US would otherwise leave stale data in
+    bursa_agent_US.db that leaks into the next test using US mode.
+
+    We iterate every market, temporarily activate it, init_db() and
+    _reset_one_db(), then restore the original MARKET_MODE so the test
+    starts on whichever market it expects.
+    """
+    import os as _os
+    from db import init_db
+    from market_profiles import available_markets, reset_cache as _reset_mp
+
+    saved_env = _os.environ.get("MARKET_MODE")
+    for code in available_markets():
+        _os.environ["MARKET_MODE"] = code
+        _reset_mp()
+        try:
+            init_db()
+        except Exception:
+            pass
+        try:
+            _reset_one_db()
+        except Exception:
+            pass
+
+    # Restore env so the test's own MARKET_MODE setup wins
+    if saved_env is None:
+        _os.environ.pop("MARKET_MODE", None)
+    else:
+        _os.environ["MARKET_MODE"] = saved_env
+    _reset_mp()
