@@ -42,10 +42,32 @@ def isolated_home(tmp_path, monkeypatch):
 
 
 def _reimport(modnames: list[str]):
+    """Reload modules so they re-resolve per-market paths after MARKET_MODE
+    changes.
+
+    IMPORTANT (test-isolation fix): we reload *in place* with
+    importlib.reload() instead of `del sys.modules[m]; import_module(m)`.
+
+    The delete-then-reimport approach created a BRAND-NEW module object in
+    sys.modules. Modules imported earlier (persistence, repository, …) kept
+    referencing the OLD `db` module, while any later `from db import …`
+    picked up the NEW one — a split-brain where writes went to one db
+    module's WAL connection and reads came from another's. This leaked
+    across files and made the full-suite run fail (`no such table: account`,
+    `get_meta` returning None) even though each file passed alone.
+
+    importlib.reload() keeps the SAME module object (mutates its __dict__),
+    so every cross-module reference stays coherent. Since db.current_db_path()
+    is already resolved dynamically, reloading is only needed to refresh
+    module-level constants captured at import time.
+    """
+    import sys
+    out = []
     for m in modnames:
-        if m in __import__("sys").modules:
-            del __import__("sys").modules[m]
-    return [importlib.import_module(m) for m in modnames]
+        mod = sys.modules.get(m)
+        out.append(importlib.reload(mod) if mod is not None
+                   else importlib.import_module(m))
+    return out
 
 
 # ---------------------------------------------------------------------------
