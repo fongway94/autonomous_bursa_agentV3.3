@@ -1,9 +1,21 @@
 # watchlist.py
 """
-Curated Bursa Malaysia watchlist + user-added custom tickers.
+Curated default watchlist + user-added custom tickers.
 
-Custom tickers are stored in SQLite (`custom_watchlist` table) but a
-JSON fallback file is also kept for backwards-compat with v1 data dirs.
+v3.6 multi-market change
+------------------------
+The full ~74-ticker Bursa universe still lives in BURSA_WATCHLIST below as
+the single source of truth for MY. The US universe is sourced from
+`market_profiles.us_profile.US_PROFILE.default_watchlist`.
+
+All public helpers (`get_all_tickers`, `get_ticker_sector`,
+`get_ticker_name`, `is_shariah_compliant`, etc.) DISPATCH on the active
+market profile. Callers (screener.py, market_analyzer.py, evaluation.py)
+need no changes.
+
+Custom tickers are stored in SQLite (`custom_watchlist` table) per-market
+(each market has its own DB file as of v3.6, so custom tickers are
+naturally isolated).
 """
 
 import os
@@ -12,6 +24,10 @@ from db import connect, myt_iso, DATA_DIR
 
 CUSTOM_WATCHLIST_FILE = os.path.join(DATA_DIR, "custom_watchlist.json")
 
+
+# ---------------------------------------------------------------------------
+# MY universe — full 74-ticker Bursa list (unchanged from v3.3)
+# ---------------------------------------------------------------------------
 
 BURSA_WATCHLIST = {
     "Construction": {
@@ -151,9 +167,43 @@ BURSA_WATCHLIST = {
 }
 
 
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Multi-market dispatch
+# ---------------------------------------------------------------------------
+
+def _active_code() -> str:
+    try:
+        from market_profiles import active_market_code
+        return active_market_code()
+    except Exception:
+        return "MY"
+
+
+def _us_curated_by_sector() -> dict[str, dict[str, str]]:
+    """Build a {sector: {yf_symbol: name}} map from us_profile for parity with BURSA_WATCHLIST."""
+    out: dict[str, dict[str, str]] = {}
+    try:
+        from market_profiles.us_profile import US_PROFILE
+        for t in US_PROFILE.default_watchlist:
+            out.setdefault(t.sector, {})[t.yf_symbol] = t.name
+    except Exception:
+        pass
+    return out
+
+
+def get_default_watchlist_by_sector() -> dict[str, dict[str, str]]:
+    """For UI display — {sector: {ticker: name}} for the active market.
+
+    MY → returns BURSA_WATCHLIST directly.
+    US → returns the leveraged-ETF + mega-cap basket from us_profile.
+    """
+    return BURSA_WATCHLIST if _active_code() == "MY" else _us_curated_by_sector()
+
+
+# ---------------------------------------------------------------------------
 # Custom tickers — SQLite-backed with JSON fallback
-# -------------------------------------------------------------------------
+# (table is per-market because each market has its own DB file in v3.6)
+# ---------------------------------------------------------------------------
 
 def _ensure_custom_table():
     with connect() as c:
@@ -161,8 +211,8 @@ def _ensure_custom_table():
             "CREATE TABLE IF NOT EXISTS custom_watchlist ("
             " ticker TEXT PRIMARY KEY, name TEXT, sector TEXT, added_at TEXT)"
         )
-    # Migrate from JSON file if present
-    if os.path.exists(CUSTOM_WATCHLIST_FILE):
+    # Migrate from JSON file if present (MY-only legacy path)
+    if _active_code() == "MY" and os.path.exists(CUSTOM_WATCHLIST_FILE):
         try:
             with open(CUSTOM_WATCHLIST_FILE) as f:
                 items = json.load(f)
@@ -192,10 +242,21 @@ def load_custom_watchlist_tickers() -> dict:
     return {r["ticker"]: {"name": r["name"], "sector": r["sector"]} for r in rows}
 
 
+def _normalise_ticker_for_active_market(ticker: str) -> str:
+    """Apply the active market's yf_template if the user typed a bare symbol."""
+    t = ticker.strip().upper()
+    if _active_code() == "MY":
+        if not t.endswith(".KL"):
+            t += ".KL"
+        return t
+    # US: bare symbol (no suffix). Strip a misplaced .KL if any.
+    if t.endswith(".KL"):
+        t = t[:-3]
+    return t
+
+
 def add_custom_ticker(ticker: str, name: str, sector: str = "Custom") -> str:
-    ticker = ticker.strip().upper()
-    if not ticker.endswith(".KL"):
-        ticker += ".KL"
+    ticker = _normalise_ticker_for_active_market(ticker)
     with connect() as c:
         c.execute(
             "INSERT OR REPLACE INTO custom_watchlist "
@@ -212,14 +273,16 @@ def remove_custom_ticker(ticker: str) -> None:
 
 def get_all_tickers() -> list[str]:
     tickers = []
-    for items in BURSA_WATCHLIST.values():
+    default = get_default_watchlist_by_sector()
+    for items in default.values():
         tickers.extend(items.keys())
     tickers.extend(load_custom_watchlist_tickers().keys())
     return sorted(set(tickers))
 
 
 def get_ticker_sector(ticker: str) -> str:
-    for sector, items in BURSA_WATCHLIST.items():
+    default = get_default_watchlist_by_sector()
+    for sector, items in default.items():
         if ticker in items:
             return sector
     custom = load_custom_watchlist_tickers().get(ticker)
@@ -227,23 +290,17 @@ def get_ticker_sector(ticker: str) -> str:
 
 
 def get_ticker_name(ticker: str) -> str:
-    for items in BURSA_WATCHLIST.values():
+    default = get_default_watchlist_by_sector()
+    for items in default.values():
         if ticker in items:
             return items[ticker]
     custom = load_custom_watchlist_tickers().get(ticker)
     return custom["name"] if custom else ticker
 
 
-# -------------------------------------------------------------------------
-# Shariah-compliant filter (optional, user-toggle)
-# -------------------------------------------------------------------------
-#
-# Default *non*-compliant set based on Securities Commission Malaysia
-# Shariah-compliant Securities List (best-effort, may drift between
-# SC's twice-yearly revisions). Users should verify with their broker.
-#
-# Banks (conventional interest income), brewers, gaming companies are
-# typically excluded.
+# ---------------------------------------------------------------------------
+# Shariah-compliant filter (MY-only; in US it's a no-op pass-through)
+# ---------------------------------------------------------------------------
 
 SHARIAH_NON_COMPLIANT = {
     # Conventional banks
@@ -259,7 +316,13 @@ SHARIAH_NON_COMPLIANT = {
 
 
 def is_shariah_compliant(ticker: str) -> bool:
-    """Best-effort check; user can override in Settings."""
+    """Best-effort check; user can override in Settings.
+
+    For non-MY markets the concept doesn't apply, so we return True
+    (treating the filter as a no-op).
+    """
+    if _active_code() != "MY":
+        return True
     return ticker not in SHARIAH_NON_COMPLIANT
 
 
