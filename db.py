@@ -67,22 +67,32 @@ def _resolve_db_path() -> str:
     `db.DB_PATH` to a custom path that DOESN'T match the auto-derived
     per-market path of any known market, honour it. This lets old tests
     using `monkeypatch.setattr(db, 'DB_PATH', tmp.db)` keep working.
+
+    Override detection is by BASENAME, not full path. A genuine test override
+    uses a foreign filename (e.g. `fake.db`, `test.db`, `restored.db`). An
+    *auto-computed* value always has the basename `bursa_agent_<CODE>.db`
+    (or the legacy `bursa_agent.db`). We must treat any auto-pattern basename
+    as "not an override" even when its directory differs — otherwise a stale
+    DB_PATH captured at first import (e.g. against the real $HOME before a
+    test fixture redirected HOME, or left over after importlib.reload) would
+    be mistaken for a deliberate override and silently win, pointing the
+    whole process at the wrong data dir / market.
     """
     overridden = globals().get("DB_PATH")
     try:
         from market_profiles import active_market_code, available_markets
         code = active_market_code()
         real = os.path.join(DATA_DIR, f"bursa_agent_{code}.db")
-        # Known per-market computed paths — these are NEVER overrides.
-        known_paths = {
-            os.path.join(DATA_DIR, f"bursa_agent_{c}.db")
-            for c in available_markets()
+        # Basenames that are auto-computed (never a deliberate override),
+        # regardless of which directory they live in.
+        auto_basenames = {
+            f"bursa_agent_{c}.db" for c in available_markets()
         }
-        known_paths.add(_LEGACY_DB_PATH)
+        auto_basenames.add(os.path.basename(_LEGACY_DB_PATH))  # bursa_agent.db
     except Exception:
         return _LEGACY_DB_PATH
-    if overridden and overridden not in known_paths:
-        # Patched to a foreign path → respect it (test fixture override)
+    if overridden and os.path.basename(overridden) not in auto_basenames:
+        # Foreign filename → a real test fixture override; respect it.
         return overridden
     return real
 
