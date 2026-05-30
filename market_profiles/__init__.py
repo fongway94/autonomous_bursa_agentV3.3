@@ -13,8 +13,12 @@ the MarketProfile Protocol — zero changes elsewhere.
 
 Active profile selection priority (first match wins):
     1. Environment variable `MARKET_MODE` (one of: MY, US)
-    2. `meta` table key `market` (set via Settings tab sidebar switcher)
+    2. Marker file `~/.bursa_agent_data/.active_market` (set by Settings tab)
     3. Default = MY (preserves v3.3 behaviour for existing deployments)
+
+NB: We deliberately do NOT read the market from the SQLite `meta` table —
+that would create a chicken-and-egg with `db.py` (whose DB_PATH depends on
+the active market). The text-file marker breaks the cycle cleanly.
 
 This module deliberately has NO imports from any business module to avoid
 circular imports. Profiles import their own dependencies.
@@ -24,6 +28,7 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 from typing import Optional
 
 from market_profiles.base import MarketProfile
@@ -31,6 +36,11 @@ from market_profiles.base import MarketProfile
 # Lazy-loaded, cached profile. Reset via set_active_market() on switch.
 _ACTIVE_PROFILE: Optional[MarketProfile] = None
 _LOCK = threading.RLock()
+
+# Marker file location — kept under DATA_DIR but managed here directly
+# (no `from db import DATA_DIR` to avoid circular import).
+_DATA_DIR = Path(os.path.expanduser("~")) / ".bursa_agent_data"
+_MARKER_FILE = _DATA_DIR / ".active_market"
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +52,7 @@ def active_profile() -> MarketProfile:
 
     Resolution order:
         1. env var MARKET_MODE
-        2. meta table key 'market' (if db importable)
+        2. ~/.bursa_agent_data/.active_market marker file
         3. default 'MY'
     """
     global _ACTIVE_PROFILE
@@ -52,12 +62,17 @@ def active_profile() -> MarketProfile:
         return _ACTIVE_PROFILE
 
 
+def active_market_code() -> str:
+    """Short form, e.g. 'MY' or 'US'. Cheaper than active_profile() in hot paths."""
+    return active_profile().code
+
+
 def set_active_market(market_code: str, persist: bool = True) -> MarketProfile:
     """Switch the active market profile at runtime.
 
     Args:
         market_code: 'MY' or 'US' (case-insensitive)
-        persist: if True, write to meta table so next boot picks it up
+        persist: if True, write to marker file so next boot picks it up
 
     Returns:
         The newly-activated MarketProfile.
@@ -71,7 +86,7 @@ def set_active_market(market_code: str, persist: bool = True) -> MarketProfile:
     with _LOCK:
         _ACTIVE_PROFILE = new_profile
     if persist:
-        _persist_market_to_meta(code)
+        _persist_market_to_marker(code)
     return new_profile
 
 
@@ -97,14 +112,13 @@ def _detect_market_code() -> str:
     if env in available_markets():
         return env
 
-    # 2. meta table (optional — db.py may not be importable in tests yet)
+    # 2. marker file
     try:
-        from db import get_meta  # type: ignore
-        meta_value = get_meta("market")
-        if meta_value and meta_value.upper() in available_markets():
-            return meta_value.upper()
+        if _MARKER_FILE.exists():
+            v = _MARKER_FILE.read_text(encoding="utf-8").strip().upper()
+            if v in available_markets():
+                return v
     except Exception:
-        # db not initialised, or in a test fixture — that's fine, fall through
         pass
 
     # 3. default
@@ -123,10 +137,10 @@ def _resolve_profile(code: str) -> MarketProfile:
     )
 
 
-def _persist_market_to_meta(code: str) -> None:
+def _persist_market_to_marker(code: str) -> None:
     try:
-        from db import set_meta  # type: ignore
-        set_meta("market", code)
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _MARKER_FILE.write_text(code, encoding="utf-8")
     except Exception:
         # best-effort — UI layer should surface failures if needed
         pass
@@ -135,7 +149,9 @@ def _persist_market_to_meta(code: str) -> None:
 __all__ = [
     "MarketProfile",
     "active_profile",
+    "active_market_code",
     "set_active_market",
     "available_markets",
     "reset_cache",
 ]
+
