@@ -44,9 +44,13 @@ from market_profiles.us_profile import US_PROFILE
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _reset_profile_cache():
-    """Clear active-profile cache and any MARKET_MODE env var between tests."""
+def _reset_profile_cache(tmp_path, monkeypatch):
+    """Clear active-profile cache, isolate marker file, scrub env var."""
     old_env = os.environ.pop("MARKET_MODE", None)
+    # Point the marker file at a temp dir so tests don't touch real ~/.bursa_agent_data/
+    monkeypatch.setattr(market_profiles, "_MARKER_FILE",
+                        tmp_path / ".active_market")
+    monkeypatch.setattr(market_profiles, "_DATA_DIR", tmp_path)
     reset_cache()
     yield
     reset_cache()
