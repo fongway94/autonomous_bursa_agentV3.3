@@ -22,6 +22,19 @@ from repository import get_trade, get_scheduler_state
 from logger import get_logger
 from notifier import dispatch
 
+
+def _ccy() -> str:
+    """Active market's currency symbol ('RM' / '$'). Falls back to 'RM'.
+
+    Alerts mirror real paper-trades, so the symbol must match the market the
+    trade was taken in (US trades show '$', MY trades show 'RM').
+    """
+    try:
+        from market_profiles import active_profile
+        return active_profile().currency_symbol
+    except Exception:
+        return "RM"
+
 log = get_logger("live_trigger")
 
 
@@ -165,15 +178,16 @@ def _format_entry(t: dict, ss: dict) -> tuple[str, str, str]:
     risk_pct = t.get("actual_risk_pct") or 0
     sector = t.get("sector") or "—"
 
+    cur = _ccy()
     text = (
         f"{_icon('ENTRY')} ENTRY ALERT — {t['ticker']} {t.get('name','')}\n"
         f"Time: {t.get('logged_at','')} MYT\n"
         f"Setup: {t.get('signal_type','')} | Confidence: {conf:.0f}/100\n"
         f"Brain mode: {brain}\n\n"
-        f"Action: BUY {t.get('shares',0):,} shares @ RM {t.get('entry_price',0):.3f}\n"
-        f"Stop Loss: RM {t.get('stop_loss',0):.3f} (-{risk_pct:.1f}% risk)\n"
-        f"TP1: RM {t.get('tp1',0):.3f} | TP2: RM {t.get('tp2',0):.3f} "
-        f"| TP3: RM {t.get('tp3',0):.3f}\n"
+        f"Action: BUY {t.get('shares',0):,} shares @ {cur} {t.get('entry_price',0):.3f}\n"
+        f"Stop Loss: {cur} {t.get('stop_loss',0):.3f} (-{risk_pct:.1f}% risk)\n"
+        f"TP1: {cur} {t.get('tp1',0):.3f} | TP2: {cur} {t.get('tp2',0):.3f} "
+        f"| TP3: {cur} {t.get('tp3',0):.3f}\n"
         f"Sector: {sector} | Regime: {regime}\n\n"
         f"Reasoning: {(t.get('entry_reasoning') or '')[:300]}"
     )
@@ -203,11 +217,12 @@ def _format_exit(t: dict, event_type: str, exit_price: float,
     label = label_map.get(event_type, event_type)
     outcome = t.get("outcome") or ("WIN" if pnl > 0 else "LOSS")
 
+    cur = _ccy()
     text = (
         f"{_icon(event_type)} {label} — {t['ticker']}\n"
         f"Time: {t.get('closed_at','')} MYT\n"
-        f"Action: SELL {t.get('shares',0):,} shares @ RM {exit_price:.3f}\n"
-        f"Result: {outcome} RM {pnl:+,.2f} | {pnl_pct:+.2f}% on cost\n"
+        f"Action: SELL {t.get('shares',0):,} shares @ {cur} {exit_price:.3f}\n"
+        f"Result: {outcome} {cur} {pnl:+,.2f} | {pnl_pct:+.2f}% on cost\n"
         f"Held: {held} days"
     )
     html = ("<pre style=\"font-family:monospace;font-size:13px;\">"
