@@ -579,15 +579,15 @@ with tab_scanner:
                       <div class="kvp"><span class="k">Confidence</span>
                           <span class="v">{row['confidence']:.0f}/100</span></div>
                       <div class="kvp"><span class="k">Price</span>
-                          <span class="v">RM {row['price']:.3f}
+                          <span class="v">{_ccy} {row['price']:.3f}
                           ({row['change_pct']:+.2f}%)</span></div>
                       <div class="kvp"><span class="k">Entry</span>
-                          <span class="v">RM {row['entry']:.3f}</span></div>
+                          <span class="v">{_ccy} {row['entry']:.3f}</span></div>
                       <div class="kvp"><span class="k">Stop Loss</span>
-                          <span class="v">RM {row['stop_loss']:.3f}
+                          <span class="v">{_ccy} {row['stop_loss']:.3f}
                           ({row['risk_pct']:.1f}% risk)</span></div>
                       <div class="kvp"><span class="k">TP1 / TP2 / TP3</span>
-                          <span class="v">RM {row['tp1']:.3f} ·
+                          <span class="v">{_ccy} {row['tp1']:.3f} ·
                           {row['tp2']:.3f} · {row['tp3']:.3f}</span></div>
                       <div class="kvp"><span class="k">RSI / Vol×</span>
                           <span class="v">{row['rsi']:.1f} ·
@@ -609,9 +609,9 @@ with tab_scanner:
                     cost_info = calculate_trade_cost(shares, row["entry"])
                     actual_risk = risk_per_share * shares
                     st.caption(
-                        f"Outlay ≈ RM {cost_info['gross']:,.0f} "
-                        f"+ fee RM {cost_info['fee']:.2f} "
-                        f"| Risk RM {actual_risk:,.0f}"
+                        f"Outlay ≈ {_ccy} {cost_info['gross']:,.0f} "
+                        f"+ fee {_ccy} {cost_info['fee']:.2f} "
+                        f"| Risk {_ccy} {actual_risk:,.0f}"
                     )
                     if st.button("✅ EXECUTE BUY ORDER",
                                  use_container_width=True, type="primary"):
@@ -777,12 +777,12 @@ with tab_portfolio:
     returns_pct = (equity / acc["initial_capital"] - 1) * 100
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Equity", f"RM {equity:,.0f}",
+    m1.metric("Equity", f"{_ccy} {equity:,.0f}",
               f"{returns_pct:+.2f}% vs start")
-    m2.metric("Cash", f"RM {acc['cash_balance']:,.0f}")
-    m3.metric("Active Cost", f"RM {total_active_cost:,.0f}")
-    m4.metric("Active MV", f"RM {total_active_value:,.0f}",
-              f"RM {(total_active_value-total_active_cost):+,.0f}")
+    m2.metric("Cash", f"{_ccy} {acc['cash_balance']:,.0f}")
+    m3.metric("Active Cost", f"{_ccy} {total_active_cost:,.0f}")
+    m4.metric("Active MV", f"{_ccy} {total_active_value:,.0f}",
+              f"{_ccy} {(total_active_value-total_active_cost):+,.0f}")
     m5.metric("Active Trades", len(active))
 
     st.markdown("### 🛡️ Risk Dashboard")
@@ -793,7 +793,7 @@ with tab_portfolio:
     r1.metric("Drawdown", f"{risk_stats['drawdown_pct']:.2f}%",
               delta=risk_stats["drawdown_level"], delta_color=dd_color)
     r2.metric("Exposure", f"{risk_stats['exposure_pct']:.1f}%",
-              f"RM {risk_stats['total_exposure_rm']:,.0f}")
+              f"{_ccy} {risk_stats['total_exposure_rm']:,.0f}")
     r3.metric("Positions",
               f"{risk_stats['active_positions']}/{risk_stats['max_positions_allowed']}")
     r4.metric("Trades today",
@@ -819,10 +819,12 @@ with tab_portfolio:
             sec_exp[sec] = sec_exp.get(sec, 0) + (t.get("cost") or 0)
         if sec_exp:
             st.markdown("### 🔥 Sector Exposure")
+            _exposure_label = f"exposure_{_current_profile.currency_iso.lower()}"
             df_sec = pd.DataFrame({"sector": list(sec_exp.keys()),
-                                   "exposure_rm": list(sec_exp.values())})
-            fig = px.bar(df_sec, x="sector", y="exposure_rm",
-                         color="exposure_rm", color_continuous_scale="Blues")
+                                   _exposure_label: list(sec_exp.values())})
+            fig = px.bar(df_sec, x="sector", y=_exposure_label,
+                         color=_exposure_label, color_continuous_scale="Blues",
+                         labels={_exposure_label: f"Exposure ({_ccy})"})
             fig.update_layout(**PLOTLY_LAYOUT, height=300)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -889,7 +891,7 @@ with tab_learning:
     a, b, c, d = st.columns(4)
     a.metric("Closed Trades", s["total_trades"])
     b.metric("Win Rate", f"{s['win_rate']}%")
-    c.metric("Total P&L", f"RM {s['total_pnl_rm']:,.0f}")
+    c.metric("Total P&L", f"{_ccy} {s['total_pnl_rm']:,.0f}")
     d.metric("Avg Win / Loss",
              f"{s['avg_win_rm']:.0f} / {s['avg_loss_rm']:.0f}")
 
@@ -998,7 +1000,7 @@ with tab_perf:
     cc = st.columns(4)
     cc[0].metric("Total Return",
                  f"{s['total_return_pct']:+.2f}%",
-                 f"RM {s['current_equity']:,.0f}")
+                 f"{_ccy} {s['current_equity']:,.0f}")
     cc[1].metric("Sharpe", r["sharpe"])
     cc[2].metric("Sortino", r["sortino"])
     cc[3].metric("Max Drawdown", f"{r['max_dd_pct']:.2f}%",
@@ -1007,7 +1009,7 @@ with tab_perf:
     cc2 = st.columns(4)
     cc2[0].metric("Profit Factor",
                   f"{e['profit_factor']}" if e["profit_factor"] else "∞")
-    cc2[1].metric("Expectancy", f"RM {e['expectancy_rm']:.2f}",
+    cc2[1].metric("Expectancy", f"{_ccy} {e['expectancy_rm']:.2f}",
                   f"R {e['expectancy_r']:+.2f}")
     cc2[2].metric("Avg MAE / MFE",
                   f"{mm['avg_mae_pct']:+.2f}% / {mm['avg_mfe_pct']:+.2f}%")
@@ -2028,9 +2030,8 @@ with tab_settings:
                        _rs.get("last_reconcile_at") or "never")
         with c3:
             _drift = _rs.get("last_reconcile_drift")
-            _ccy_local = (_bh.get("market") == "MY" and "RM ") or "$ "
             st.metric("Last drift",
-                       f"{_ccy_local}{_drift:+,.2f}" if _drift is not None else "—")
+                       f"{_ccy} {_drift:+,.2f}" if _drift is not None else "—")
 
         if st.button("🔎 Run reconciliation now"):
             with st.spinner("Querying broker + computing diffs..."):
