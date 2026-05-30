@@ -1,40 +1,42 @@
 # data_provider.py
 """
-Unified market-data provider with Moomoo OpenD → yfinance auto-fallback.
+Unified market-data provider — multi-market (v3.6).
 
-Goals
------
-1. Drop-in replacement for `yf.Ticker(t).history(period=..., timeout=...)` and
-   `yf.Ticker(t).history(start=..., end=..., timeout=...)` patterns used in
+What this module does
+---------------------
+1. Drop-in replacement for `yf.Ticker(t).history(...)` patterns used in
    screener.py, market_analyzer.py, evaluation.py, learner.py.
-2. Auto-detect Moomoo OpenD on first use. If unavailable, *stickily* fall back
-   to yfinance for the rest of the process — no per-call reconnect storms.
-3. Per-call defensive fallback: if Moomoo is "up" but a single call raises or
-   times out, serve that call from yfinance. After
-   `MOOMOO_MAX_CONSECUTIVE_FAILURES` consecutive failures, demote Moomoo for
+2. Auto-detect Moomoo OpenD on first use. If unavailable, stickily fall
+   back to yfinance for the rest of the process — no per-call reconnect storms.
+3. Per-call defensive fallback: if Moomoo is "up" but a single call raises
+   or times out, serve that call from yfinance. After
+   MOOMOO_MAX_CONSECUTIVE_FAILURES consecutive failures, demote Moomoo for
    the rest of the process.
-4. Ticker conversion is internal: callers always pass yfinance-style tickers
-   (e.g. `0166.KL`, `^KLSE`). The Moomoo path converts them to `MY.0166` /
-   `MY.800000` style on the way out.
-5. Output DataFrame is identical in shape to what yfinance returns:
-   columns = ['Open','High','Low','Close','Volume', ...], tz-aware
-   DatetimeIndex named 'Date'. Existing OHLCV validators and indicator code
-   keep working unmodified.
-6. Honors PROJECT_HANDBOOK rule #15: every network call has an explicit
-   `timeout=`. Moomoo SDK has no native timeout kwarg on `request_history_kline`,
-   so we run it in a helper thread and join with a deadline.
+4. **NEW in v3.6:** the ticker→moomoo-code conversion respects the ACTIVE
+   market profile. The same code path serves MY (`MY.0166`) and US
+   (`US.AAPL`) symbol mapping. If `active_profile().moomoo_available` is
+   False (MY today — Bursa not yet on OpenD), we never try moomoo for
+   that market's tickers — saves a TCP probe + SDK init.
+
+Output DataFrame shape is identical to yfinance.history() for both
+markets. Existing OHLCV validators and indicator code keep working.
+
+Honors PROJECT_HANDBOOK rule #15: every network call has an explicit
+`timeout=`. Moomoo SDK has no native timeout kwarg on
+`request_history_kline`, so we run it in a helper thread and join with
+a deadline.
 
 Env / Streamlit secrets
 -----------------------
 - `BURSA_DATA_PROVIDER` : `auto` (default) | `moomoo` | `yfinance`
+  (Name kept for backwards compatibility — applies to both markets.)
 - `MOOMOO_HOST`         : default `127.0.0.1`
 - `MOOMOO_PORT`         : default `11111`
 
 Public API
 ----------
 - `get_history(ticker, period=None, start=None, end=None, timeout=15)`
-- `provider_name()`  → 'moomoo' | 'yfinance' (whichever served the last call,
-                       or whichever we'd serve next if no calls yet)
+- `provider_name()`  → 'moomoo' | 'yfinance' (last call, or next-call guess)
 - `health()`         → dict for the Settings tab
 - `reset()`          → forget detection state (mainly for tests)
 """
@@ -72,8 +74,6 @@ _MOOMOO_PORT = int(os.getenv("MOOMOO_PORT", "11111"))
 # rest of the process. Each successful call resets the counter.
 MOOMOO_MAX_CONSECUTIVE_FAILURES = 5
 
-# How long to allow a Moomoo SDK call to run before we abandon it.
-# Caller can override per-call via the `timeout=` kwarg.
 DEFAULT_TIMEOUT_S = 15
 
 
@@ -82,41 +82,81 @@ DEFAULT_TIMEOUT_S = 15
 # ---------------------------------------------------------------------------
 
 _state_lock = threading.Lock()
-_quote_ctx = None              # cached OpenQuoteContext (or None)
-_moomoo_available: Optional[bool] = None   # None = not yet probed
+_quote_ctx = None                         # cached OpenQuoteContext (or None)
+_moomoo_available: Optional[bool] = None  # None = not yet probed
 _moomoo_failures = 0
-_last_served_by = "yfinance"   # for diagnostics
+_last_served_by = "yfinance"              # for diagnostics
 _init_error: Optional[str] = None
-_last_moomoo_error: Optional[str] = None  # v3.6: surface per-call failure reason in health()
+_last_moomoo_error: Optional[str] = None  # per-call failure surface for health()
 
 
 # ---------------------------------------------------------------------------
-# Ticker conversion
+# Ticker conversion (multi-market aware)
 # ---------------------------------------------------------------------------
 
 def _to_moomoo_code(ticker: str) -> Optional[str]:
     """
     Convert a yfinance-style ticker to a Moomoo `MARKET.CODE` string.
 
-    Returns None if we can't safely map it (e.g. an unknown index symbol).
-    The caller should treat None as "Moomoo can't serve this; use yfinance".
+    Dispatch logic:
+        '*.KL'  → MY.<base>      (Bursa equity)
+        '^KLSE' → MY.800000      (FBMKLCI index; may fail per SDK version)
+        bare    → US.<symbol>    (NYSE/NASDAQ)
+        '^...'  → US index — we don't map these; caller falls back to yfinance.
+
+    Returns None for symbols we can't safely map; the caller should treat
+    None as "moomoo can't serve this; use yfinance".
     """
     if not ticker:
         return None
     t = ticker.strip().upper()
 
-    # Bursa equities:  '0166.KL'  →  'MY.0166'
+    # Bursa equities
     if t.endswith(".KL"):
         return f"MY.{t[:-3]}"
 
-    # KLCI index. yfinance uses '^KLSE'. Moomoo uses 'MY.800000' for FBMKLCI.
-    # We don't fully trust this code across SDK versions, so let the caller's
-    # try/except path catch it and fall back to yfinance.
+    # KLCI index
     if t in ("^KLSE", "^FBMKLCI"):
         return "MY.800000"
 
-    # Anything else (US, HK, indices we don't know) → don't try Moomoo.
+    # US bare symbol (1-5 letters, optional dot like BRK.B → we keep it simple)
+    if t.replace(".", "").isalpha() and len(t.replace(".", "")) <= 6:
+        # Bare symbol that looks like a US ticker. SPY, AAPL, NVDA, BRK.B…
+        return f"US.{t}"
+
+    # Other indices (^SPX, ^IXIC, ^VIX, etc.) — fall back to yfinance.
     return None
+
+
+def _moomoo_market_for(ticker: str) -> str:
+    """Return the MARKET prefix (MY/US/HK/…) for a yfinance ticker."""
+    code = _to_moomoo_code(ticker)
+    if code is None:
+        return "UNKNOWN"
+    return code.split(".", 1)[0]
+
+
+def _market_supports_moomoo(ticker: str) -> bool:
+    """True if the active OR per-ticker market profile claims moomoo OpenD support."""
+    mkt = _moomoo_market_for(ticker)
+    if mkt == "MY":
+        # Static fact today: OpenD doesn't yet support MY.
+        # We honour the MY profile's moomoo_available flag so the day
+        # Moomoo enables MY, flipping that flag in my_profile.py turns this on.
+        try:
+            from market_profiles.my_profile import MY_PROFILE
+            return bool(MY_PROFILE.moomoo_available)
+        except Exception:
+            return False
+    if mkt == "US":
+        try:
+            from market_profiles.us_profile import US_PROFILE
+            return bool(US_PROFILE.moomoo_available)
+        except Exception:
+            return True   # US is the marquee supported market
+    # Future markets: assume supported. If wrong, the per-call try/except
+    # demotes moomoo for this process.
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +171,6 @@ def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
     SDK spawns a background reconnect thread in its constructor that will
     spam ECONNREFUSED forever on environments without OpenD (Streamlit Cloud,
     VPS without Moomoo Desktop, etc.) — even if we close the context.
-
-    Returns True only if the port accepts a TCP connection within `timeout` s.
     """
     import socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -152,14 +190,7 @@ def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
 def _try_init_moomoo() -> bool:
     """
     Probe whether Moomoo OpenD is reachable. Sets module state.
-
-    This is called at most once per process (unless `reset()` is called).
-    Returns True if Moomoo is usable, False otherwise.
-
-    Critical: we pre-check the TCP port with a raw socket BEFORE creating
-    OpenQuoteContext, because the moomoo SDK's constructor spawns a
-    background reconnect thread that cannot be cleanly killed and will
-    spam ECONNREFUSED to logs forever on environments without OpenD.
+    Called at most once per process (unless `reset()` is called).
     """
     global _quote_ctx, _moomoo_available, _init_error
 
@@ -170,7 +201,6 @@ def _try_init_moomoo() -> bool:
         return False
 
     try:
-        # Local import so missing moomoo-api doesn't break yfinance-only deploys.
         from moomoo import OpenQuoteContext, RET_OK  # noqa: F401
     except ImportError as e:
         _moomoo_available = False
@@ -178,17 +208,14 @@ def _try_init_moomoo() -> bool:
         log.info("data_provider: moomoo-api not installed, using yfinance")
         return False
 
-    # Pre-check: is the OpenD port even open? Skip all the SDK gymnastics if not.
     if not _is_port_open(_MOOMOO_HOST, _MOOMOO_PORT, timeout=1.0):
         _moomoo_available = False
         _init_error = f"OpenD port {_MOOMOO_HOST}:{_MOOMOO_PORT} not open (no listener)"
         log.info("data_provider: %s — using yfinance", _init_error)
         return False
 
-    # Port is open — safe to instantiate the SDK context (won't spawn zombie threads).
     try:
         ctx = OpenQuoteContext(host=_MOOMOO_HOST, port=_MOOMOO_PORT)
-        # Cheap liveness check: get_global_state is documented & fast.
         ret, _data = ctx.get_global_state()
         if ret != 0:  # RET_OK == 0
             try:
@@ -257,7 +284,6 @@ def _resolve_window(period: Optional[str],
                     end: Optional[str]) -> Tuple[str, str]:
     """Return (start_str, end_str) as YYYY-MM-DD for Moomoo."""
     if start is not None or end is not None:
-        # Normalise to strings.
         end_d = pd.to_datetime(end).date() if end is not None else datetime.now(timezone.utc).date()
         if start is not None:
             start_d = pd.to_datetime(start).date()
@@ -281,13 +307,15 @@ def _resolve_window(period: Optional[str],
 # Moomoo fetch (with thread-based timeout)
 # ---------------------------------------------------------------------------
 
-def _moomoo_kline_normalise(df: pd.DataFrame) -> pd.DataFrame:
-    """Reshape Moomoo's kline DataFrame to match yfinance.history() output."""
+def _moomoo_kline_normalise(df: pd.DataFrame, market: str) -> pd.DataFrame:
+    """Reshape Moomoo's kline DataFrame to match yfinance.history() output.
+
+    `market` ('MY'/'US'/...) picks the timezone we localise to so the
+    DatetimeIndex semantics match what yfinance would have returned.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Moomoo columns of interest: time_key, open, close, high, low, volume,
-    # turnover (optional), pe_ratio (optional), turnover_rate (optional).
     rename = {
         "open": "Open", "high": "High", "low": "Low",
         "close": "Close", "volume": "Volume",
@@ -295,14 +323,19 @@ def _moomoo_kline_normalise(df: pd.DataFrame) -> pd.DataFrame:
     out = df.rename(columns=rename).copy()
 
     if "time_key" not in df.columns and "time_key" not in out.columns:
-        # Some SDK versions name it differently; bail to yfinance.
         return pd.DataFrame()
 
     ts = pd.to_datetime(out["time_key"])
-    # yfinance returns tz-aware (Asia/Kuala_Lumpur-naive but tz-aware UTC-ish).
-    # Localise to Asia/Kuala_Lumpur to mirror Bursa session timestamps.
+
+    tz_for_market = {
+        "MY": "Asia/Kuala_Lumpur",
+        "US": "America/New_York",
+        "HK": "Asia/Hong_Kong",
+        "SG": "Asia/Singapore",
+    }.get(market, "Asia/Kuala_Lumpur")
+
     try:
-        ts = ts.dt.tz_localize("Asia/Kuala_Lumpur", nonexistent="shift_forward",
+        ts = ts.dt.tz_localize(tz_for_market, nonexistent="shift_forward",
                                ambiguous="NaT")
     except TypeError:
         # Already tz-aware
@@ -312,7 +345,6 @@ def _moomoo_kline_normalise(df: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in out.columns]
     out = out[keep]
 
-    # Drop rows with all-NaN OHLC (mirrors yfinance behaviour)
     out = out.dropna(how="all", subset=[c for c in ["Open", "Close"] if c in out.columns])
     return out
 
@@ -330,7 +362,12 @@ def _fetch_moomoo(ticker: str,
 
     code = _to_moomoo_code(ticker)
     if code is None:
-        return None  # not a Moomoo-mappable symbol
+        return None
+    market = code.split(".", 1)[0]
+
+    if not _market_supports_moomoo(ticker):
+        # MY today: OpenD doesn't serve it; skip silently rather than spam.
+        return None
 
     s_str, e_str = _resolve_window(period, start, end)
 
@@ -373,14 +410,12 @@ def _fetch_moomoo(ticker: str,
     t.join(timeout=max(1.0, float(timeout)))
 
     if t.is_alive():
-        # Moomoo SDK hung. Don't try to cancel — just abandon the thread
-        # and treat as failure. Watchdog (rule #15) is our safety net.
         return _moomoo_failure_signal(f"timeout after {timeout}s")
 
     if result["err"]:
         return _moomoo_failure_signal(result["err"])
 
-    df = _moomoo_kline_normalise(result["df"])
+    df = _moomoo_kline_normalise(result["df"], market=market)
     _moomoo_success_signal()
     return df
 
@@ -440,27 +475,21 @@ def get_history(ticker: str,
     """
     Drop-in replacement for `yf.Ticker(ticker).history(...)`.
 
-    Tries Moomoo first if available, falls back to yfinance on any failure
-    for that single call. After repeated failures Moomoo is demoted for the
-    rest of the process.
-
-    Parameters mirror yfinance:
-      - period: '1d','5d','1mo','3mo','6mo','1y','2y','3y','5y','10y','ytd','max'
-      - start / end: anything pd.to_datetime() accepts
-      - timeout: seconds; passed to yfinance and enforced via thread-join on Moomoo.
-
-    Returns a (possibly empty) DataFrame with Open/High/Low/Close/Volume.
+    Tries Moomoo first if available AND the ticker's market is on the
+    moomoo supported list. Otherwise (or on any failure) falls back to
+    yfinance for that single call. After repeated failures Moomoo is
+    demoted for the rest of the process.
     """
     global _last_served_by
 
     _ensure_provider_decided()
 
-    if _moomoo_available:
+    if _moomoo_available and _market_supports_moomoo(ticker):
         df = _fetch_moomoo(ticker, period, start, end, timeout)
         if df is not None and not df.empty:
             _last_served_by = "moomoo"
             return df
-        # Moomoo couldn't serve this one — fall through to yfinance for *this* call.
+        # Fall through to yfinance for this single call.
 
     df = _fetch_yfinance(ticker, period, start, end, timeout)
     _last_served_by = "yfinance"
@@ -468,30 +497,28 @@ def get_history(ticker: str,
 
 
 def provider_name() -> str:
-    """
-    Returns the provider that served the last call, or the provider we'd use
-    for the next call if none have been served yet.
-    """
+    """Provider that served the last call, or our guess for the next call."""
     if _moomoo_available is None:
-        # Haven't probed yet. Best guess from env.
         return "yfinance" if _PROVIDER_ENV == "yfinance" else "auto"
     return _last_served_by
 
 
 def ensure_probed() -> None:
-    """
-    Public alias for the internal probe. Safe to call from UI code (e.g.
-    the Settings tab Data Source panel) to make sure `health()` and
-    `provider_name()` report the actually-active provider rather than "auto".
-
-    No-op if a probe has already happened in this process.
-    """
+    """Public alias for the internal probe — safe to call from the Settings tab."""
     _ensure_provider_decided()
 
 
 def health() -> dict:
     """Diagnostic snapshot for the Settings tab."""
+    # Active market context, so the Settings panel can show e.g.
+    # "US market active; Moomoo available; serving from moomoo".
+    try:
+        from market_profiles import active_market_code
+        market = active_market_code()
+    except Exception:
+        market = "MY"
     return {
+        "active_market": market,
         "provider_env": _PROVIDER_ENV,
         "moomoo_available": bool(_moomoo_available),
         "moomoo_host": _MOOMOO_HOST,
@@ -499,17 +526,18 @@ def health() -> dict:
         "moomoo_consecutive_failures": _moomoo_failures,
         "last_served_by": _last_served_by,
         "init_error": _init_error,
-        # v3.6: per-call failure reason (e.g. "Unsupported quote market")
-        # Distinct from init_error (which is connect-time failure).
         "last_moomoo_error": _last_moomoo_error,
+        # v3.6: explicit per-market support flag so the UI can render
+        # "📡 OpenD not yet available for MY market" without re-probing.
+        "moomoo_supports_active_market": (
+            _market_supports_moomoo("AAPL") if market == "US"
+            else _market_supports_moomoo("1155.KL")
+        ),
     }
 
 
 def reset() -> None:
-    """
-    Forget detection state. Mainly for tests; also useful from the Settings
-    tab if the user starts OpenD after the app already booted.
-    """
+    """Forget detection state. Mainly for tests; also useful if OpenD was started after boot."""
     global _quote_ctx, _moomoo_available, _moomoo_failures, _init_error
     global _last_served_by, _last_moomoo_error
     with _state_lock:
@@ -524,3 +552,4 @@ def reset() -> None:
         _init_error = None
         _last_served_by = "yfinance"
         _last_moomoo_error = None
+
