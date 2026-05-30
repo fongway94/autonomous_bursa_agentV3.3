@@ -429,11 +429,21 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
             sess_name = sess.name if sess else "outside-session"
             from market_calendar import market_status_text
             ms = market_status_text()
+            # v3.6: describe the active market's safe-entry window instead of
+            # hardcoding Bursa hours. Shown to a Malaysia-based user, so the
+            # helper appends the MYT equivalent for non-MY markets.
+            try:
+                from market_profiles import active_profile
+                from market_profiles.base import format_session_window
+                _win = format_session_window(active_profile(), with_user_local=True)
+            except Exception:
+                _win = "the configured session window"
             log_scheduler_event(
                 "AUTO_ENTRY_SKIP",
                 f"0 entries — In {sess_name} session "
                 f"({ms.get('reason', '')}). "
-                "New auto-entries only fire 09:00-12:30 and 14:30-16:00 MYT. "
+                f"New auto-entries only fire during {_win} "
+                f"(up to the safe-entry cutoff). "
                 f"Next opportunity: {ms.get('next_event', '?')}",
                 "INFO",
                 payload={"reason": "outside_safe_entry_window",
