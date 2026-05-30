@@ -231,19 +231,59 @@ if "log_deduped" not in st.session_state:
 # =========================================================================
 
 with st.sidebar:
-    st.markdown("## 🚀 BursaAI Agent")
-    st.caption("Bursa Malaysia · Paper Trading · v3 — auto-trade default ON")
+    # v3.6 Block 7 — Multi-market switcher.
+    # The active market governs which DB file is used, the watchlist,
+    # the trading calendar/timezone, the currency, lot size, fees,
+    # and whether SIMULATE/REAL execution modes are even available.
+    from market_profiles import (
+        active_profile as _active_profile_fn,
+        active_market_code as _active_code_fn,
+        set_active_market as _set_market_fn,
+        available_markets as _avail_markets_fn,
+    )
+    _current_profile = _active_profile_fn()
+    _current_market = _current_profile.code
+    _ccy = _current_profile.currency_symbol  # "RM" or "$"
+
+    st.markdown(f"## 🚀 {_current_profile.flag_emoji} BursaAI Agent")
+    st.caption(
+        f"{_current_profile.display_name} · Paper Trading · v3.6 multi-market"
+    )
+
+    # Market switcher
+    _markets = _avail_markets_fn()
+    _market_labels = {
+        m: f"{_active_profile_fn().flag_emoji if m == _current_market else ('🇲🇾' if m == 'MY' else '🇺🇸')} {m}"
+        for m in _markets
+    }
+    new_market = st.selectbox(
+        "🌐 Market",
+        options=_markets,
+        index=_markets.index(_current_market),
+        format_func=lambda m: ("🇲🇾 MY — Bursa Malaysia" if m == "MY"
+                                else "🇺🇸 US — NYSE/NASDAQ"),
+        help=(
+            "Switch active market. Each market has its OWN database file "
+            "(bursa_agent_MY.db / bursa_agent_US.db) so trades, brain, "
+            "and risk params are fully isolated. App reloads on switch."
+        ),
+    )
+    if new_market != _current_market:
+        _set_market_fn(new_market, persist=True)
+        st.success(f"Market switched to {new_market}. Reloading…")
+        st.rerun()
 
     acc = load_account()
     new_cap = st.number_input(
-        "Initial Capital (RM)", min_value=1000.0, max_value=10_000_000.0,
+        f"Initial Capital ({_ccy})",
+        min_value=1000.0, max_value=10_000_000.0,
         value=float(acc["initial_capital"]), step=1000.0,
     )
     if abs(new_cap - acc["initial_capital"]) > 0.5:
         if st.button("💾 Update Capital", use_container_width=True):
             save_account(initial_capital=new_cap, cash_balance=new_cap,
                          total_equity=new_cap)
-            st.success(f"Capital reset to RM {new_cap:,.0f}")
+            st.success(f"Capital reset to {_ccy} {new_cap:,.0f}")
             st.rerun()
 
     risk_pct = st.slider("Risk per Trade (%)", 0.25, 3.0, 1.0, 0.25)
@@ -253,11 +293,11 @@ with st.sidebar:
         f"""
         <div class="bursa-card bursa-card-info">
           <div class="kvp"><span class="k">Risk per Trade</span>
-            <span class="v">RM {risk_amount:,.0f}</span></div>
+            <span class="v">{_ccy} {risk_amount:,.0f}</span></div>
           <div class="kvp"><span class="k">Cash</span>
-            <span class="v">RM {acc['cash_balance']:,.0f}</span></div>
+            <span class="v">{_ccy} {acc['cash_balance']:,.0f}</span></div>
           <div class="kvp"><span class="k">Equity</span>
-            <span class="v">RM {acc['total_equity']:,.0f}</span></div>
+            <span class="v">{_ccy} {acc['total_equity']:,.0f}</span></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -290,6 +330,42 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+
+    # v3.6 Block 7 — Broker execution badge.
+    # Shows current broker_mode + a connection light when SIMULATE/REAL.
+    try:
+        from broker_adapter import get_broker_mode, adapter_health
+        _broker_mode = get_broker_mode()
+        _broker_h = adapter_health()
+        if _broker_mode == "NOOP":
+            _bm_class = "bursa-card-info"
+            _bm_emoji = "🔕"
+            _bm_status = "Notification-only (paper)"
+        elif _broker_h.get("connected"):
+            _bm_class = "bursa-card-good"
+            _bm_emoji = "🟢"
+            _bm_status = f"{_broker_mode} · Connected"
+        else:
+            _bm_class = "bursa-card-bad"
+            _bm_emoji = "🔴"
+            _bm_status = f"{_broker_mode} · Disconnected"
+        st.markdown(
+            f"""
+            <div class="bursa-card {_bm_class}">
+              <div style="font-weight:700; margin-bottom:6px;">{_bm_emoji} Broker · {_bm_status}</div>
+              <div class="kvp"><span class="k">Mode</span>
+                <span class="v">{_broker_mode}</span></div>
+              <div class="kvp"><span class="k">Adapter</span>
+                <span class="v">{_broker_h.get('adapter_name', '—')}</span></div>
+              <div class="kvp"><span class="k">Moomoo for {_current_market}</span>
+                <span class="v">{'✅' if _broker_h.get('moomoo_available_for_market') else '❌ not yet'}</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        # broker_adapter not importable — non-fatal, just skip the badge
+        pass
 
     # v3.1.9: Persist the Start button result in session_state so the
     # warning survives the immediate st.rerun() and is visible to the user.
@@ -1816,6 +1892,158 @@ with tab_settings:
         "with Moomoo Desktop + OpenD on port 11111, real-time data is used "
         "automatically."
     )
+
+    # -----------------------------------------------------------------
+    # v3.6 Block 7 — Execution Mode (NOOP / SIMULATE / REAL)
+    # -----------------------------------------------------------------
+    st.markdown("### 🎯 Execution Mode")
+    from broker_adapter import (
+        get_broker_mode as _br_get_mode, set_broker_mode as _br_set_mode,
+        adapter_health as _br_health,
+        reset_adapter_cache as _br_reset_cache,
+    )
+    _cur_mode = _br_get_mode()
+    _bh = _br_health()
+    _moomoo_ready = bool(_bh.get("moomoo_available_for_market"))
+
+    st.caption(
+        "Controls whether the agent ONLY sends Telegram alerts (NOOP) or "
+        "ALSO places matching orders via Moomoo OpenAPI (SIMULATE / REAL). "
+        "Internal paper-trade engine + Bayesian brain are unaffected; the "
+        "broker is a parallel mirror with periodic reconciliation."
+    )
+
+    if not _moomoo_ready:
+        st.info(
+            f"📡 The active market (**{_bh.get('market', '?')}**) does not "
+            "yet have Moomoo OpenAPI support. Only NOOP mode is available. "
+            "Switch to the 🇺🇸 US market in the sidebar to enable "
+            "SIMULATE / REAL execution."
+        )
+    else:
+        _opts = ["NOOP", "SIMULATE", "REAL"]
+        _new_mode = st.selectbox(
+            "Broker execution mode",
+            options=_opts,
+            index=_opts.index(_cur_mode),
+            help=(
+                "NOOP — paper-trade only, send Telegram alerts; you "
+                "manually mirror in Moomoo.\n\n"
+                "SIMULATE — agent places real orders in moomoo's "
+                "paper-trading account (no real money). Recommended for "
+                "first 4-6 weeks of validation.\n\n"
+                "REAL — agent places live orders with real money. "
+                "Requires MOOMOO_TRADING_PWD in env/secrets and an unlocked "
+                "moomoo trading session. ONLY use after SIMULATE has "
+                "matched paper-trade outcomes for at least a month."
+            ),
+        )
+
+        if _new_mode == "REAL" and not _bh.get("real_pwd_configured"):
+            st.error(
+                "❌ Cannot activate REAL mode — `MOOMOO_TRADING_PWD` "
+                "environment variable / Streamlit Secret is not set. "
+                "Configure it first, restart, then come back."
+            )
+            _save_disabled = True
+        else:
+            _save_disabled = False
+
+        if _new_mode != _cur_mode and not _save_disabled:
+            # Show a warning banner for REAL mode upgrades
+            if _new_mode == "REAL":
+                st.warning(
+                    "⚠️ You are about to enable LIVE TRADING. "
+                    "The agent will place real orders with real money "
+                    "using your moomoo account. "
+                    "Recommended only after a successful SIMULATE period."
+                )
+            if st.button(f"💾 Switch broker mode to {_new_mode}", type="primary"):
+                _br_set_mode(_new_mode)
+                _br_reset_cache()
+                st.success(
+                    f"Broker mode set to **{_new_mode}**. "
+                    "The next scheduler cycle will use the new mode."
+                )
+                st.rerun()
+
+        # Connection diagnostics
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            if _bh.get("connected"):
+                st.success("✅ Moomoo OpenD: connected")
+            else:
+                st.warning("⚠️ Moomoo OpenD: not connected")
+                if _bh.get("last_error"):
+                    st.caption(f"Last error: {_bh['last_error']}")
+        with c2:
+            with st.expander("Full diagnostics", expanded=False):
+                st.json(_bh)
+
+        if st.button("🔌 Test broker connection"):
+            from broker_adapter import get_broker_adapter as _ga
+            _br_reset_cache()
+            _adapter = _ga()
+            _ok = _adapter.connect()
+            if _ok:
+                st.success(f"✅ Connected as {_adapter.name} in {_cur_mode} mode")
+            else:
+                _err = getattr(_adapter, "last_error", lambda: None)()
+                st.error(f"❌ Connect failed: {_err or 'unknown'}")
+
+    # -----------------------------------------------------------------
+    # v3.6 Block 7 — Reconciliation status
+    # -----------------------------------------------------------------
+    st.markdown("### 🔄 Broker Reconciliation")
+    st.caption(
+        "Every scheduler cycle compares internal account+positions to the "
+        "broker. When equity drift exceeds 0.5% or any position quantity "
+        "differs, a Telegram `RECONCILE_DRIFT` alert is sent. The agent "
+        "never mutates internal state from broker data — drift is "
+        "observation-only."
+    )
+    try:
+        from reconciliation import (
+            get_reconciliation_status as _rec_status,
+            run_reconciliation as _run_rec,
+        )
+        _rs = _rec_status()
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Mode", _rs.get("broker_mode", "?"))
+        with c2:
+            st.metric("Last run",
+                       _rs.get("last_reconcile_at") or "never")
+        with c3:
+            _drift = _rs.get("last_reconcile_drift")
+            _ccy_local = (_bh.get("market") == "MY" and "RM ") or "$ "
+            st.metric("Last drift",
+                       f"{_ccy_local}{_drift:+,.2f}" if _drift is not None else "—")
+
+        if st.button("🔎 Run reconciliation now"):
+            with st.spinner("Querying broker + computing diffs..."):
+                _result = _run_rec()
+            if not _result.ran:
+                st.info(f"Skipped: {_result.reason_skipped}")
+            elif _result.error:
+                st.error(f"Reconciliation error: {_result.error}")
+            elif _result.is_clean():
+                st.success(
+                    f"✅ Clean — equity drift "
+                    f"{_result.equity_drift_pct:.3f}% (threshold "
+                    f"{_result.drift_threshold_pct:.2f}%), 0 position diffs."
+                )
+            else:
+                st.warning(
+                    f"⚠️ Drift detected — equity drift "
+                    f"{_result.equity_drift:+,.2f} "
+                    f"({_result.equity_drift_pct:.3f}%), "
+                    f"{len(_result.position_diffs)} position diffs."
+                )
+                with st.expander("Details", expanded=True):
+                    st.json(_result.to_dict())
+    except Exception as e:
+        st.warning(f"Reconciliation panel unavailable: {e}")
 
     # -----------------------------------------------------------------
     # Corporate Actions (v3.5 — auto-handling of splits / bonus / dividends)
