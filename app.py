@@ -273,6 +273,18 @@ with st.sidebar:
         st.success(f"Market switched to {new_market}. Reloading…")
         st.rerun()
 
+    # v3.6 hotfix: ensure the active market's DB has schema + seed rows
+    # for every rerun. Cheap idempotent CREATE TABLE IF NOT EXISTS calls.
+    # This is the safety net for "user changed MARKET_MODE env var on
+    # Streamlit Cloud secrets" — the app comes back up against a market
+    # whose DB has never been initialised.
+    try:
+        from db import init_db as _init_active_db
+        _init_active_db()
+    except Exception as _e:
+        st.error(f"DB init failed for active market: {_e}")
+        st.stop()
+
     acc = load_account()
     new_cap = st.number_input(
         f"Initial Capital ({_ccy})",
