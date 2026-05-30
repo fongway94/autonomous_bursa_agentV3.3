@@ -87,6 +87,20 @@ def set_active_market(market_code: str, persist: bool = True) -> MarketProfile:
         _ACTIVE_PROFILE = new_profile
     if persist:
         _persist_market_to_marker(code)
+
+    # v3.6 hotfix: ensure the newly-active market's DB has its schema +
+    # singleton rows seeded. Without this, the very first switch to a fresh
+    # market crashes with `sqlite3.OperationalError: no such table: account`
+    # because db.py only ran init_db() at module load time against the
+    # market that was active then.
+    try:
+        from db import init_db
+        init_db()
+    except Exception:
+        # If db.py isn't importable (e.g. very early bootstrap), the next
+        # app.py rerun will catch it via its own init_db() call.
+        pass
+
     return new_profile
 
 
