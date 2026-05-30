@@ -176,5 +176,10 @@ def test_ml_constants_defined():
     import persistence
     assert hasattr(persistence, "ML_GIST_FILENAME")
     assert hasattr(persistence, "ML_MODEL_PATH")
-    assert persistence.ML_GIST_FILENAME == "setup_classifier.pkl.b64.gz"
+    # v3.6: ML model backups are per-market so MY and US brains don't
+    # overwrite each other in the shared Gist. Filename now carries the
+    # active market code, e.g. "setup_classifier_MY.pkl.b64.gz".
+    assert persistence.ML_GIST_FILENAME.startswith("setup_classifier_")
+    assert persistence.ML_GIST_FILENAME.endswith(".pkl.b64.gz")
+    assert persistence._ml_gist_filename() == persistence.ML_GIST_FILENAME
     assert "setup_classifier.pkl" in persistence.ML_MODEL_PATH
