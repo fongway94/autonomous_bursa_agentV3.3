@@ -3,15 +3,20 @@
 Enhanced Screener — Integrates market regime, relative strength ranking,
 and Bayesian state scoring into the scanning engine.
 
-Fixes vs v1
------------
+v3.6 multi-market change
+------------------------
+* All currency strings in user-facing output use the active market's symbol.
+* Ticker universe comes from `watchlist.get_all_tickers()` which itself
+  dispatches on the active profile (MY → BURSA_WATCHLIST, US → US_PROFILE).
+* Indicator math is market-agnostic and unchanged.
+* The BEAR-regime ⚠️ tagging behaviour is preserved.
+
+Fixes vs v1 (still guarded)
+---------------------------
 * Breakout threshold corrected (>= prev_resistance * 1.000 not 0.98).
-* Indicator math unchanged (was correct).
-* Parameters loaded from SQLite via repository.
 * Bayesian per-state action score replaces fake Q-learning.
 * Each fetched dataframe is run through data_quality.validate_ohlcv.
-* Optional secondary data source (pandas-based fallback) — disabled by
-  default, hook is present.
+* ThreadPool future.result(timeout=30) (v3.3 invariant).
 """
 
 import pandas as pd
@@ -26,8 +31,17 @@ from logger import get_logger
 
 log = get_logger("screener")
 
+
+def _ccy() -> str:
+    try:
+        from market_profiles import active_profile
+        return active_profile().currency_symbol
+    except Exception:
+        return "RM"
+
+
 # ---------------------------------------------------------------------------
-# Indicator math
+# Indicator math (unchanged from v3.3)
 # ---------------------------------------------------------------------------
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -90,6 +104,7 @@ def compute_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
 def get_recent_5day_analysis(df: pd.DataFrame, params: dict) -> list[dict]:
     if df.empty or len(df) < 6:
         return []
+    ccy = _ccy()
     out = []
     for i in range(-5, 0):
         row = df.iloc[i]
@@ -124,7 +139,7 @@ def get_recent_5day_analysis(df: pd.DataFrame, params: dict) -> list[dict]:
 
         out.append({
             "Date": df.index[i].strftime("%Y-%m-%d"),
-            "Close": f"RM {close:.3f}",
+            "Close": f"{ccy} {close:.3f}",
             "Change": f"{daily_change:+.2f}%",
             "VolRatio": f"{vol_ratio:.2f}x",
             "RSI": f"{rsi:.1f}",
@@ -165,6 +180,7 @@ def analyze_stock_setup(ticker, df, params,
                         market_regime=None, rs_data=None, q_action=None):
     if df is None or df.empty or len(df) < 5:
         return None
+    ccy = _ccy()
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -197,7 +213,6 @@ def analyze_stock_setup(ticker, df, params,
     is_volume_spike = vol_ratio >= params.get("volume_surge_ratio", 1.5)
     is_dry_volume = vol_ratio < 0.8
 
-    # FIX: breakout requires actually breaking above prior resistance.
     is_breakout_resistance = close >= float(prev["Resistance_20"]) * 1.000
     is_ema_bull_cross = (ema_fast > ema_slow) and \
                         (float(prev["EMA_Fast"]) <= float(prev["EMA_Slow"]))
@@ -263,7 +278,7 @@ def analyze_stock_setup(ticker, df, params,
                 base_confidence += 10
             if rs_signal == "LEADING":
                 base_confidence += 8
-                reasoning.append("Stock leading market (RS > 1.2x vs KLCI).")
+                reasoning.append("Stock leading market (RS > 1.2x vs benchmark).")
             elif rs_signal == "LAGGING":
                 base_confidence -= 5
                 reasoning.append("⚠️ Stock lagging market — weak RS.")
@@ -293,7 +308,7 @@ def analyze_stock_setup(ticker, df, params,
         else:
             signal_type = "HOLD / WATCH"
             if not is_in_price_range:
-                reasoning.append(f"Price RM {close:.2f} outside range "
+                reasoning.append(f"Price {ccy} {close:.2f} outside range "
                                  f"({min_price:.2f}–{max_price:.2f}).")
             else:
                 reasoning.append("Uptrend intact, no active trigger.")
@@ -313,9 +328,6 @@ def analyze_stock_setup(ticker, df, params,
     if sector in sec_biases:
         bias_adj += (sec_biases[sector] - 1.0) * 10.0
 
-    # Confidence is regime-independent (pure signal quality).
-    # Regime risk is handled by position sizing + position cap in
-    # risk_manager and scheduler (not by crushing the score here).
     base_confidence = base_confidence + bias_adj
     base_confidence = float(np.clip(base_confidence, 5.0, 99.0))
 
@@ -421,7 +433,12 @@ def screen_all_stocks(progress_callback=None, market_regime=None):
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(fetch_and_calculate, t, params): t for t in tickers}
         for fut in as_completed(futures):
-            ticker, df = fut.result(timeout=30)
+            try:
+                ticker, df = fut.result(timeout=30)
+            except Exception as e:
+                log.warning(f"future.result timeout/error: {e}")
+                completed += 1
+                continue
             completed += 1
             if progress_callback:
                 progress_callback(completed / total,
@@ -429,7 +446,6 @@ def screen_all_stocks(progress_callback=None, market_regime=None):
             if df is None or df.empty:
                 continue
 
-            # Bayesian state-action score
             try:
                 last = df.iloc[-1]
                 state_id = discretize_state(
