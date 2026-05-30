@@ -175,6 +175,35 @@ def _run_corporate_actions_step(summary: dict) -> None:
         )
 
 
+def _run_reconciliation_step(summary: dict) -> None:
+    """
+    v3.6 Block 6 — Compare internal state to broker state, log drift.
+
+    Runs at the END of each cycle (after all settles + entries) so the
+    snapshot reflects the cycle's actual outcome. Skipped automatically
+    when broker_mode == NOOP or the market has no broker support.
+
+    Mutates `summary` to add reconcile_* keys. Catches all exceptions
+    internally — reconciliation MUST NOT abort the trading cycle.
+    """
+    try:
+        from reconciliation import run_reconciliation
+        rec = run_reconciliation(alert_on_drift=True)
+        summary["reconcile_ran"] = rec.ran
+        summary["reconcile_drift_flagged"] = rec.drift_flagged
+        summary["reconcile_equity_drift_pct"] = rec.equity_drift_pct
+        summary["reconcile_position_diffs"] = len(rec.position_diffs)
+        if not rec.ran:
+            summary["reconcile_skip_reason"] = rec.reason_skipped
+    except Exception as e:
+        log_scheduler_event(
+            "RECONCILE_ERROR",
+            f"run_reconciliation raised: {e}",
+            "ERROR",
+            payload={"traceback": traceback.format_exc()},
+        )
+
+
 def _explain_cycle_outcome(summary: dict, df, regime: dict,
                             threshold: float, active_count: int,
                             max_positions: int,
@@ -517,6 +546,10 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
             "0 entries — Auto-entry is OFF. Toggle it on in "
             "🤖 Robo-Trader tab to let the agent open positions.",
             payload={"reason": "autotrade_disabled"})
+
+    # v3.6 Block 6 — broker ↔ internal reconciliation (no-op in NOOP mode).
+    # Runs at the very end so settlements and entries are already reflected.
+    _run_reconciliation_step(summary)
 
     return summary
 
