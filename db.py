@@ -1,13 +1,31 @@
 # db.py
 """
-SQLite persistence layer for BursaAI.
+SQLite persistence layer — multi-market aware (v3.6).
 
 Single connection-per-call pattern with WAL mode for concurrent read safety.
 Replaces the scattered JSON files that previously caused race conditions
 in the multi-threaded scheduler.
 
-Tables
-------
+Multi-market (v3.6)
+-------------------
+Each market has its OWN database file:
+    ~/.bursa_agent_data/bursa_agent_MY.db
+    ~/.bursa_agent_data/bursa_agent_US.db
+
+The active market is resolved by `market_profiles.active_profile()` which
+reads (in order): env var MARKET_MODE, then a small text-file marker
+under DATA_DIR. NO cross-DB joins anywhere — each market is fully isolated
+so switching markets cannot leak Bursa cash math into US trades or vice
+versa.
+
+Backward compatibility:
+    If `~/.bursa_agent_data/bursa_agent.db` exists (the legacy v3.3 path)
+    and the active market is MY, we rename it to `bursa_agent_MY.db` on
+    first init so existing deployments seamlessly upgrade. Existing US
+    deployments (there are none in the wild yet) start fresh.
+
+Tables (unchanged from v3.3)
+----------------------------
 trades                — full trade journal (entry + exits + reasoning)
 partial_exits         — per-TP partial exit records
 account               — virtual paper-trade account state (single row)
@@ -38,11 +56,112 @@ HOME_DIR = os.path.expanduser("~")
 DATA_DIR = os.path.join(HOME_DIR, ".bursa_agent_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DB_PATH = os.path.join(DATA_DIR, "bursa_agent.db")
+# Legacy v3.3 single-DB path (pre multi-market). Kept for migration only.
+_LEGACY_DB_PATH = os.path.join(DATA_DIR, "bursa_agent.db")
 
-# Single global lock for *write* operations only.
-# SQLite WAL handles concurrent reads natively.
-_WRITE_LOCK = threading.RLock()
+
+def _resolve_db_path() -> str:
+    """Active DB path, dispatched on market_profiles.active_market_code().
+
+    v3.6 back-compat: if a caller (typically a v3.3 test) has monkey-patched
+    `db.DB_PATH` to a custom path that DOESN'T match the auto-derived
+    per-market path of any known market, honour it. This lets old tests
+    using `monkeypatch.setattr(db, 'DB_PATH', tmp.db)` keep working.
+    """
+    overridden = globals().get("DB_PATH")
+    try:
+        from market_profiles import active_market_code, available_markets
+        code = active_market_code()
+        real = os.path.join(DATA_DIR, f"bursa_agent_{code}.db")
+        # Known per-market computed paths — these are NEVER overrides.
+        known_paths = {
+            os.path.join(DATA_DIR, f"bursa_agent_{c}.db")
+            for c in available_markets()
+        }
+        known_paths.add(_LEGACY_DB_PATH)
+    except Exception:
+        return _LEGACY_DB_PATH
+    if overridden and overridden not in known_paths:
+        # Patched to a foreign path → respect it (test fixture override)
+        return overridden
+    return real
+
+
+def _migrate_legacy_db_if_needed() -> None:
+    """One-shot rename of legacy `bursa_agent.db` → `bursa_agent_MY.db`.
+
+    Only runs if:
+      * legacy file exists
+      * active market is MY
+      * no `bursa_agent_MY.db` yet
+    Otherwise a no-op.
+    """
+    try:
+        from market_profiles import active_market_code
+        if active_market_code() != "MY":
+            return
+    except Exception:
+        return
+    target = os.path.join(DATA_DIR, "bursa_agent_MY.db")
+    if os.path.exists(_LEGACY_DB_PATH) and not os.path.exists(target):
+        try:
+            os.rename(_LEGACY_DB_PATH, target)
+            # Also move any -wal / -shm sidecars
+            for suffix in ("-wal", "-shm"):
+                src = _LEGACY_DB_PATH + suffix
+                dst = target + suffix
+                if os.path.exists(src) and not os.path.exists(dst):
+                    try:
+                        os.rename(src, dst)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[db] legacy migration skipped: {e}")
+
+
+# DB_PATH is now COMPUTED, not a constant. Old code that imported DB_PATH at
+# module load time will still see the right path (we resolve below after
+# migration). New code should prefer `current_db_path()` which always reflects
+# the latest active market.
+_migrate_legacy_db_if_needed()
+DB_PATH = _resolve_db_path()
+
+
+def current_db_path() -> str:
+    """Always-fresh DB path. Use this in long-lived modules (persistence)."""
+    return _resolve_db_path()
+
+
+# Per-process locks keyed by DB path so two markets don't serialise on each other.
+_WRITE_LOCKS_BY_PATH: dict[str, threading.RLock] = {}
+_LOCKS_REGISTRY_LOCK = threading.Lock()
+
+
+def _lock_for_path(path: str) -> threading.RLock:
+    with _LOCKS_REGISTRY_LOCK:
+        lock = _WRITE_LOCKS_BY_PATH.get(path)
+        if lock is None:
+            lock = threading.RLock()
+            _WRITE_LOCKS_BY_PATH[path] = lock
+        return lock
+
+
+# Backward-compat: expose a `_WRITE_LOCK` that resolves to the active DB's
+# lock. Some test fixtures import it directly.
+class _ActiveLockProxy:
+    def __enter__(self):
+        self._lock = _lock_for_path(current_db_path())
+        self._lock.acquire()
+        return self
+    def __exit__(self, *exc):
+        self._lock.release()
+    def acquire(self, *a, **kw):
+        _lock_for_path(current_db_path()).acquire(*a, **kw)
+    def release(self):
+        _lock_for_path(current_db_path()).release()
+
+
+_WRITE_LOCK = _ActiveLockProxy()
 
 
 def get_myt_now():
@@ -62,12 +181,16 @@ def myt_iso(dt=None):
 @contextmanager
 def connect(readonly: bool = False):
     """
-    Yields a sqlite3.Connection. Always uses WAL.
-    Writes are wrapped in the module-level RLock so concurrent threads
-    (Streamlit re-renders + scheduler) never collide.
+    Yields a sqlite3.Connection to the ACTIVE market's DB.
+
+    Always uses WAL. Writes are wrapped in a per-DB-path RLock so concurrent
+    threads (Streamlit re-renders + scheduler) never collide — and so two
+    markets running side-by-side don't serialise on each other.
     """
+    db_path = current_db_path()
+
     if readonly:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10.0)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -75,8 +198,9 @@ def connect(readonly: bool = False):
             conn.close()
         return
 
-    with _WRITE_LOCK:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0, isolation_level=None)
+    lock = _lock_for_path(db_path)
+    with lock:
+        conn = sqlite3.connect(db_path, timeout=30.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -374,14 +498,30 @@ CREATE TABLE IF NOT EXISTS risk_params (
     payload     TEXT,
     updated_at  TEXT
 );
-"""""
+"""
+
+
+def _profile_default_capital() -> float:
+    """Seed-account capital for the active market.
+
+    MY → RM 20,000 (preserved v3.3 default)
+    US → USD 5,000
+    """
+    try:
+        from market_profiles import active_profile
+        return float(active_profile().default_capital)
+    except Exception:
+        return 20_000.0
 
 
 def init_db():
-    """Create tables if missing, run column migrations, and seed singleton rows."""
+    """Create tables if missing, run column migrations, and seed singleton rows.
+
+    Idempotent — safe to call on every import.
+    """
     with connect() as c:
         c.executescript(SCHEMA)
-        # ---- Lightweight column migrations (v2 → v3 → v3.1) ----
+        # ---- Lightweight column migrations (v2 → v3 → v3.6) ----
         # All wrapped individually in try/except — ALTER TABLE ... ADD COLUMN
         # raises if the column already exists, which is the no-op case.
         for sql in (
@@ -389,17 +529,22 @@ def init_db():
             "ALTER TABLE scheduler_state ADD COLUMN exploration_trades_target INTEGER NOT NULL DEFAULT 50",
             "ALTER TABLE scheduler_state ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0",
             # v3.1.10: cycle_started_at lets the watchdog detect runaway cycles.
-            # NULL when no cycle is in flight; ISO timestamp when one is running.
             "ALTER TABLE scheduler_state ADD COLUMN cycle_started_at TEXT",
             "ALTER TABLE trades ADD COLUMN executed_in_window TEXT",
             # v3.5: corporate-action audit trail. Default 1.0 means "never split".
-            # When a 1-for-N split is applied, this becomes N (or product of N's).
             "ALTER TABLE trades ADD COLUMN cumulative_split_factor REAL DEFAULT 1.0",
             # v3.5: toggle for auto-adjustment behaviour. Default ON.
             "ALTER TABLE scheduler_state ADD COLUMN corp_action_autoadjust INTEGER NOT NULL DEFAULT 1",
             # v3.5: last time we scanned for corporate actions (ISO timestamp).
-            # NULL means "never scanned" → first scan looks back 7 days.
             "ALTER TABLE scheduler_state ADD COLUMN last_corp_action_scan_at TEXT",
+            # v3.6: broker execution mode for this market's DB.
+            # 'NOOP' (default — notify only) / 'SIMULATE' / 'REAL'.
+            # MY ignores anything other than NOOP today; US respects all three.
+            "ALTER TABLE scheduler_state ADD COLUMN broker_mode TEXT NOT NULL DEFAULT 'NOOP'",
+            # v3.6: last reconciliation drift (broker vs internal) in absolute currency,
+            # plus the timestamp it was last computed. Surfaces in Settings tab.
+            "ALTER TABLE scheduler_state ADD COLUMN last_reconcile_at TEXT",
+            "ALTER TABLE scheduler_state ADD COLUMN last_reconcile_drift REAL DEFAULT 0",
         ):
             try:
                 c.execute(sql)
@@ -412,12 +557,13 @@ def init_db():
             " exploration_mode, exploration_trades_target) "
             "VALUES (1, 0, 3600, 1, 1, 1, 50)"
         )
-        # Seed account
+        # Seed account — capital comes from active market profile.
+        seed_cap = _profile_default_capital()
         c.execute(
             "INSERT OR IGNORE INTO account "
             "(id, initial_capital, cash_balance, total_equity, last_updated) "
-            "VALUES (1, 20000.0, 20000.0, 20000.0, ?)",
-            (myt_iso(),),
+            "VALUES (1, ?, ?, ?, ?)",
+            (seed_cap, seed_cap, seed_cap, myt_iso()),
         )
         # Seed parameters
         param_path = os.path.join(
@@ -436,6 +582,14 @@ def init_db():
                     default_params.update(json.load(f))
             except Exception:
                 pass
+        # US-specific price-range override: leveraged ETFs run USD 10–200, not RM 0.30–4.00.
+        try:
+            from market_profiles import active_market_code
+            if active_market_code() == "US":
+                default_params["min_price"] = 5.00
+                default_params["max_price"] = 500.00
+        except Exception:
+            pass
         c.execute(
             "INSERT OR IGNORE INTO parameters (id, payload, updated_at) VALUES (1, ?, ?)",
             (json.dumps(default_params), myt_iso()),
@@ -467,8 +621,6 @@ def init_db():
 def execute(sql, args=()):
     with connect() as c:
         return c.execute(sql, args)
-
-
 
 
 # v3.1.9: meta key/value helpers — survive container resets via Gist backup
