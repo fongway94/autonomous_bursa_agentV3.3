@@ -13,7 +13,8 @@ Markets: 🇲🇾 Bursa Malaysia (KLSE) · 🇺🇸 NYSE/NASDAQ
 - **Per-market isolated databases** — `bursa_agent_MY.db` / `bursa_agent_US.db`, separate trade history, Bayesian brain, risk params
 - **Full Moomoo US execution adapter** — NOOP / SIMULATE / REAL broker modes
 - **Per-cycle reconciliation** — internal vs broker drift alerts via Telegram
-- **Symmetric data fallback** — Moomoo OpenD ↔ yfinance for both markets
+- **Symmetric data fallback** — Moomoo OpenD ↔ yfinance for both markets (MY gated to yfinance until Moomoo OpenAPI adds Bursa)
+- **Timezone-aware Settings** — because you trade from Malaysia, US session/cutoff times show as both native exchange time **and** the MYT equivalent (e.g. `09:30–16:00 ET (21:30–04:00 MYT)`)
 
 ---
 
@@ -100,7 +101,7 @@ The sidebar always shows the active flag (🇲🇾 or 🇺🇸) + market name + 
 pytest tests/ -q
 ```
 
-**240 tests** should pass in ~10 seconds. The suite uses isolated temp directories and never touches your real DBs.
+**471 tests** should pass in ~45 seconds — and the **full suite must pass in one `pytest tests/` run** (not just per-file). The suite uses isolated temp directories and never touches your real DBs.
 
 ---
 
@@ -269,7 +270,7 @@ To flip to REAL (only after SIMULATE has matched paper-trade expectations):
 
 ---
 
-## Module map (24 modules + market_profiles/ package)
+## Module map (23 top-level modules + market_profiles/ package = 27 total)
 
 ```
 autonomous_bursa_agent/
@@ -304,7 +305,7 @@ autonomous_bursa_agent/
 ├── ai_parameters.json            ← Default scanner params
 ├── requirements.txt
 ├── .streamlit/config.toml        ← Light theme enforcement
-├── tests/                        ← 240 tests across 32 files
+├── tests/                        ← 471 tests across 35 files
 └── HandBook/                     ← PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md
 ```
 
@@ -312,7 +313,7 @@ autonomous_bursa_agent/
 
 ## Per-market data layout
 
-Each market has its OWN SQLite database file with the full schema (21 tables):
+Each market has its OWN SQLite database file with the full schema (~22 tables):
 
 ```
 ~/.bursa_agent_data/
@@ -359,9 +360,9 @@ The `MarketProfile` for each market lives in `market_profiles/<code>_profile.py`
 | Currency | MYR (RM) | USD ($) |
 | Lot size | 100 shares (board lot) | 1 share |
 | Default capital | RM 20,000 | $ 5,000 |
-| Sessions | 09:00-12:30 + 14:30-17:00 MYT (lunch break) | 09:30-16:00 ET (RTH only) |
-| Timezone | Asia/Kuala_Lumpur | America/New_York |
-| Safe-entry cutoff | 16:00 MYT | 15:30 ET |
+| Sessions | 09:00-12:30 + 14:30-17:00 MYT (lunch break) | 09:30-16:00 ET (RTH only) — UI also shows MYT mirror |
+| Timezone | Asia/Kuala_Lumpur | America/New_York (Settings input is in ET; MYT shown in brackets) |
+| Safe-entry cutoff | 16:00 MYT | 15:30 ET (≈03:30 MYT) |
 | Holidays | Hardcoded set (update yearly) | Auto-extending via `pandas_market_calendars` |
 | Regime ticker | `^KLSE` | `SPY` |
 | Per-trade fee | 0.15% per side | 0% (moomoo US commission-free) |
@@ -409,7 +410,8 @@ POSITION_QTY_TOLERANCE_PCT = 0.01       # 1%
 | Reset everything for BOTH markets | `rm -rf ~/.bursa_agent_data/` then restart |
 | Brain lost after Streamlit Cloud redeploy | Set `GITHUB_TOKEN` + `GIST_ID` in Secrets |
 | `sqlite3.OperationalError: no such table: account` after switching market | Fixed in v3.6 — pull latest `market_profiles/__init__.py` + `app.py` |
-| US tab still shows RM currency | Fixed in v3.6 — pull latest `app.py` |
+| US tab still shows RM currency | Fixed in v3.6 — pull latest `app.py` + `live_trigger.py` (alerts are currency-aware too) |
+| US Settings shows times in MYT only / confusing timezone | Expected in v3.6: US session + cutoff render as native `ET` with the `MYT` equivalent in brackets. Enter window values in **ET**. |
 | Moomoo OpenD "not listening" on US SIMULATE | Make sure Moomoo Desktop is open AND OpenD is enabled in Settings → API |
 | Moomoo REAL mode says "MOOMOO_TRADING_PWD not set" | Add the secret + restart the agent process so env vars reload |
 | Switching market doesn't show new flag | Hard refresh (Ctrl+Shift+R) — Streamlit caches the sidebar across tab switches |
