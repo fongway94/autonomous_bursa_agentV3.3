@@ -34,6 +34,8 @@ from market_profiles.base import (
     TradingSession,
     is_within_sessions,
     next_session_start,
+    format_session_window,
+    format_time_with_user_local,
 )
 from market_profiles.my_profile import MY_PROFILE
 from market_profiles.us_profile import US_PROFILE
@@ -44,9 +46,13 @@ from market_profiles.us_profile import US_PROFILE
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _reset_profile_cache():
-    """Clear active-profile cache and any MARKET_MODE env var between tests."""
+def _reset_profile_cache(tmp_path, monkeypatch):
+    """Clear active-profile cache, isolate marker file, scrub env var."""
     old_env = os.environ.pop("MARKET_MODE", None)
+    # Point the marker file at a temp dir so tests don't touch real ~/.bursa_agent_data/
+    monkeypatch.setattr(market_profiles, "_MARKER_FILE",
+                        tmp_path / ".active_market")
+    monkeypatch.setattr(market_profiles, "_DATA_DIR", tmp_path)
     reset_cache()
     yield
     reset_cache()
@@ -313,3 +319,47 @@ def test_us_holiday_regular_weekday_is_not_holiday():
     tz = US_PROFILE.timezone
     normal = datetime(2026, 6, 2, 12, 0, tzinfo=tz)  # Tuesday
     assert US_PROFILE.is_holiday(normal) is False
+
+
+# ---------------------------------------------------------------------------
+# Display helpers (v3.6) — Settings panel adapts per market.
+# The user runs from Malaysia, so non-MY markets also show the MYT mirror.
+# ---------------------------------------------------------------------------
+
+def test_format_session_window_my_is_native_only():
+    """MY market shows native MYT sessions with NO redundant mirror."""
+    s = format_session_window(MY_PROFILE)
+    assert "09:00–12:30" in s
+    assert "14:30–17:00" in s
+    assert "MYT" in s
+    # No bracketed mirror because market TZ == user TZ.
+    assert "(" not in s
+
+
+def test_format_session_window_us_shows_et_and_myt():
+    """US market shows ET sessions PLUS the Malaysia-local (MYT) equivalent."""
+    s = format_session_window(US_PROFILE)
+    assert "09:30–16:00" in s
+    assert "ET" in s
+    # Mirror in brackets, labelled MYT.
+    assert "MYT" in s
+    assert "(" in s and ")" in s
+
+
+def test_format_session_window_us_can_suppress_mirror():
+    s = format_session_window(US_PROFILE, with_user_local=False)
+    assert "ET" in s
+    assert "MYT" not in s
+    assert "(" not in s
+
+
+def test_format_time_with_user_local_my():
+    s = format_time_with_user_local(MY_PROFILE.safe_entry_cutoff, MY_PROFILE)
+    assert s == "16:00 MYT"
+
+
+def test_format_time_with_user_local_us_has_myt_mirror():
+    s = format_time_with_user_local(US_PROFILE.safe_entry_cutoff, US_PROFILE)
+    assert s.startswith("15:30 ET")
+    assert "MYT" in s
+    assert "(" in s and ")" in s

@@ -231,19 +231,71 @@ if "log_deduped" not in st.session_state:
 # =========================================================================
 
 with st.sidebar:
-    st.markdown("## 🚀 BursaAI Agent")
-    st.caption("Bursa Malaysia · Paper Trading · v3 — auto-trade default ON")
+    # v3.6 Block 7 — Multi-market switcher.
+    # The active market governs which DB file is used, the watchlist,
+    # the trading calendar/timezone, the currency, lot size, fees,
+    # and whether SIMULATE/REAL execution modes are even available.
+    from market_profiles import (
+        active_profile as _active_profile_fn,
+        active_market_code as _active_code_fn,
+        set_active_market as _set_market_fn,
+        available_markets as _avail_markets_fn,
+    )
+    _current_profile = _active_profile_fn()
+    _current_market = _current_profile.code
+    _ccy = _current_profile.currency_symbol  # "RM" or "$"
+
+    st.markdown(f"## 🚀 {_current_profile.flag_emoji} BursaAI Agent")
+    st.caption(
+        f"{_current_profile.display_name} · Paper Trading · v3.6 multi-market"
+    )
+
+    # Market switcher
+    _markets = _avail_markets_fn()
+    _market_labels = {
+        m: f"{_active_profile_fn().flag_emoji if m == _current_market else ('🇲🇾' if m == 'MY' else '🇺🇸')} {m}"
+        for m in _markets
+    }
+    new_market = st.selectbox(
+        "🌐 Market",
+        options=_markets,
+        index=_markets.index(_current_market),
+        format_func=lambda m: ("🇲🇾 MY — Bursa Malaysia" if m == "MY"
+                                else "🇺🇸 US — NYSE/NASDAQ"),
+        help=(
+            "Switch active market. Each market has its OWN database file "
+            "(bursa_agent_MY.db / bursa_agent_US.db) so trades, brain, "
+            "and risk params are fully isolated. App reloads on switch."
+        ),
+    )
+    if new_market != _current_market:
+        _set_market_fn(new_market, persist=True)
+        st.success(f"Market switched to {new_market}. Reloading…")
+        st.rerun()
+
+    # v3.6 hotfix: ensure the active market's DB has schema + seed rows
+    # for every rerun. Cheap idempotent CREATE TABLE IF NOT EXISTS calls.
+    # This is the safety net for "user changed MARKET_MODE env var on
+    # Streamlit Cloud secrets" — the app comes back up against a market
+    # whose DB has never been initialised.
+    try:
+        from db import init_db as _init_active_db
+        _init_active_db()
+    except Exception as _e:
+        st.error(f"DB init failed for active market: {_e}")
+        st.stop()
 
     acc = load_account()
     new_cap = st.number_input(
-        "Initial Capital (RM)", min_value=1000.0, max_value=10_000_000.0,
+        f"Initial Capital ({_ccy})",
+        min_value=1000.0, max_value=10_000_000.0,
         value=float(acc["initial_capital"]), step=1000.0,
     )
     if abs(new_cap - acc["initial_capital"]) > 0.5:
         if st.button("💾 Update Capital", use_container_width=True):
             save_account(initial_capital=new_cap, cash_balance=new_cap,
                          total_equity=new_cap)
-            st.success(f"Capital reset to RM {new_cap:,.0f}")
+            st.success(f"Capital reset to {_ccy} {new_cap:,.0f}")
             st.rerun()
 
     risk_pct = st.slider("Risk per Trade (%)", 0.25, 3.0, 1.0, 0.25)
@@ -253,11 +305,11 @@ with st.sidebar:
         f"""
         <div class="bursa-card bursa-card-info">
           <div class="kvp"><span class="k">Risk per Trade</span>
-            <span class="v">RM {risk_amount:,.0f}</span></div>
+            <span class="v">{_ccy} {risk_amount:,.0f}</span></div>
           <div class="kvp"><span class="k">Cash</span>
-            <span class="v">RM {acc['cash_balance']:,.0f}</span></div>
+            <span class="v">{_ccy} {acc['cash_balance']:,.0f}</span></div>
           <div class="kvp"><span class="k">Equity</span>
-            <span class="v">RM {acc['total_equity']:,.0f}</span></div>
+            <span class="v">{_ccy} {acc['total_equity']:,.0f}</span></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -290,6 +342,42 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+
+    # v3.6 Block 7 — Broker execution badge.
+    # Shows current broker_mode + a connection light when SIMULATE/REAL.
+    try:
+        from broker_adapter import get_broker_mode, adapter_health
+        _broker_mode = get_broker_mode()
+        _broker_h = adapter_health()
+        if _broker_mode == "NOOP":
+            _bm_class = "bursa-card-info"
+            _bm_emoji = "🔕"
+            _bm_status = "Notification-only (paper)"
+        elif _broker_h.get("connected"):
+            _bm_class = "bursa-card-good"
+            _bm_emoji = "🟢"
+            _bm_status = f"{_broker_mode} · Connected"
+        else:
+            _bm_class = "bursa-card-bad"
+            _bm_emoji = "🔴"
+            _bm_status = f"{_broker_mode} · Disconnected"
+        st.markdown(
+            f"""
+            <div class="bursa-card {_bm_class}">
+              <div style="font-weight:700; margin-bottom:6px;">{_bm_emoji} Broker · {_bm_status}</div>
+              <div class="kvp"><span class="k">Mode</span>
+                <span class="v">{_broker_mode}</span></div>
+              <div class="kvp"><span class="k">Adapter</span>
+                <span class="v">{_broker_h.get('adapter_name', '—')}</span></div>
+              <div class="kvp"><span class="k">Moomoo for {_current_market}</span>
+                <span class="v">{'✅' if _broker_h.get('moomoo_available_for_market') else '❌ not yet'}</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        # broker_adapter not importable — non-fatal, just skip the badge
+        pass
 
     # v3.1.9: Persist the Start button result in session_state so the
     # warning survives the immediate st.rerun() and is visible to the user.
@@ -491,15 +579,15 @@ with tab_scanner:
                       <div class="kvp"><span class="k">Confidence</span>
                           <span class="v">{row['confidence']:.0f}/100</span></div>
                       <div class="kvp"><span class="k">Price</span>
-                          <span class="v">RM {row['price']:.3f}
+                          <span class="v">{_ccy} {row['price']:.3f}
                           ({row['change_pct']:+.2f}%)</span></div>
                       <div class="kvp"><span class="k">Entry</span>
-                          <span class="v">RM {row['entry']:.3f}</span></div>
+                          <span class="v">{_ccy} {row['entry']:.3f}</span></div>
                       <div class="kvp"><span class="k">Stop Loss</span>
-                          <span class="v">RM {row['stop_loss']:.3f}
+                          <span class="v">{_ccy} {row['stop_loss']:.3f}
                           ({row['risk_pct']:.1f}% risk)</span></div>
                       <div class="kvp"><span class="k">TP1 / TP2 / TP3</span>
-                          <span class="v">RM {row['tp1']:.3f} ·
+                          <span class="v">{_ccy} {row['tp1']:.3f} ·
                           {row['tp2']:.3f} · {row['tp3']:.3f}</span></div>
                       <div class="kvp"><span class="k">RSI / Vol×</span>
                           <span class="v">{row['rsi']:.1f} ·
@@ -521,9 +609,9 @@ with tab_scanner:
                     cost_info = calculate_trade_cost(shares, row["entry"])
                     actual_risk = risk_per_share * shares
                     st.caption(
-                        f"Outlay ≈ RM {cost_info['gross']:,.0f} "
-                        f"+ fee RM {cost_info['fee']:.2f} "
-                        f"| Risk RM {actual_risk:,.0f}"
+                        f"Outlay ≈ {_ccy} {cost_info['gross']:,.0f} "
+                        f"+ fee {_ccy} {cost_info['fee']:.2f} "
+                        f"| Risk {_ccy} {actual_risk:,.0f}"
                     )
                     if st.button("✅ EXECUTE BUY ORDER",
                                  use_container_width=True, type="primary"):
@@ -689,12 +777,12 @@ with tab_portfolio:
     returns_pct = (equity / acc["initial_capital"] - 1) * 100
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Equity", f"RM {equity:,.0f}",
+    m1.metric("Equity", f"{_ccy} {equity:,.0f}",
               f"{returns_pct:+.2f}% vs start")
-    m2.metric("Cash", f"RM {acc['cash_balance']:,.0f}")
-    m3.metric("Active Cost", f"RM {total_active_cost:,.0f}")
-    m4.metric("Active MV", f"RM {total_active_value:,.0f}",
-              f"RM {(total_active_value-total_active_cost):+,.0f}")
+    m2.metric("Cash", f"{_ccy} {acc['cash_balance']:,.0f}")
+    m3.metric("Active Cost", f"{_ccy} {total_active_cost:,.0f}")
+    m4.metric("Active MV", f"{_ccy} {total_active_value:,.0f}",
+              f"{_ccy} {(total_active_value-total_active_cost):+,.0f}")
     m5.metric("Active Trades", len(active))
 
     st.markdown("### 🛡️ Risk Dashboard")
@@ -705,7 +793,7 @@ with tab_portfolio:
     r1.metric("Drawdown", f"{risk_stats['drawdown_pct']:.2f}%",
               delta=risk_stats["drawdown_level"], delta_color=dd_color)
     r2.metric("Exposure", f"{risk_stats['exposure_pct']:.1f}%",
-              f"RM {risk_stats['total_exposure_rm']:,.0f}")
+              f"{_ccy} {risk_stats['total_exposure_rm']:,.0f}")
     r3.metric("Positions",
               f"{risk_stats['active_positions']}/{risk_stats['max_positions_allowed']}")
     r4.metric("Trades today",
@@ -731,10 +819,12 @@ with tab_portfolio:
             sec_exp[sec] = sec_exp.get(sec, 0) + (t.get("cost") or 0)
         if sec_exp:
             st.markdown("### 🔥 Sector Exposure")
+            _exposure_label = f"exposure_{_current_profile.currency_iso.lower()}"
             df_sec = pd.DataFrame({"sector": list(sec_exp.keys()),
-                                   "exposure_rm": list(sec_exp.values())})
-            fig = px.bar(df_sec, x="sector", y="exposure_rm",
-                         color="exposure_rm", color_continuous_scale="Blues")
+                                   _exposure_label: list(sec_exp.values())})
+            fig = px.bar(df_sec, x="sector", y=_exposure_label,
+                         color=_exposure_label, color_continuous_scale="Blues",
+                         labels={_exposure_label: f"Exposure ({_ccy})"})
             fig.update_layout(**PLOTLY_LAYOUT, height=300)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -801,7 +891,7 @@ with tab_learning:
     a, b, c, d = st.columns(4)
     a.metric("Closed Trades", s["total_trades"])
     b.metric("Win Rate", f"{s['win_rate']}%")
-    c.metric("Total P&L", f"RM {s['total_pnl_rm']:,.0f}")
+    c.metric("Total P&L", f"{_ccy} {s['total_pnl_rm']:,.0f}")
     d.metric("Avg Win / Loss",
              f"{s['avg_win_rm']:.0f} / {s['avg_loss_rm']:.0f}")
 
@@ -910,7 +1000,7 @@ with tab_perf:
     cc = st.columns(4)
     cc[0].metric("Total Return",
                  f"{s['total_return_pct']:+.2f}%",
-                 f"RM {s['current_equity']:,.0f}")
+                 f"{_ccy} {s['current_equity']:,.0f}")
     cc[1].metric("Sharpe", r["sharpe"])
     cc[2].metric("Sortino", r["sortino"])
     cc[3].metric("Max Drawdown", f"{r['max_dd_pct']:.2f}%",
@@ -919,7 +1009,7 @@ with tab_perf:
     cc2 = st.columns(4)
     cc2[0].metric("Profit Factor",
                   f"{e['profit_factor']}" if e["profit_factor"] else "∞")
-    cc2[1].metric("Expectancy", f"RM {e['expectancy_rm']:.2f}",
+    cc2[1].metric("Expectancy", f"{_ccy} {e['expectancy_rm']:.2f}",
                   f"R {e['expectancy_r']:+.2f}")
     cc2[2].metric("Avg MAE / MFE",
                   f"{mm['avg_mae_pct']:+.2f}% / {mm['avg_mfe_pct']:+.2f}%")
@@ -1558,27 +1648,53 @@ with tab_settings:
     daily_cap = c1.number_input("Daily trade limit",
                                  value=int(rp["max_trades_per_day"]), step=1)
 
-    # ---- Trading window controls (v3.1.2) ----
-    st.markdown("##### 🕘 Trading Window")
-    st.caption(
-        "Bursa Malaysia native sessions: 09:00–12:30 (morning) and "
-        "14:30–17:00 (afternoon). Lunch break + weekends + public "
-        "holidays are auto-detected. The user-configured window below "
-        "can only TIGHTEN this — it cannot extend past Bursa hours."
+    # ---- Trading window controls (v3.1.2; v3.6 multi-market) ----
+    # The description, timezone labels, and example times all adapt to the
+    # active market. Because the user runs from Malaysia, non-MY markets ALSO
+    # show the equivalent MYT wall-clock so they know when to be watching.
+    from market_profiles import active_profile
+    from market_profiles.base import (
+        format_session_window, format_time_with_user_local, _tz_abbrev,
+        USER_LOCAL_TZ,
     )
+    _prof = active_profile()
+    _mkt_tz_abbr = _tz_abbrev(_prof.timezone)
+    _is_foreign_tz = str(_prof.timezone) != str(USER_LOCAL_TZ)
+    _sessions_str = format_session_window(_prof, with_user_local=True)
+    _cutoff_str = format_time_with_user_local(_prof.safe_entry_cutoff, _prof)
+
+    st.markdown("##### 🕘 Trading Window")
+    _caption = (
+        f"{_prof.flag_emoji} **{_prof.display_name}** native sessions: "
+        f"{_sessions_str}. Lunch break (if any) + weekends + public "
+        f"holidays are auto-detected. The user-configured window below "
+        f"can only TIGHTEN this — it cannot extend past market hours."
+    )
+    if _is_foreign_tz:
+        _caption += (
+            f"\n\n🌏 You're in Malaysia, so times are shown in "
+            f"**{_mkt_tz_abbr}** with the **MYT** equivalent in brackets. "
+            f"Enter the values below in **{_mkt_tz_abbr}** (the exchange's "
+            f"local time)."
+        )
+    st.caption(_caption)
+
     tw1, tw2 = st.columns(2)
+    # Default times come from the active profile's sessions/cutoff.
+    _default_before = _prof.sessions[0].start.strftime("%H:%M")
+    _default_after = _prof.sessions[-1].end.strftime("%H:%M")
     no_before = tw1.text_input(
-        "No entries before (HH:MM MYT)",
-        value=str(rp.get("no_entry_before_time", "09:00")),
-        help="Default 09:00. Set to a later time if you want to wait "
-             "for the opening volatility to settle (e.g. 09:30).",
+        f"No entries before (HH:MM {_mkt_tz_abbr})",
+        value=str(rp.get("no_entry_before_time", _default_before)),
+        help=f"Default {_default_before}. Set to a later time if you want "
+             f"to wait for the opening volatility to settle.",
     )
     no_after = tw2.text_input(
-        "No entries after (HH:MM MYT)",
-        value=str(rp.get("no_entry_after_time", "17:00")),
-        help="Default 17:00. Note: the agent already enforces a "
-             "separate hard 16:00 cutoff for auto-entries so trades "
-             "have time to develop before close.",
+        f"No entries after (HH:MM {_mkt_tz_abbr})",
+        value=str(rp.get("no_entry_after_time", _default_after)),
+        help=f"Default {_default_after}. Note: the agent already enforces a "
+             f"separate hard safe-entry cutoff at {_cutoff_str} for "
+             f"auto-entries so trades have time to develop before close.",
     )
     # Show current market status for sanity
     from market_calendar import market_status_text
@@ -1818,6 +1934,157 @@ with tab_settings:
     )
 
     # -----------------------------------------------------------------
+    # v3.6 Block 7 — Execution Mode (NOOP / SIMULATE / REAL)
+    # -----------------------------------------------------------------
+    st.markdown("### 🎯 Execution Mode")
+    from broker_adapter import (
+        get_broker_mode as _br_get_mode, set_broker_mode as _br_set_mode,
+        adapter_health as _br_health,
+        reset_adapter_cache as _br_reset_cache,
+    )
+    _cur_mode = _br_get_mode()
+    _bh = _br_health()
+    _moomoo_ready = bool(_bh.get("moomoo_available_for_market"))
+
+    st.caption(
+        "Controls whether the agent ONLY sends Telegram alerts (NOOP) or "
+        "ALSO places matching orders via Moomoo OpenAPI (SIMULATE / REAL). "
+        "Internal paper-trade engine + Bayesian brain are unaffected; the "
+        "broker is a parallel mirror with periodic reconciliation."
+    )
+
+    if not _moomoo_ready:
+        st.info(
+            f"📡 The active market (**{_bh.get('market', '?')}**) does not "
+            "yet have Moomoo OpenAPI support. Only NOOP mode is available. "
+            "Switch to the 🇺🇸 US market in the sidebar to enable "
+            "SIMULATE / REAL execution."
+        )
+    else:
+        _opts = ["NOOP", "SIMULATE", "REAL"]
+        _new_mode = st.selectbox(
+            "Broker execution mode",
+            options=_opts,
+            index=_opts.index(_cur_mode),
+            help=(
+                "NOOP — paper-trade only, send Telegram alerts; you "
+                "manually mirror in Moomoo.\n\n"
+                "SIMULATE — agent places real orders in moomoo's "
+                "paper-trading account (no real money). Recommended for "
+                "first 4-6 weeks of validation.\n\n"
+                "REAL — agent places live orders with real money. "
+                "Requires MOOMOO_TRADING_PWD in env/secrets and an unlocked "
+                "moomoo trading session. ONLY use after SIMULATE has "
+                "matched paper-trade outcomes for at least a month."
+            ),
+        )
+
+        if _new_mode == "REAL" and not _bh.get("real_pwd_configured"):
+            st.error(
+                "❌ Cannot activate REAL mode — `MOOMOO_TRADING_PWD` "
+                "environment variable / Streamlit Secret is not set. "
+                "Configure it first, restart, then come back."
+            )
+            _save_disabled = True
+        else:
+            _save_disabled = False
+
+        if _new_mode != _cur_mode and not _save_disabled:
+            # Show a warning banner for REAL mode upgrades
+            if _new_mode == "REAL":
+                st.warning(
+                    "⚠️ You are about to enable LIVE TRADING. "
+                    "The agent will place real orders with real money "
+                    "using your moomoo account. "
+                    "Recommended only after a successful SIMULATE period."
+                )
+            if st.button(f"💾 Switch broker mode to {_new_mode}", type="primary"):
+                _br_set_mode(_new_mode)
+                _br_reset_cache()
+                st.success(
+                    f"Broker mode set to **{_new_mode}**. "
+                    "The next scheduler cycle will use the new mode."
+                )
+                st.rerun()
+
+        # Connection diagnostics
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            if _bh.get("connected"):
+                st.success("✅ Moomoo OpenD: connected")
+            else:
+                st.warning("⚠️ Moomoo OpenD: not connected")
+                if _bh.get("last_error"):
+                    st.caption(f"Last error: {_bh['last_error']}")
+        with c2:
+            with st.expander("Full diagnostics", expanded=False):
+                st.json(_bh)
+
+        if st.button("🔌 Test broker connection"):
+            from broker_adapter import get_broker_adapter as _ga
+            _br_reset_cache()
+            _adapter = _ga()
+            _ok = _adapter.connect()
+            if _ok:
+                st.success(f"✅ Connected as {_adapter.name} in {_cur_mode} mode")
+            else:
+                _err = getattr(_adapter, "last_error", lambda: None)()
+                st.error(f"❌ Connect failed: {_err or 'unknown'}")
+
+    # -----------------------------------------------------------------
+    # v3.6 Block 7 — Reconciliation status
+    # -----------------------------------------------------------------
+    st.markdown("### 🔄 Broker Reconciliation")
+    st.caption(
+        "Every scheduler cycle compares internal account+positions to the "
+        "broker. When equity drift exceeds 0.5% or any position quantity "
+        "differs, a Telegram `RECONCILE_DRIFT` alert is sent. The agent "
+        "never mutates internal state from broker data — drift is "
+        "observation-only."
+    )
+    try:
+        from reconciliation import (
+            get_reconciliation_status as _rec_status,
+            run_reconciliation as _run_rec,
+        )
+        _rs = _rec_status()
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Mode", _rs.get("broker_mode", "?"))
+        with c2:
+            st.metric("Last run",
+                       _rs.get("last_reconcile_at") or "never")
+        with c3:
+            _drift = _rs.get("last_reconcile_drift")
+            st.metric("Last drift",
+                       f"{_ccy} {_drift:+,.2f}" if _drift is not None else "—")
+
+        if st.button("🔎 Run reconciliation now"):
+            with st.spinner("Querying broker + computing diffs..."):
+                _result = _run_rec()
+            if not _result.ran:
+                st.info(f"Skipped: {_result.reason_skipped}")
+            elif _result.error:
+                st.error(f"Reconciliation error: {_result.error}")
+            elif _result.is_clean():
+                st.success(
+                    f"✅ Clean — equity drift "
+                    f"{_result.equity_drift_pct:.3f}% (threshold "
+                    f"{_result.drift_threshold_pct:.2f}%), 0 position diffs."
+                )
+            else:
+                st.warning(
+                    f"⚠️ Drift detected — equity drift "
+                    f"{_result.equity_drift:+,.2f} "
+                    f"({_result.equity_drift_pct:.3f}%), "
+                    f"{len(_result.position_diffs)} position diffs."
+                )
+                with st.expander("Details", expanded=True):
+                    st.json(_result.to_dict())
+    except Exception as e:
+        st.warning(f"Reconciliation panel unavailable: {e}")
+
+    # -----------------------------------------------------------------
     # Corporate Actions (v3.5 — auto-handling of splits / bonus / dividends)
     # -----------------------------------------------------------------
     st.markdown("### 🏢 Corporate Actions")
@@ -1839,7 +2106,7 @@ with tab_settings:
                 "When ON (default), the scheduler automatically adjusts "
                 "shares × ratio, prices ÷ ratio for any split/bonus event "
                 "detected on a ticker you hold. Cash-conservation invariant "
-                "is preserved within RM 1.00. "
+                f"is preserved within {_ccy} 1.00. "
                 "When OFF (shadow mode), the agent only alerts you — you "
                 "must manually adjust trades."
             ),

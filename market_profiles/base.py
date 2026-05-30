@@ -151,6 +151,87 @@ def next_session_start(now_local: datetime, sessions: tuple[TradingSession, ...]
     return datetime.combine(tomorrow, sessions[0].start, tzinfo=now_local.tzinfo)
 
 
+# ---------------------------------------------------------------------------
+# Display helpers (v3.6) — used by the Settings UI so it adapts per market
+# ---------------------------------------------------------------------------
+
+# The user runs the app from Malaysia, so for non-MY markets we ALSO render
+# the equivalent wall-clock time in MYT. This lets a Malaysia-based trader
+# know "when do I need to be watching" without doing timezone math.
+USER_LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur")
+
+
+def _tz_abbrev(tz: ZoneInfo) -> str:
+    """Short label for a timezone, e.g. 'MYT' / 'ET'. Falls back to the
+    tzdata abbreviation for the current date if not one we special-case."""
+    key = str(tz)
+    if key == "Asia/Kuala_Lumpur":
+        return "MYT"
+    if key == "America/New_York":
+        return "ET"
+    # Generic fallback — current abbreviation (e.g. 'EDT'/'EST').
+    try:
+        return datetime.now(tz).strftime("%Z") or key
+    except Exception:
+        return key
+
+
+def _to_user_local(t: dtime, market_tz: ZoneInfo, on_date: datetime | None = None) -> dtime:
+    """Convert a market-local time-of-day into the user's local (MYT) time-of-day.
+
+    We anchor on a concrete date (today by default) so DST is handled
+    correctly — the US↔MY offset shifts between 12h and 13h across the year.
+    """
+    base_date = (on_date or datetime.now(market_tz)).date()
+    market_dt = datetime.combine(base_date, t, tzinfo=market_tz)
+    return market_dt.astimezone(USER_LOCAL_TZ).time()
+
+
+def format_session_window(profile: "MarketProfile", with_user_local: bool = True) -> str:
+    """Human-readable session string for the Settings panel.
+
+    MY example:
+        '09:00–12:30 and 14:30–17:00 MYT'
+    US example (shown to a Malaysia-based user):
+        '09:30–16:00 ET  (21:30–04:00 MYT)'
+
+    The MYT mirror is only appended when the market is NOT MY and
+    `with_user_local` is True.
+    """
+    mkt_tz = profile.timezone
+    mkt_abbr = _tz_abbrev(mkt_tz)
+
+    def _fmt(sessions, tz_for_value):
+        parts = []
+        for s in sessions:
+            if tz_for_value is None:
+                a, b = s.start, s.end
+            else:
+                a = _to_user_local(s.start, mkt_tz)
+                b = _to_user_local(s.end, mkt_tz)
+            parts.append(f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')}")
+        return " and ".join(parts)
+
+    native = f"{_fmt(profile.sessions, None)} {mkt_abbr}"
+
+    if with_user_local and str(mkt_tz) != str(USER_LOCAL_TZ):
+        local = f"{_fmt(profile.sessions, USER_LOCAL_TZ)} {_tz_abbrev(USER_LOCAL_TZ)}"
+        return f"{native}  ({local})"
+    return native
+
+
+def format_time_with_user_local(t: dtime, profile: "MarketProfile") -> str:
+    """Format a single market-local time, with the MYT equivalent in parens
+    for non-MY markets. e.g. '15:30 ET (04:30 MYT)' or '16:00 MYT'."""
+    mkt_tz = profile.timezone
+    mkt_abbr = _tz_abbrev(mkt_tz)
+    native = f"{t.strftime('%H:%M')} {mkt_abbr}"
+    if str(mkt_tz) != str(USER_LOCAL_TZ):
+        local_t = _to_user_local(t, mkt_tz)
+        return f"{native} ({local_t.strftime('%H:%M')} {_tz_abbrev(USER_LOCAL_TZ)})"
+    return native
+
+
 __all__ = [
     "MarketProfile",
     "TickerSpec",
@@ -159,4 +240,8 @@ __all__ = [
     "IsHolidayFn",
     "is_within_sessions",
     "next_session_start",
+    "format_session_window",
+    "format_time_with_user_local",
+    "USER_LOCAL_TZ",
 ]
+

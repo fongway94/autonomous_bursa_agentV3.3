@@ -3,7 +3,7 @@
 **Living reference document.** Update as the project evolves.
 Single source of truth for: architecture decisions, why things were built the way they are, known issues, operational runbooks, and the rationale behind every design choice.
 
-Last updated: 2026-05-29 (v3.5)
+Last updated: 2026-05-30 (v3.6)
 
 ---
 
@@ -22,6 +22,7 @@ Last updated: 2026-05-29 (v3.5)
 11. [Known Gaps & v4 Roadmap](#11-known-gaps--v4-roadmap)
 12. [Conventions for Future Work](#12-conventions-for-future-work)
 13. [Long-Term Maintenance Calendar](#13-long-term-maintenance-calendar)
+14. [Multi-Market Architecture (v3.6)](#14-multi-market-architecture-v36)
 
 ---
 
@@ -45,17 +46,18 @@ Last updated: 2026-05-29 (v3.5)
 
 | | |
 |---|---|
-| **Codebase version** | v3.5 |
-| **Deployment** | Streamlit Cloud (live, on yfinance) + optional local PC mode (Moomoo OpenD for real-time) |
-| **Database** | SQLite WAL at `~/.bursa_agent_data/bursa_agent.db` |
-| **DB persistence** | **GitHub Gist backup (private)** — survives container resets |
-| **Source LOC** | ~11,214 across **22 Python modules** |
-| **Test count** | **329 passing in ~41 seconds** |
+| **Codebase version** | v3.6 (multi-market: MY + US) |
+| **Deployment** | MY on Streamlit Cloud (yfinance) + US on local PC (Moomoo OpenD when up, yfinance fallback otherwise) |
+| **Database** | SQLite WAL, **one file per market**: `~/.bursa_agent_data/bursa_agent_MY.db` + `bursa_agent_US.db` |
+| **DB persistence** | **GitHub Gist backup (private), per-market** — survives container resets |
+| **Source LOC** | ~14,350 across **27 Python modules** (23 top-level + 4 in `market_profiles/`) |
+| **Test count** | **471 passing in ~46 seconds** (35 test files; full-suite green in one run) |
 | **Documentation files** | SETUP_GUIDE.md, USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, REVISION_HISTORY.md, PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md |
-| **Capital (paper)** | RM 20,000 default (user adjustable) |
-| **Brokers supported** | NOOP (notification only), MoomooAdapter stub (v4 ready) |
-| **Data sources** | yfinance (always) + Moomoo OpenD (auto-detect; v3.4) — pluggable via `data_provider.py` |
+| **Capital (paper)** | MY: RM 20,000 · US: USD 5,000 (per-market default, user adjustable) |
+| **Brokers supported** | NOOP (notify only, all markets) · **MoomooUSAdapter (US: SIMULATE + REAL, full)** · MoomooMYAdapter (stub — OpenAPI gap) |
+| **Data sources** | yfinance (always, both markets) + Moomoo OpenD (US live; MY gated off until OpenAPI adds Bursa) — pluggable via `data_provider.py` |
 | **Corporate actions** | Splits / bonus issues auto-adjusted; cash dividends alerted (v3.5) — `corporate_actions.py` |
+| **Reconciliation** | Broker↔internal drift checker with Telegram alerts (v3.6) — `reconciliation.py` |
 
 ---
 
@@ -280,6 +282,11 @@ The `screener.py` ThreadPoolExecutor `fut.result()` was missing a timeout — me
 | `broker_adapter.py` | Abstract broker interface (NOOP + Moomoo stub) | `BrokerAdapter.place_order()` (stubbed) |
 | **`persistence.py`** ⭐ | **Gist-backed DB backup + restore** | `backup()`, `restore()`, `boot_restore_once()`, `get_status()` |
 | `maintenance_reminders.py` | Holiday/PAT/WFO renewal reminder banners (v3.1.7) | `check_maintenance_status()`, `mark_pat_rotated()` |
+| **`market_profiles/`** ⭐ (v3.6) | **Multi-market abstraction** — one profile per market behind a Protocol | `active_profile()`, `active_market_code()`, `set_active_market()`, `available_markets()`, `format_session_window()`, `format_time_with_user_local()` |
+| `market_profiles/base.py` | `MarketProfile` Protocol + shared value types + display/session helpers | `TradingSession`, `TickerSpec`, `is_within_sessions()`, `format_session_window()` |
+| `market_profiles/my_profile.py` | `MY_PROFILE` singleton (Bursa: RM, 100-lot, 09:00–17:00 MYT, 0.15% fee, `moomoo_available=False`) | — |
+| `market_profiles/us_profile.py` | `US_PROFILE` singleton (NYSE/NASDAQ: USD, 1-share, 09:30–16:00 ET, 0% fee, `moomoo_available=True`) | — |
+| **`reconciliation.py`** ⭐ (v3.6) | **Broker↔internal drift checker** — compares internal positions/cash to the broker, alerts on drift | `run_reconciliation()`, `compare_positions()` |
 
 **Note:** `learning_engine.py` was removed in v3.1.3 — it was a 40-line backwards-compat shim from the v1→v2 refactor with zero remaining imports.
 
@@ -744,6 +751,13 @@ Each bug has a regression test guarding against its return.
 - **v3.3: `risk_params` table not in `db.py` SCHEMA** — created lazily; moved to SCHEMA for consistency.
 - **v3.3: 9 unused imports across 8 modules** — removed (`math`, `yfinance`, `numpy`, `Any`, `get_myt_now`, `myt_iso`, `datetime/timezone/timedelta`).
 
+### v3.6 (multi-market)
+
+- **v3.6: `db.DB_PATH` override detection by full path → stale path wins** ⭐ — `_resolve_db_path()` treated *any* `DB_PATH` value that didn't exactly match the current per-market path as a deliberate test override. A stale auto-computed path (captured at first import against the real `$HOME` before a test redirected HOME, or left over after `importlib.reload`) was therefore mistaken for an override and silently won — pointing the whole process at the wrong data dir/market → `no such table: account` / `get_meta` returning None. **The full pytest suite failed (43 failures) even though every file passed alone.** Fixed by detecting overrides **by basename**: auto values are always `bursa_agent_<CODE>.db` / `bursa_agent.db`; genuine fixtures use foreign names (`fake.db`, `test.db`). Guards: the full suite must pass in one `pytest tests/` run (471 tests, deterministic across repeated runs).
+- **v3.6: test split-brain from `del sys.modules["db"]`** — `test_multi_market_dispatch._reimport()` deleted+re-imported `db`, creating a *second* `db` module object. Modules imported earlier kept the OLD `db`; later `from db import …` got the NEW one → writes and reads hit different WAL connections. Fixed: reload **in place** with `importlib.reload()` (single module identity).
+- **v3.6: stale tests asserting pre-v3.6 behaviour** — `test_data_provider` (MY-ticker Moomoo path; `_to_moomoo_code("AAPL")`), `test_live_trigger` (Moomoo adapter `NotImplementedError`), `test_ml_persistence` (old `setup_classifier.pkl.b64.gz` filename) updated to v3.6 reality; `test_data_provider` Moomoo-path tests re-pointed to US (the live path) + new `TestMarketGating` class (incl. flag-flip "MY goes live" guard).
+- **v3.6: hardcoded `RM` / Bursa-session strings in user-facing output** — Telegram/email alert prices (`live_trigger.py`), corp-action help text + Trading Window panel (`app.py`), and the "0 entries" scheduler log now use the active profile's currency symbol and `format_session_window()` so US shows `$` and `ET (… MYT)`.
+
 ## 11. Known Gaps & v4 Roadmap
 
 ### Known gaps (deliberately deferred)
@@ -753,16 +767,18 @@ Each bug has a regression test guarding against its return.
 | ~~Single data source (yfinance)~~ → **partially solved in v3.4** | Now pluggable via `data_provider.py`; real-time Moomoo when OpenD is running locally, yfinance fallback otherwise. Adding a 2nd free provider (e.g. Stooq) for redundancy is still on the v4 list. | — |
 | ~~No corporate actions (splits, bonuses)~~ → **solved in v3.5** | Splits/bonus auto-adjusted via `corporate_actions.py`; cash dividends alert-only (full P&L credit deferred to v6). Rights issues still not handled. | — |
 | Slippage model is heuristic | Real fills may differ for very thin stocks | Volume-aware version covers most cases |
-| No real broker execution | Notification only | Moomoo adapter stubbed; user wants 6-month validation first |
-| Public holiday list expires after 2027 | Must update yearly | Hardcoded in `market_calendar.MY_PUBLIC_HOLIDAYS` |
+| ~~No real broker execution~~ → **solved for US in v3.6** | US can execute via Moomoo SIMULATE/REAL (`MoomooUSAdapter`). MY remains notify-only (OpenAPI gap). | — |
+| **Moomoo OpenAPI has no MY coverage** | MY can't use Moomoo for data or execution; stays on yfinance + notify-only | Out of our control — flip `MY_PROFILE.moomoo_available=True` the day Moomoo adds Bursa |
+| Public holiday list expires after 2027 (MY only) | Must update yearly | Hardcoded in `market_calendar.MY_PUBLIC_HOLIDAYS`. US auto-extends via `pandas_market_calendars` |
 | GitHub PAT expires | Backups silently fail | User must rotate ~yearly |
 | ML classifier .pkl not in Gist | Lost on container reset | Self-rebuilds nightly within 24h, so non-critical |
 | Python `threading` cannot interrupt blocking I/O | Watchdog recovers within N min, can't cut a stuck call short | Subprocess-based scan would be a 4× code increase; per-call HTTP timeouts cover the realistic cases |
 
 ### v4 candidates (when user is ready)
 
-1. **Moomoo OpenAPI integration** — ✅ *data layer done in v3.4 (`data_provider.py`)*. Still TODO: fill in `broker_adapter.MoomooAdapter` execution methods, add `broker_mode = "EXECUTE"` toggle in live_trigger.py
-2. **Live capital tracking** — separate `live_account` table that records real-broker mirror trades
+1. **Moomoo OpenAPI integration** — ✅ *data layer done in v3.4; US execution done in v3.6 (`MoomooUSAdapter`, NOOP/SIMULATE/REAL + `reconciliation.py`)*. Remaining: HK market profile; MY execution blocked until OpenAPI adds Bursa.
+2. **Live capital tracking** — separate `live_account` table that records real-broker mirror trades (reconciliation foundation landed in v3.6)
+3. **Stooq as 2nd free data fallback** — full redundancy beyond yfinance for both markets
 3. **Calibration-driven auto-mode-switch** — only enable EXECUTE mode if calibration chart shows <5% deviation
 4. **GitHub Actions CI** — auto-run pytest on every push
 5. **Telegram interactive buttons** — APPROVE/REJECT inline keyboard for each alert
@@ -890,6 +906,161 @@ and in **⚙️ Settings → 🗓️ Long-Term Maintenance Status** (see v3.1.7)
 
 ---
 
+## 14. Multi-Market Architecture (v3.6)
+
+v3.6 turns the Bursa-only agent into a **dual-market** agent (MY + US) on a
+single repo. This section is the canonical reference for how markets are kept
+separate and how to add a third.
+
+### 14.1 Why two markets
+
+Moomoo OpenAPI does **not** support Bursa (MY) for real-time data *or*
+execution. So the v4 dream of "real broker execution" is impossible on MY —
+MY stays **notification-only on yfinance**. The path to actual automation is
+**US/HK**, where OpenAPI is fully supported. v3.6 adds US with full Moomoo
+execution (NOOP / SIMULATE / REAL) while leaving MY behaviour byte-identical.
+
+### 14.2 The data-source contract ⭐ (read this — it's the most-asked question)
+
+There is **one** data mechanism, gated per-market by a single profile flag
+`moomoo_available`:
+
+| Market | `moomoo_available` | Behaviour today | The day it changes |
+|---|---|---|---|
+| **US** | `True` | Uses **Moomoo** when OpenD is connected; **falls back to yfinance** when OpenD is down | (already live) |
+| **MY** | `False` | **Always yfinance** — Moomoo path is *gated off*, not deleted | Flip the one flag to `True` in `my_profile.py` + connect OpenD → MY **auto-goes-live on Moomoo**, no other code change |
+
+Key invariants:
+- **yfinance is the universal fallback for both markets** — nothing ever hard-breaks if Moomoo is absent.
+- The MY Moomoo path is the *same code path* as US, merely gated by the flag. Moomoo OpenD is "always ready"; it's just disconnected until OpenAPI adds Bursa.
+- `data_provider._market_supports_moomoo(ticker)` reads the active profile's `moomoo_available` live. `data_provider.py` literally comments: *"the day Moomoo enables MY, flipping that flag in my_profile.py turns this on."*
+- Regression guards live in `tests/test_data_provider.py::TestMarketGating` (incl. a flag-flip test proving MY goes live when the flag is set).
+
+### 14.3 Repo structure — profiles behind a Protocol
+
+```
+market_profiles/
+    __init__.py     # active_profile() resolver + set_active_market() + display helpers re-export
+    base.py         # MarketProfile Protocol, TradingSession/TickerSpec, slippage/calendar contracts,
+                    #   format_session_window() / format_time_with_user_local() (v3.6 display helpers)
+    my_profile.py   # MY_PROFILE singleton (Bursa)
+    us_profile.py   # US_PROFILE singleton (NYSE/NASDAQ)
+```
+
+Business modules import `active_profile()` instead of hardcoding Bursa
+constants. **Adding a third market (HK/SG) = one new `<code>_profile.py`** that
+satisfies the Protocol + adding it to `available_markets()` — zero changes
+elsewhere.
+
+### 14.4 Active-market resolution (priority order)
+
+1. Env var `MARKET_MODE` (`MY` / `US`)
+2. Marker file `~/.bursa_agent_data/.active_market` (written by the Settings sidebar switcher)
+3. Default = `MY` (preserves v3.3 behaviour)
+
+> **Why a text-file marker, not the SQLite `meta` table?** `db.py`'s DB path
+> depends on the active market, so reading the market from the DB would be a
+> chicken-and-egg. The marker file breaks the cycle.
+
+### 14.5 Per-market isolation (two brains, two DBs)
+
+Each market has its **own** SQLite file with the full schema, so cash math,
+trades, and the Bayesian brain can never cross-contaminate:
+
+```
+~/.bursa_agent_data/
+├── .active_market                # marker: "MY" or "US"
+├── bursa_agent_MY.db             # MY trades, brain, account, params, scheduler_state
+├── bursa_agent_US.db             # US trades, brain, account, params, scheduler_state
+├── setup_classifier.pkl          # ML model (market-tagged in Gist)
+└── .gist_marker.json             # Gist backup pointer
+```
+
+Gist backup is **per-market** too: `bursa_agent_MY_db.b64.gz`,
+`bursa_agent_US_db.b64.gz`, `setup_classifier_MY.pkl.b64.gz`,
+`setup_classifier_US.pkl.b64.gz` inside the single private Gist.
+
+`db._resolve_db_path()` dispatches on `active_market_code()`. **Override
+detection is by basename** (`bursa_agent_<CODE>.db` = auto; any other name =
+a deliberate test override) — see §10 bug entry for why.
+
+### 14.6 Per-market configuration (MY vs US)
+
+| Setting | 🇲🇾 MY (Bursa) | 🇺🇸 US (NYSE/NASDAQ) |
+|---|---|---|
+| Currency | MYR (RM) | USD ($) |
+| Lot size | 100 (board lot) | 1 |
+| Default capital | RM 20,000 | USD 5,000 |
+| Sessions | 09:00–12:30 + 14:30–17:00 MYT (lunch break) | 09:30–16:00 ET (RTH) |
+| Timezone | Asia/Kuala_Lumpur | America/New_York |
+| Safe-entry cutoff | 16:00 MYT | 15:30 ET |
+| Holidays | Hardcoded set (update yearly) | Auto-extends via `pandas_market_calendars` |
+| Regime ticker | `^KLSE` | `SPY` |
+| Per-trade fee | 0.15% per side | 0% (commission-free) |
+| Slippage | 5–80 bps (volume-aware Bursa) | 2–35 bps (tighter US ETFs) |
+| Min risk/trade | RM 50 | USD 20 |
+| Max positions | BULL 8 / NEUTRAL 5 / BEAR 3 | BULL 6 / NEUTRAL 4 / BEAR 2 |
+| Default universe | ~74 Bursa tickers + Shariah filter | leveraged ETFs + mega-caps |
+| Moomoo execution | ❌ Not yet (OpenAPI gap) | ✅ Full (SIMULATE + REAL) |
+
+### 14.7 Timezone display for a Malaysia-based user (v3.6)
+
+You run the app from Malaysia, so for **non-MY markets the UI shows the native
+exchange time AND the MYT equivalent** (DST-aware), via
+`market_profiles.base.format_session_window()` /
+`format_time_with_user_local()`:
+
+- US sessions render as `09:30–16:00 ET  (21:30–04:00 MYT)`
+- US safe-entry cutoff renders as `15:30 ET (03:30 MYT)`
+- MY renders natively with no redundant mirror: `09:00–12:30 and 14:30–17:00 MYT`
+
+The Settings → Trading Window panel, and the scheduler "0 entries" log message,
+both use these helpers and adapt to the active market. **Enter window times in
+the exchange's local timezone** (the input labels say `ET` / `MYT`
+accordingly). The agent's internal clock and the nightly-maintenance time
+(`01:00 MYT`) remain MYT regardless of market — that is intentional.
+
+### 14.8 Broker execution (US only)
+
+`broker_adapter.get_broker_adapter(mode)` resolves on (active market, mode):
+
+- MY → **always `NoopAdapter`** (OpenAPI gap), regardless of mode.
+- US + `NOOP` → `NoopAdapter` (notify only — the default).
+- US + `SIMULATE` → `MoomooUSAdapter(trd_env="SIMULATE")` (broker-side paper account).
+- US + `REAL` → `MoomooUSAdapter(trd_env="REAL")` (live money; requires `MOOMOO_TRADING_PWD`).
+
+`MoomooUSAdapter` (v3.6 Block 5) implements connect/unlock_trade/place_order/
+accinfo_query/position_list_query, cherry-picked from the
+`WallTrading-Bot-MooMoo-Futu` reference pattern. Mirror hooks
+(`mirror_entry_to_broker` / `mirror_exit_to_broker`) are fire-and-forget and
+NO-OP in NOOP mode. **`broker_mode` is a per-market `scheduler_state` column.**
+
+### 14.9 Reconciliation (v3.6)
+
+`reconciliation.py` compares internal positions/cash to the broker each
+scheduler cycle (US/SIMULATE/REAL only) and alerts via Telegram when drift
+exceeds `DEFAULT_DRIFT_ALERT_THRESHOLD` (0.5% of equity) or position qty
+tolerance (1 share / 1%). Last drift + timestamp are stored in
+`scheduler_state.last_reconcile_drift` / `last_reconcile_at` and surfaced in
+Settings. Drift < 0.5% is normal (internal uses heuristic slippage; broker
+uses real NBBO).
+
+### 14.10 Deployment model
+
+- **MY** → Streamlit Cloud (yfinance). Runs 24/7, brain persists via Gist.
+- **US** → your local PC with Moomoo Desktop + OpenD. When OpenD is up → Moomoo live; when you're away/offline → US tab shows "disconnected" and uses yfinance (no execution). MY keeps running on the cloud independently.
+
+### 14.11 How to switch markets
+
+1. Sidebar market switcher (writes the `.active_market` marker), **or**
+2. Env var `MARKET_MODE=US` before launch, **or**
+3. `market_profiles.set_active_market("US")` at runtime.
+
+Each switch lazily `init_db()`s the target market's DB so a first-ever switch
+never crashes with `no such table: account`.
+
+---
+
 ## Appendix A: SQLite Schema Summary
 
 | Table | Singleton? | Purpose |
@@ -904,7 +1075,7 @@ and in **⚙️ Settings → 🗓️ Long-Term Maintenance Status** (see v3.1.7)
 | `state_priors` | No | Per (state_id, action) Beta(α,β) |
 | `learning_events` | No | Bayes updates, ML training, walk-forward |
 | `scheduler_log` | No | HEARTBEAT, SKIP, CYCLE_OK, CYCLE_SLOW, CYCLE_TIMEOUT, errors |
-| `scheduler_state` | Yes | Running flag, last/next run, owner_pid, toggles, **cycle_started_at (v3.1.10)** |
+| `scheduler_state` | Yes | Running flag, last/next run, owner_pid, toggles, cycle_started_at (v3.1.10), corp_action_autoadjust (v3.5), **broker_mode / last_reconcile_at / last_reconcile_drift (v3.6)** |
 | `trade_log` | No | Every ENTRY/EXIT/REJECT execution event |
 | `data_quality_log` | No | Per-ticker validation issues |
 | `scan_cache` | Yes | Most recent screener output |
@@ -915,8 +1086,13 @@ and in **⚙️ Settings → 🗓️ Long-Term Maintenance Status** (see v3.1.7)
 | `maintenance_state` | No (one row per task) | Daily-task idempotency CAS |
 | `regime_history` | No | Per-cycle KLCI regime snapshots (v3.1.4) |
 | `meta` | No (key/value) | Cross-container state (Gist marker, PAT rotation timestamp) — v3.1.9 |
+| `corporate_actions_processed` | No | Split/bonus/dividend idempotency guard — v3.5 |
 
-**All tables are inside `~/.bursa_agent_data/bursa_agent.db` and are backed up to the Gist as a single file.**
+**v3.6:** the schema above exists **once per market** — in `bursa_agent_MY.db`
+AND `bursa_agent_US.db`. Each file is backed up to the Gist independently
+(`bursa_agent_MY_db.b64.gz` / `bursa_agent_US_db.b64.gz`). The active market is
+chosen by `market_profiles.active_market_code()` (env `MARKET_MODE` → marker
+file → default MY). See §14.
 
 ---
 

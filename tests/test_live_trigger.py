@@ -158,13 +158,23 @@ def test_noop_adapter_implements_interface():
     assert a.list_positions() == []
 
 
-def test_moomoo_adapter_raises_not_implemented():
-    from broker_adapter import get_broker_adapter
+def test_moomoo_adapter_implemented_not_stub():
+    """v3.6 Block 5: the Moomoo adapter is now fully implemented, so it no
+    longer raises NotImplementedError (it used to be a skeleton).
+
+    On the MY market the factory always forces NOOP (Moomoo OpenAPI has no
+    MY coverage yet), so a legacy "MOOMOO"/unknown mode resolves to a working
+    NoopAdapter rather than raising. Full MoomooUSAdapter behaviour is
+    exercised in tests/test_moomoo_us_adapter.py.
+    """
+    from broker_adapter import get_broker_adapter, NoopAdapter
+
+    # Legacy / unknown mode on the default (MY) market → safe NoopAdapter.
     a = get_broker_adapter("MOOMOO")
-    with pytest.raises(NotImplementedError):
-        a.connect()
-    with pytest.raises(NotImplementedError):
-        a.get_cash_balance()
+    assert isinstance(a, NoopAdapter)
+    # No NotImplementedError anymore — these just work.
+    assert a.connect() is True
+    assert a.get_cash_balance() == 0.0
 
 
 # ----- Format integration -----

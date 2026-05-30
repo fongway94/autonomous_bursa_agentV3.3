@@ -1,24 +1,48 @@
 # market_calendar.py
 """
-Bursa Malaysia market calendar — accurate trading sessions + public holidays.
+Market calendar — accurate trading sessions + public holidays.
 
-Sessions
---------
-    Monday–Friday (except public holidays)
+v3.6 multi-market change
+------------------------
+This module used to be 100% Bursa-Malaysia-specific. As of v3.6 it is a
+THIN DISPATCHER: when the active market profile is MY it preserves the
+exact v3.3 behaviour (no regression). When the active profile is US (or
+any future profile), it delegates session/holiday/safe-entry logic to the
+profile object itself.
 
-    08:30 – 09:00   Pre-opening
-    09:00 – 12:30   Morning session
-    12:30 – 14:00   Lunch break (closed)
-    14:00 – 14:30   Afternoon pre-open
-    14:30 – 16:45   Afternoon session
-    16:45 – 16:50   Pre-closing
-    16:50 – 17:00   Trading at Last
+The legacy module-level constants (`MYT`, `BURSA_SESSIONS`,
+`MY_PUBLIC_HOLIDAYS`, `is_public_holiday`, etc.) are kept as-is so that:
+    * `maintenance_reminders.py` (which scans MY_PUBLIC_HOLIDAYS for the
+      "renew the holiday list" banner) keeps working.
+    * Old tests pass unchanged.
+    * A user staring at the file can still see exactly which Bursa
+      holidays are encoded.
+
+Session source of truth
+-----------------------
+MY (Bursa):
+    Mon–Fri (excl. public holidays)
+    08:30–09:00  Pre-opening
+    09:00–12:30  Morning
+    12:30–14:00  Lunch break (closed)
+    14:00–14:30  Afternoon pre-open
+    14:30–16:45  Afternoon
+    16:45–16:50  Pre-closing
+    16:50–17:00  Trading at Last
+
+US (NYSE/NASDAQ RTH):
+    Mon–Fri (excl. NYSE holidays)
+    09:30–16:00  Regular Trading Hours
 """
 
 from __future__ import annotations
 from datetime import datetime, time, timezone, timedelta
 from typing import NamedTuple
 
+
+# ---------------------------------------------------------------------------
+# Legacy MY constants — kept for backwards compatibility
+# ---------------------------------------------------------------------------
 
 MYT = timezone(timedelta(hours=8))
 
@@ -41,51 +65,6 @@ BURSA_SESSIONS = [
 ]
 
 
-def current_session(now: datetime | None = None) -> Session | None:
-    if now is None:
-        now = datetime.now(MYT)
-    if not is_trading_day(now.date()):
-        return None
-    t = now.time()
-    for s in BURSA_SESSIONS:
-        if s.start <= t < s.end:
-            return s
-    return None
-
-
-def is_market_open(now: datetime | None = None) -> bool:
-    s = current_session(now)
-    return s is not None and s.fills
-
-
-def is_safe_entry_window(now: datetime | None = None) -> bool:
-    if now is None:
-        now = datetime.now(MYT)
-    if not is_trading_day(now.date()):
-        return False
-    t = now.time()
-    morning_ok = time(9, 0) <= t < time(12, 30)
-    afternoon_ok = time(14, 30) <= t < time(16, 0)
-    return morning_ok or afternoon_ok
-
-
-def next_session_start(now: datetime | None = None) -> datetime:
-    if now is None:
-        now = datetime.now(MYT)
-    today = now.date()
-    if is_trading_day(today):
-        for s in BURSA_SESSIONS:
-            session_start = datetime.combine(today, s.start, tzinfo=MYT)
-            if session_start > now:
-                return session_start
-    d = today
-    for _ in range(10):
-        d = d + timedelta(days=1)
-        if is_trading_day(d):
-            return datetime.combine(d, time(9, 0), tzinfo=MYT)
-    return now + timedelta(hours=24)
-
-
 MY_PUBLIC_HOLIDAYS: set[str] = {
     # 2025
     "2025-01-01", "2025-01-29", "2025-01-30", "2025-02-11", "2025-03-18",
@@ -103,10 +82,169 @@ MY_PUBLIC_HOLIDAYS: set[str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _active_market() -> str:
+    """Returns the active market code, defaulting to 'MY' on any failure."""
+    try:
+        from market_profiles import active_market_code
+        return active_market_code()
+    except Exception:
+        return "MY"
+
+
+def _active_tz():
+    code = _active_market()
+    if code == "MY":
+        return MYT
+    try:
+        from market_profiles import active_profile
+        return active_profile().timezone
+    except Exception:
+        return MYT
+
+
+def _now_local(now: datetime | None = None) -> datetime:
+    """Return `now` converted to the active market's local timezone."""
+    tz = _active_tz()
+    if now is None:
+        return datetime.now(tz)
+    if now.tzinfo is None:
+        # Naive datetimes are assumed to already be in the local tz.
+        return now.replace(tzinfo=tz)
+    return now.astimezone(tz)
+
+
+# ---------------------------------------------------------------------------
+# Public calendar API (dispatched by active market)
+# ---------------------------------------------------------------------------
+
+def current_session(now: datetime | None = None) -> Session | None:
+    """Return the trading Session covering `now`, or None if outside.
+
+    For MY this returns one of the BURSA_SESSIONS NamedTuples (with `fills`
+    flag). For US/other markets it returns a Session built on the fly so
+    callers that inspect `.name` and `.fills` keep working.
+    """
+    now_local = _now_local(now)
+    if not is_trading_day(now_local.date()):
+        return None
+    t = now_local.time()
+    code = _active_market()
+
+    if code == "MY":
+        for s in BURSA_SESSIONS:
+            if s.start <= t < s.end:
+                return s
+        return None
+
+    # Generic dispatch via profile.sessions
+    try:
+        from market_profiles import active_profile
+        for s in active_profile().sessions:
+            if s.start <= t < s.end:
+                return Session(s.name, s.start, s.end, True)
+    except Exception:
+        pass
+    return None
+
+
+def is_market_open(now: datetime | None = None) -> bool:
+    s = current_session(now)
+    return s is not None and s.fills
+
+
+def is_safe_entry_window(now: datetime | None = None) -> bool:
+    """True iff the active market is open AND there's enough time left in
+    the session to make a new auto-entry sensible.
+
+    MY: 09:00-12:30 OR 14:30-16:00 (16:00 cutoff so trade has ≥1h to develop)
+    US: 09:30-15:30  (15:30 cutoff for the same reason)
+    """
+    now_local = _now_local(now)
+    if not is_trading_day(now_local.date()):
+        return False
+    t = now_local.time()
+    code = _active_market()
+
+    if code == "MY":
+        morning_ok = time(9, 0) <= t < time(12, 30)
+        afternoon_ok = time(14, 30) <= t < time(16, 0)
+        return morning_ok or afternoon_ok
+
+    # Generic: in-session AND before the profile's safe_entry_cutoff
+    try:
+        from market_profiles import active_profile
+        from market_profiles.base import is_within_sessions
+        prof = active_profile()
+        # we need a datetime for the helper; reuse now_local
+        if not is_within_sessions(now_local, prof.sessions):
+            return False
+        return t < prof.safe_entry_cutoff
+    except Exception:
+        return False
+
+
+def next_session_start(now: datetime | None = None) -> datetime:
+    """Return the next session-start datetime (in active market TZ)."""
+    now_local = _now_local(now)
+    tz = now_local.tzinfo
+    today = now_local.date()
+    code = _active_market()
+
+    if code == "MY":
+        sessions = BURSA_SESSIONS
+        # On a fresh trading day, MY conventionally surfaces 9:00 (MORNING open)
+        # to the user, not 8:30 (PRE_OPEN_AM). v3.3 behaviour preserved.
+        first_open_session = next(s for s in BURSA_SESSIONS if s.fills)
+        first_start = first_open_session.start
+    else:
+        try:
+            from market_profiles import active_profile
+            sessions = [Session(s.name, s.start, s.end, True)
+                        for s in active_profile().sessions]
+        except Exception:
+            sessions = BURSA_SESSIONS
+        first_start = sessions[0].start
+
+    if is_trading_day(today):
+        for s in sessions:
+            session_start = datetime.combine(today, s.start, tzinfo=tz)
+            if session_start > now_local:
+                return session_start
+
+    d = today
+    for _ in range(10):
+        d = d + timedelta(days=1)
+        if is_trading_day(d):
+            return datetime.combine(d, first_start, tzinfo=tz)
+    return now_local + timedelta(hours=24)
+
+
 def is_public_holiday(d) -> bool:
-    if hasattr(d, "strftime"):
-        d = d.strftime("%Y-%m-%d")
-    return d in MY_PUBLIC_HOLIDAYS
+    """True if `d` is a public holiday for the ACTIVE market."""
+    code = _active_market()
+    if code == "MY":
+        if hasattr(d, "strftime"):
+            d_str = d.strftime("%Y-%m-%d")
+        else:
+            d_str = str(d)
+        return d_str in MY_PUBLIC_HOLIDAYS
+
+    # Other markets delegate to their profile's is_holiday(datetime) callable.
+    try:
+        from market_profiles import active_profile
+        prof = active_profile()
+        # Build a midday datetime in profile TZ so we don't trip near-midnight DST cases
+        if isinstance(d, str):
+            d = datetime.strptime(d, "%Y-%m-%d").date()
+        from datetime import datetime as _dt
+        local_dt = _dt.combine(d, time(12, 0), tzinfo=prof.timezone)
+        return bool(prof.is_holiday(local_dt))
+    except Exception:
+        return False
 
 
 def is_trading_day(d) -> bool:
@@ -118,37 +256,44 @@ def is_trading_day(d) -> bool:
 
 
 def market_status_text(now: datetime | None = None) -> dict:
-    if now is None:
-        now = datetime.now(MYT)
+    """Human-readable status block; respects active market timezone."""
+    now_local = _now_local(now)
+    tz = now_local.tzinfo
+    code = _active_market()
+    tz_label = "MYT" if code == "MY" else now_local.strftime("%Z") or code
 
-    if not is_trading_day(now.date()):
-        is_hol = is_public_holiday(now.date())
-        reason = ("Malaysian public holiday — Bursa closed"
-                  if is_hol else "Weekend — Bursa closed")
-        nxt = next_session_start(now)
+    if not is_trading_day(now_local.date()):
+        is_hol = is_public_holiday(now_local.date())
+        market_name = "Bursa" if code == "MY" else ("NYSE/NASDAQ" if code == "US" else code)
+        reason = (f"Public holiday — {market_name} closed"
+                  if is_hol else f"Weekend — {market_name} closed")
+        nxt = next_session_start(now_local)
         return {
             "open": False,
             "session": "CLOSED_HOLIDAY" if is_hol else "CLOSED_WEEKEND",
             "reason": reason,
-            "next_event": nxt.strftime("%Y-%m-%d %H:%M MYT"),
+            "next_event": nxt.strftime(f"%Y-%m-%d %H:%M {tz_label}"),
         }
 
-    sess = current_session(now)
+    sess = current_session(now_local)
     if sess is None:
-        nxt = next_session_start(now)
+        pre_market_label = ("PRE_MARKET"
+                            if now_local.time() < time(8, 30 if code == "MY" else 9, 30)
+                            else "POST_CLOSE")
+        nxt = next_session_start(now_local)
         return {
             "open": False,
-            "session": "PRE_MARKET" if now.time() < time(8, 30) else "POST_CLOSE",
-            "reason": "Outside Bursa sessions",
-            "next_event": nxt.strftime("%Y-%m-%d %H:%M MYT"),
+            "session": pre_market_label,
+            "reason": f"Outside {code} sessions",
+            "next_event": nxt.strftime(f"%Y-%m-%d %H:%M {tz_label}"),
         }
 
-    nxt = next_session_start(now)
+    nxt = next_session_start(now_local)
     return {
         "open": sess.fills,
         "session": sess.name,
         "reason": (f"{sess.name} session "
                    f"({sess.start.strftime('%H:%M')}–"
                    f"{sess.end.strftime('%H:%M')})"),
-        "next_event": nxt.strftime("%Y-%m-%d %H:%M MYT"),
+        "next_event": nxt.strftime(f"%Y-%m-%d %H:%M {tz_label}"),
     }

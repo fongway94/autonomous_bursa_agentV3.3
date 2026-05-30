@@ -175,6 +175,35 @@ def _run_corporate_actions_step(summary: dict) -> None:
         )
 
 
+def _run_reconciliation_step(summary: dict) -> None:
+    """
+    v3.6 Block 6 — Compare internal state to broker state, log drift.
+
+    Runs at the END of each cycle (after all settles + entries) so the
+    snapshot reflects the cycle's actual outcome. Skipped automatically
+    when broker_mode == NOOP or the market has no broker support.
+
+    Mutates `summary` to add reconcile_* keys. Catches all exceptions
+    internally — reconciliation MUST NOT abort the trading cycle.
+    """
+    try:
+        from reconciliation import run_reconciliation
+        rec = run_reconciliation(alert_on_drift=True)
+        summary["reconcile_ran"] = rec.ran
+        summary["reconcile_drift_flagged"] = rec.drift_flagged
+        summary["reconcile_equity_drift_pct"] = rec.equity_drift_pct
+        summary["reconcile_position_diffs"] = len(rec.position_diffs)
+        if not rec.ran:
+            summary["reconcile_skip_reason"] = rec.reason_skipped
+    except Exception as e:
+        log_scheduler_event(
+            "RECONCILE_ERROR",
+            f"run_reconciliation raised: {e}",
+            "ERROR",
+            payload={"traceback": traceback.format_exc()},
+        )
+
+
 def _explain_cycle_outcome(summary: dict, df, regime: dict,
                             threshold: float, active_count: int,
                             max_positions: int,
@@ -400,11 +429,21 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
             sess_name = sess.name if sess else "outside-session"
             from market_calendar import market_status_text
             ms = market_status_text()
+            # v3.6: describe the active market's safe-entry window instead of
+            # hardcoding Bursa hours. Shown to a Malaysia-based user, so the
+            # helper appends the MYT equivalent for non-MY markets.
+            try:
+                from market_profiles import active_profile
+                from market_profiles.base import format_session_window
+                _win = format_session_window(active_profile(), with_user_local=True)
+            except Exception:
+                _win = "the configured session window"
             log_scheduler_event(
                 "AUTO_ENTRY_SKIP",
                 f"0 entries — In {sess_name} session "
                 f"({ms.get('reason', '')}). "
-                "New auto-entries only fire 09:00-12:30 and 14:30-16:00 MYT. "
+                f"New auto-entries only fire during {_win} "
+                f"(up to the safe-entry cutoff). "
                 f"Next opportunity: {ms.get('next_event', '?')}",
                 "INFO",
                 payload={"reason": "outside_safe_entry_window",
@@ -517,6 +556,10 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
             "0 entries — Auto-entry is OFF. Toggle it on in "
             "🤖 Robo-Trader tab to let the agent open positions.",
             payload={"reason": "autotrade_disabled"})
+
+    # v3.6 Block 6 — broker ↔ internal reconciliation (no-op in NOOP mode).
+    # Runs at the very end so settlements and entries are already reflected.
+    _run_reconciliation_step(summary)
 
     return summary
 

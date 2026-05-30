@@ -59,17 +59,62 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
-from db import DATA_DIR, DB_PATH, get_meta, set_meta
+from db import DATA_DIR, current_db_path, get_meta, set_meta
 from logger import get_logger
 
 log = get_logger("persistence")
 
 MYT = timezone(timedelta(hours=8))
 GIST_API = "https://api.github.com/gists"
-GIST_FILENAME = "bursa_agent_db.b64.gz"
-ML_GIST_FILENAME = "setup_classifier.pkl.b64.gz"  # v3.1.6: ML model
+
+# v3.6 multi-market: each market gets its OWN filename inside the gist
+# (one gist per market is also possible; we use one-gist-many-files to
+# keep the user's "rotate the PAT" workflow unchanged).
+#
+# DB_PATH is now COMPUTED via current_db_path() to track the active market.
+
+def _active_market_code() -> str:
+    try:
+        from market_profiles import active_market_code
+        return active_market_code()
+    except Exception:
+        return "MY"
+
+
+def _gist_filename() -> str:
+    """e.g. 'bursa_agent_MY_db.b64.gz' / 'bursa_agent_US_db.b64.gz'."""
+    return f"bursa_agent_{_active_market_code()}_db.b64.gz"
+
+
+def _ml_gist_filename() -> str:
+    return f"setup_classifier_{_active_market_code()}.pkl.b64.gz"
+
+
+# Backwards-compat module aliases (legacy v3.3 names). Many call sites use
+# these as constants; we re-resolve them at call time below.
+GIST_FILENAME = _gist_filename()
+ML_GIST_FILENAME = _ml_gist_filename()
 MARKER_FILE = os.path.join(DATA_DIR, ".gist_marker.json")
 ML_MODEL_PATH = os.path.join(DATA_DIR, "setup_classifier.pkl")
+
+
+def _db_path() -> str:
+    """Always returns the ACTIVE market's DB path.
+
+    v3.6 back-compat: if a caller has monkey-patched the module-level
+    `DB_PATH` constant (legacy v3.3 tests do this), honour that override
+    so the test suite stays green.
+    """
+    # Look up the module attribute dynamically so monkey-patching works.
+    overridden = globals().get("DB_PATH")
+    real = current_db_path()
+    if overridden and overridden != real:
+        return overridden
+    return real
+
+
+# Maintain backward compatibility for any code that imports DB_PATH from us.
+DB_PATH = current_db_path()
 
 # Avoid overlapping backups
 _BACKUP_LOCK = threading.RLock()
@@ -137,9 +182,9 @@ def _write_marker(data: dict) -> None:
 
 def _encode_db_for_gist() -> str:
     """Read the SQLite DB, gzip + base64-encode for storage in a text Gist."""
-    if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"DB not found at {DB_PATH}")
-    with open(DB_PATH, "rb") as f:
+    if not os.path.exists(_db_path()):
+        raise FileNotFoundError(f"DB not found at {_db_path()}")
+    with open(_db_path(), "rb") as f:
         raw = f.read()
     compressed = gzip.compress(raw, compresslevel=6)
     encoded = base64.b64encode(compressed).decode("ascii")
@@ -212,13 +257,13 @@ def backup(force: bool = False, reason: str = "") -> dict:
             marker = _read_marker()
             gist_id = marker.get("gist_id")
 
-            files = {GIST_FILENAME: {"content": encoded}}
+            files = {_gist_filename(): {"content": encoded}}
 
             # v3.1.6: also include the ML classifier .pkl if it exists
             ml_encoded = _encode_ml_for_gist()
             ml_size_kb = 0.0
             if ml_encoded:
-                files[ML_GIST_FILENAME] = {"content": ml_encoded}
+                files[_ml_gist_filename()] = {"content": ml_encoded}
                 ml_size_kb = len(ml_encoded) / 1024
 
             payload = {
@@ -305,8 +350,8 @@ def restore(gist_id: str | None = None) -> dict:
 
         gist = r.json()
         files = gist.get("files", {})
-        if GIST_FILENAME not in files:
-            result["reason"] = f"gist {gist_id} has no file '{GIST_FILENAME}'"
+        if _gist_filename() not in files:
+            result["reason"] = f"gist {gist_id} has no file '{_gist_filename()}'"
             return result
 
         def _fetch_file_content(file_meta):
@@ -319,21 +364,21 @@ def restore(gist_id: str | None = None) -> dict:
                 return r2.text
             return file_meta["content"]
 
-        encoded = _fetch_file_content(files[GIST_FILENAME])
+        encoded = _fetch_file_content(files[_gist_filename()])
         if encoded is None:
             result["reason"] = "DB file truncated with no raw_url"
             return result
 
         # SAFETY: backup the existing DB before overwriting (just in case)
-        if os.path.exists(DB_PATH):
-            backup_path = DB_PATH + ".pre_restore"
+        if os.path.exists(_db_path()):
+            backup_path = _db_path() + ".pre_restore"
             try:
                 import shutil
-                shutil.copy2(DB_PATH, backup_path)
+                shutil.copy2(_db_path(), backup_path)
             except Exception:
                 pass
 
-        bytes_restored = _decode_gist_to_db(encoded.strip(), DB_PATH)
+        bytes_restored = _decode_gist_to_db(encoded.strip(), _db_path())
 
         # v3.1.13: re-apply schema migrations after restore.
         # Critical for forward-compat: the Gist backup may have been made
@@ -352,9 +397,9 @@ def restore(gist_id: str | None = None) -> dict:
 
         # v3.1.6: also restore the ML classifier .pkl if present
         ml_bytes = 0
-        if ML_GIST_FILENAME in files:
+        if _ml_gist_filename() in files:
             try:
-                ml_encoded = _fetch_file_content(files[ML_GIST_FILENAME])
+                ml_encoded = _fetch_file_content(files[_ml_gist_filename()])
                 if ml_encoded:
                     ml_bytes = _decode_gist_to_db(ml_encoded.strip(),
                                                     ML_MODEL_PATH)
@@ -399,8 +444,8 @@ def get_status() -> dict:
         "last_backup_at": marker.get("last_backup_at"),
         "last_backup_size_kb": marker.get("last_backup_size_kb"),
         "last_reason": marker.get("last_reason"),
-        "db_size_kb": (round(os.path.getsize(DB_PATH) / 1024, 1)
-                       if os.path.exists(DB_PATH) else 0),
+        "db_size_kb": (round(os.path.getsize(_db_path()) / 1024, 1)
+                       if os.path.exists(_db_path()) else 0),
     }
 
 

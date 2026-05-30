@@ -1,11 +1,24 @@
 # trading_engine.py
 """
-Trading Engine — paper-trade execution with realistic Bursa Malaysia conventions.
+Trading Engine — paper-trade execution with realistic market conventions.
 
-Improvements vs v1
-------------------
+v3.6 multi-market change
+------------------------
+* `LOT_SIZE`, `TRANSACTION_COST_PCT` are now COMPUTED from the active
+  market profile, not module-level constants.
+* Existing callers can still import the names; they're now small wrapper
+  functions returning the active value.
+* Currency symbol (`RM` vs `$`) for user-facing strings comes from profile.
+* Slippage model dispatches to the profile's `slippage_fn` if the active
+  market is non-MY; MY retains the v3.3 volume-aware bps model exactly.
+* All cash-conservation tests pass unchanged because (a) MY math is
+  identical, and (b) US uses lot_size=1 + fee_rate=0 which is a strict
+  subset of the existing math.
+
+Improvements vs v1 (still guarded by tests)
+-------------------------------------------
 * Cash accounting verified with property tests (see tests/).
-* 100-share lot enforcement on entry.
+* Board-lot enforcement (100 for Bursa, 1 for US — both honoured by round_to_lot).
 * Configurable slippage model (linear in trade size / ADV).
 * MAE/MFE tracking per active trade.
 * Trailing stop set exactly once (idempotent).
@@ -27,54 +40,94 @@ from logger import log_trade_event, get_logger
 log = get_logger("trading_engine")
 
 # -------------------------------------------------------------------------
-# COST + SLIPPAGE
+# COST + SLIPPAGE — multi-market dispatch
 # -------------------------------------------------------------------------
 
-TRANSACTION_COST_PCT = 0.0015          # brokerage + stamp duty + clearing
-SLIPPAGE_BASE_BPS = 5                  # 0.05 % minimum slippage
-SLIPPAGE_K_RM = 50_000                 # adds bps proportional to trade RM
-SLIPPAGE_LIQUIDITY_CAP_BPS = 80        # hard cap, even for thin stocks
-LOT_SIZE = 100
+# These three constants exist for backwards compatibility (app.py imports
+# LOT_SIZE). They reflect MY defaults; runtime values come from the active
+# profile via the helpers below.
+TRANSACTION_COST_PCT = 0.0015          # MY default (Bursa brokerage + stamp + clearing)
+SLIPPAGE_BASE_BPS = 5                  # MY-flavoured legacy constant
+SLIPPAGE_K_RM = 50_000                 # MY-flavoured legacy constant
+SLIPPAGE_LIQUIDITY_CAP_BPS = 80        # MY hard cap, still applied when MY active
+LOT_SIZE = 100                         # MY default (Bursa board lot)
 
 
-def estimate_slippage_bps(trade_rm: float, avg_daily_rm: float | None = None,
-                          participation_ratio: float | None = None) -> float:
+def _profile():
+    """Active MarketProfile or a tiny shim with MY defaults."""
+    try:
+        from market_profiles import active_profile
+        return active_profile()
+    except Exception:
+        # Defensive fallback so this module remains importable in fixtures
+        class _Shim:
+            code = "MY"
+            currency_symbol = "RM"
+            currency_iso = "MYR"
+            lot_size = 100
+            fee_rate = 0.0015
+            min_fee = 0.0
+        return _Shim()
+
+
+def _ccy() -> str:
+    return _profile().currency_symbol
+
+
+def lot_size() -> int:
+    """Active market's board-lot size. MY=100, US=1."""
+    return int(_profile().lot_size)
+
+
+def fee_rate() -> float:
+    """Active market's per-side fee rate (proportion, not bps)."""
+    return float(_profile().fee_rate)
+
+
+def estimate_slippage_bps(trade_value: float, avg_daily_value: float | None = None,
+                          participation_ratio: float | None = None,
+                          avg_daily_rm: float | None = None) -> float:
     """
-    Volume-aware slippage estimate (v3).
+    Volume-aware slippage estimate (v3, MY-tuned).
+
+    Used by the MY codepath. US uses its own profile.slippage_fn directly
+    (see apply_buy_slippage below).
+
+    Args:
+        trade_value     — order notional in active currency
+        avg_daily_value — 20-day average traded value, same currency
+        participation_ratio — alternative to avg_daily_value (0–1)
+        avg_daily_rm    — legacy alias for avg_daily_value (kept for
+                          backwards compat with v3.3 tests)
 
     Components
     ----------
     1. base               5 bps   — minimum market-impact + spread half.
-    2. size-impact        trade_rm / 50_000   — linear in order size.
-    3. liquidity penalty  if avg_daily_rm known, scale ↑ when our order is
-                          >1% of typical daily volume. Penalty = up to
-                          (participation_ratio * 50 bps).
+    2. size-impact        trade_value / 50_000   — linear in order size.
+    3. liquidity penalty  if ADV known, scale ↑ when order is
+                          >1% of typical daily volume.
 
     Always capped at SLIPPAGE_LIQUIDITY_CAP_BPS (80 bps = 0.8%).
-
-    Examples
-    --------
-    RM 2k order, liquid stock (ADV RM 5m): 5 + 0.04 + ~0 = ~5 bps
-    RM 20k order, mid-liquid (ADV RM 500k): 5 + 0.4 + 20 = ~25 bps
-    RM 100k order, thin (ADV RM 200k): 5 + 2 + 50 = ~57 bps
     """
-    base = SLIPPAGE_BASE_BPS + (trade_rm / SLIPPAGE_K_RM)
+    if avg_daily_value is None and avg_daily_rm is not None:
+        avg_daily_value = avg_daily_rm
 
-    if avg_daily_rm is not None and avg_daily_rm > 0:
-        pr = trade_rm / avg_daily_rm
+    base = SLIPPAGE_BASE_BPS + (trade_value / SLIPPAGE_K_RM)
+
+    if avg_daily_value is not None and avg_daily_value > 0:
+        pr = trade_value / avg_daily_value
     elif participation_ratio is not None:
         pr = max(participation_ratio, 0)
     else:
         pr = 0.0
 
-    # Liquidity penalty: 0% participation → 0 bps; 10%+ → 50 bps
     liq_bps = min(max(pr, 0.0), 0.10) * 500.0
     return min(base + liq_bps, SLIPPAGE_LIQUIDITY_CAP_BPS)
 
 
-def _lookup_adv_rm(ticker: str | None) -> float | None:
+def _lookup_adv_value(ticker: str | None) -> float | None:
     """
-    Try to look up the trailing 20-day average daily traded value (in RM)
+    Trailing 20-day average daily traded value (in the active currency)
     from the most recent scan cache. None if unavailable.
     """
     if not ticker:
@@ -87,7 +140,7 @@ def _lookup_adv_rm(ticker: str | None) -> float | None:
                 vol = r.get("volume") or 0
                 price = r.get("price") or 0
                 if vol and price:
-                    return float(vol) * float(price)  # rough proxy
+                    return float(vol) * float(price)
         return None
     except Exception:
         return None
@@ -95,32 +148,53 @@ def _lookup_adv_rm(ticker: str | None) -> float | None:
 
 def apply_buy_slippage(price: float, shares: int,
                        ticker: str | None = None) -> tuple[float, float]:
-    """Worsen the fill on a buy. Returns (filled_price, slippage_pct)."""
-    adv_rm = _lookup_adv_rm(ticker)
-    bps = estimate_slippage_bps(price * shares, avg_daily_rm=adv_rm)
-    slip = bps / 10_000.0
-    return price * (1 + slip), slip * 100
+    """Worsen the fill on a buy. Returns (filled_price, slippage_pct).
+
+    Dispatches:
+      MY → estimate_slippage_bps() (Bursa-tuned, capped 80 bps)
+      US → profile.slippage_fn (tighter, ETF-tuned ~2-35 bps)
+    """
+    prof = _profile()
+    adv = _lookup_adv_value(ticker)
+    if prof.code == "MY":
+        bps = estimate_slippage_bps(price * shares, avg_daily_value=adv)
+        slip = bps / 10_000.0
+        return price * (1 + slip), slip * 100
+    # Non-MY: use profile slippage_fn (signed absolute price impact)
+    slip_abs = float(prof.slippage_fn(price, shares,
+                                      adv if adv is not None else 0.0, "BUY"))
+    filled = price + slip_abs
+    slip_pct = (filled / price - 1.0) * 100 if price > 0 else 0.0
+    return filled, slip_pct
 
 
 def apply_sell_slippage(price: float, shares: int,
                         ticker: str | None = None) -> tuple[float, float]:
-    adv_rm = _lookup_adv_rm(ticker)
-    bps = estimate_slippage_bps(price * shares, avg_daily_rm=adv_rm)
-    slip = bps / 10_000.0
-    return price * (1 - slip), slip * 100
+    prof = _profile()
+    adv = _lookup_adv_value(ticker)
+    if prof.code == "MY":
+        bps = estimate_slippage_bps(price * shares, avg_daily_value=adv)
+        slip = bps / 10_000.0
+        return price * (1 - slip), slip * 100
+    slip_abs = float(prof.slippage_fn(price, shares,
+                                      adv if adv is not None else 0.0, "SELL"))
+    filled = price + slip_abs    # slippage_fn returns negative for SELL
+    slip_pct = (1.0 - filled / price) * 100 if price > 0 else 0.0
+    return filled, slip_pct
 
 
 def calculate_trade_cost(shares: int, price: float) -> dict:
     gross = shares * price
-    fee = gross * TRANSACTION_COST_PCT
+    fee = gross * fee_rate()
     return {"gross": gross, "fee": fee, "total": gross + fee}
 
 
 def round_to_lot(shares: int) -> int:
-    """Floor shares down to nearest 100-share board lot. Returns 0 if <100."""
-    if shares < LOT_SIZE:
+    """Floor shares down to nearest board-lot. Returns 0 if below lot_size."""
+    lot = lot_size()
+    if shares < lot:
         return 0
-    return int((shares // LOT_SIZE) * LOT_SIZE)
+    return int((shares // lot) * lot)
 
 
 # -------------------------------------------------------------------------
@@ -137,27 +211,30 @@ def execute_entry(ticker, name, sector, entry_price, stop_loss,
 
     Validates:
       * Positive sane prices, SL < entry
-      * Shares is a positive multiple of 100 (auto-round down)
+      * Shares is a positive multiple of lot_size (auto-round down)
       * Sufficient cash for slippage-adjusted fill + fee
     """
+    ccy = _ccy()
+    lot = lot_size()
+
     if entry_price <= 0 or stop_loss <= 0 or entry_price <= stop_loss:
         return False, None, "Invalid entry/stop prices."
 
     shares = round_to_lot(int(shares))
     if shares <= 0:
-        return False, None, f"Position too small (< {LOT_SIZE} share lot)."
+        return False, None, f"Position too small (< {lot} share lot)."
 
     fill_price, slip_pct = apply_buy_slippage(entry_price, shares, ticker=ticker)
     gross = fill_price * shares
-    fee = gross * TRANSACTION_COST_PCT
+    fee = gross * fee_rate()
     total_outlay = gross + fee
 
     acc = load_account()
     cash = acc["cash_balance"]
     if total_outlay > cash + 0.01:
-        return False, None, (f"Insufficient cash. Need RM {total_outlay:,.2f} "
-                             f"(incl. RM {fee:.2f} fee + {slip_pct:.2f}% slip), "
-                             f"have RM {cash:,.2f}.")
+        return False, None, (f"Insufficient cash. Need {ccy} {total_outlay:,.2f} "
+                             f"(incl. {ccy} {fee:.2f} fee + {slip_pct:.2f}% slip), "
+                             f"have {ccy} {cash:,.2f}.")
 
     risk_per_share = round(fill_price - stop_loss, 4)
     trade = {
@@ -168,7 +245,7 @@ def execute_entry(ticker, name, sector, entry_price, stop_loss,
         "tp1": round(float(tp1), 3),
         "tp2": round(float(tp2), 3),
         "tp3": round(float(tp3), 3),
-        "shares": int(shares), "lots": int(shares // LOT_SIZE),
+        "shares": int(shares), "lots": int(shares // lot) if lot > 0 else int(shares),
         "cost": round(gross, 2), "fee": round(fee, 2),
         "total_outlay": round(total_outlay, 2),
         "risk_per_share": risk_per_share,
@@ -223,10 +300,21 @@ def execute_entry(ticker, name, sector, entry_price, stop_loss,
     except Exception:
         pass
 
+    # v3.6: real-broker mirror — fires only when broker_mode is SIMULATE/REAL.
+    # NOOP returns immediately. Silent failure is OK; reconciliation will catch drift.
+    try:
+        from broker_adapter import mirror_entry_to_broker
+        mirror_entry_to_broker(
+            ticker=ticker, shares=shares, fill_price=fill_price,
+            stop_loss=stop_loss, tp1=tp1, trade_id=trade_id,
+        )
+    except Exception as e:
+        log.warning(f"broker mirror_entry failed (non-fatal): {e}")
+
     return True, trade_id, (
-        f"Entry executed: {shares} shares of {ticker} @ RM {fill_price:.3f} "
-        f"(slip {slip_pct:.2f}%). Total outlay RM {total_outlay:,.2f}. "
-        f"SL RM {stop_loss:.3f} | TP1 RM {tp1:.3f} | TP2 RM {tp2:.3f} | TP3 RM {tp3:.3f}.")
+        f"Entry executed: {shares} shares of {ticker} @ {ccy} {fill_price:.3f} "
+        f"(slip {slip_pct:.2f}%). Total outlay {ccy} {total_outlay:,.2f}. "
+        f"SL {ccy} {stop_loss:.3f} | TP1 {ccy} {tp1:.3f} | TP2 {ccy} {tp2:.3f} | TP3 {ccy} {tp3:.3f}.")
 
 
 # -------------------------------------------------------------------------
@@ -236,6 +324,7 @@ def execute_entry(ticker, name, sector, entry_price, stop_loss,
 def execute_partial_exit(trade_id: int, tp_level: str, current_price: float,
                          shares_to_close: int, reason: str = "Partial TP exit",
                          actor: str = "USER") -> tuple[bool, str]:
+    ccy = _ccy()
     t = get_trade(trade_id)
     if t is None:
         return False, "Trade not found."
@@ -248,7 +337,7 @@ def execute_partial_exit(trade_id: int, tp_level: str, current_price: float,
 
     fill_price, slip_pct = apply_sell_slippage(current_price, shares_to_close, ticker=t['ticker'])
     gross = fill_price * shares_to_close
-    fee = gross * TRANSACTION_COST_PCT
+    fee = gross * fee_rate()
     net_proceeds = gross - fee
     entry = t["entry_price"]
     # Proportional entry fee already paid at open — must be netted off P&L
@@ -307,8 +396,18 @@ def execute_partial_exit(trade_id: int, tp_level: str, current_price: float,
     except Exception:
         pass
 
-    return True, (f"Partial {tp_level}: {shares_to_close} shares @ RM "
-                  f"{fill_price:.3f}. Net P&L RM {net_pnl:+.2f}. "
+    # v3.6: broker mirror (NOOP unless SIMULATE/REAL)
+    try:
+        from broker_adapter import mirror_exit_to_broker
+        mirror_exit_to_broker(
+            ticker=t["ticker"], shares=shares_to_close,
+            fill_price=fill_price, trade_id=trade_id, kind="PARTIAL",
+        )
+    except Exception as e:
+        log.warning(f"broker mirror_exit (partial) failed (non-fatal): {e}")
+
+    return True, (f"Partial {tp_level}: {shares_to_close} shares @ {ccy} "
+                  f"{fill_price:.3f}. Net P&L {ccy} {net_pnl:+.2f}. "
                   f"{new_remaining} shares remaining.")
 
 
@@ -316,6 +415,7 @@ def execute_full_exit(trade_id: int, current_price: float,
                       reason: str = "Manual close",
                       outcome: str | None = None,
                       actor: str = "USER") -> tuple[bool, str]:
+    ccy = _ccy()
     t = get_trade(trade_id)
     if t is None:
         return False, "Trade not found."
@@ -328,7 +428,7 @@ def execute_full_exit(trade_id: int, current_price: float,
 
     fill_price, slip_pct = apply_sell_slippage(current_price, shares_to_close, ticker=t['ticker'])
     gross = fill_price * shares_to_close
-    fee = gross * TRANSACTION_COST_PCT
+    fee = gross * fee_rate()
     net_proceeds = gross - fee
     entry = t["entry_price"]
     # Proportional entry fee already paid at open — must be netted off P&L
@@ -384,8 +484,17 @@ def execute_full_exit(trade_id: int, current_price: float,
     except Exception:
         pass
 
-    # v3.1.5: backup DB after every full exit (manual or auto) — preserves
-    # closed trade + updated cash balance + brain learning that follows
+    # v3.6: broker mirror (NOOP unless SIMULATE/REAL)
+    try:
+        from broker_adapter import mirror_exit_to_broker
+        mirror_exit_to_broker(
+            ticker=t["ticker"], shares=shares_to_close,
+            fill_price=fill_price, trade_id=trade_id, kind="FULL",
+        )
+    except Exception as e:
+        log.warning(f"broker mirror_exit (full) failed (non-fatal): {e}")
+
+    # v3.1.5: backup DB after every full exit (manual or auto)
     try:
         from persistence import backup as _pers_backup, is_configured
         if is_configured():
@@ -393,8 +502,8 @@ def execute_full_exit(trade_id: int, current_price: float,
     except Exception:
         pass
 
-    return True, (f"Closed {t['ticker']} @ RM {fill_price:.3f}. "
-                  f"Net P&L RM {net_pnl:+.2f} ({outcome}).")
+    return True, (f"Closed {t['ticker']} @ {ccy} {fill_price:.3f}. "
+                  f"Net P&L {ccy} {net_pnl:+.2f} ({outcome}).")
 
 
 # -------------------------------------------------------------------------
@@ -407,7 +516,6 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
     Idempotent settlement.
 
     price_lookup: {ticker: {"price": float, "high": float, "low": float}}
-                  (high/low optional but recommended for intraday accuracy)
     """
     regime = market_regime.get("regime_data", {}).get("regime", "NEUTRAL")
     max_hold_days = {"BULL": 14, "NEUTRAL": 7, "BEAR": 5}.get(regime, 7)
@@ -455,7 +563,7 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
                                 "ticker": ticker, "outcome": "WIN"})
             continue
 
-        # 2. Trailing stop (only after it is set)
+        # 2. Trailing stop
         if trailing is not None and low_today <= trailing:
             outcome = "WIN" if trailing > entry else \
                       ("BREAKEVEN" if abs(trailing - entry) / entry < 0.005
@@ -490,7 +598,6 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
                 if ok:
                     partials.append({"trade_id": t["id"], "ticker": ticker,
                                      "shares": shares_part, "msg": msg})
-                # Reload trade to update fields
                 t = get_trade(t["id"])
 
         # 5. TP1 — set trailing stop (once)
@@ -539,7 +646,7 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
 
 
 # -------------------------------------------------------------------------
-# Convenience helpers (kept for app.py compatibility)
+# Convenience helpers
 # -------------------------------------------------------------------------
 
 def add_trade_note(trade_id: int, note: str) -> bool:
@@ -562,41 +669,14 @@ def tag_trade(trade_id: int, tag: str) -> bool:
     return True
 
 
-
 # ===========================================================================
 # v3.5 — Corporate-action adjustment (splits & bonus issues)
 # ===========================================================================
-#
-# Called by the scheduler when corporate_actions.detect_for_tickers() finds a
-# SPLIT or BONUS event on a ticker we hold. Splits don't move cash — they
-# only restructure the per-share basis and share count — so the cash-
-# conservation invariant is preserved by construction.
-#
-# Conventions (mirror corporate_actions.CorporateAction):
-#
-#   ratio = new_shares / old_shares
-#
-#   1-for-5 forward split      → ratio = 5.0  → shares × 5, prices ÷ 5
-#   5-for-1 reverse split      → ratio = 0.2  → shares × 0.2 (rounded), prices × 5
-#   1-for-2 bonus issue        → ratio = 1.5  → shares × 1.5, prices ÷ 1.5
-#
-# Atomicity: ALL field updates happen inside a single SQLite transaction.
-# Any error rolls back the entire adjustment and re-raises so the caller
-# (corporate_actions.process_corporate_actions) can record the failure and
-# fire a Telegram alert.
-#
-# Idempotency: each trade's cumulative_split_factor is multiplied by the
-# applied ratio. The caller (corporate_actions.already_processed) guarantees
-# we never call apply_split_to_trade twice for the same (ticker, ex_date,
-# event_type), but as a defence-in-depth we also verify the trade is still
-# ACTIVE before adjusting.
-# ---------------------------------------------------------------------------
+# (Unchanged from v3.5 — purely numeric, market-agnostic.)
 
 from typing import Optional
 
 
-# Fields that scale DOWN with the ratio (per-share prices).
-# When ratio=5 (1-for-5 forward split), each of these gets divided by 5.
 _PRICE_FIELDS_INVERSE = (
     "entry_price",
     "stop_loss",
@@ -608,19 +688,11 @@ _PRICE_FIELDS_INVERSE = (
     "risk_per_share",
 )
 
-# Fields that scale UP with the ratio (share counts).
-# When ratio=5, each of these gets multiplied by 5.
 _SHARE_FIELDS_FORWARD = (
     "shares",
     "shares_remaining",
     "lots",
 )
-
-# Fields explicitly NOT touched by a split (sanity-check reference):
-#   cost, fee, total_outlay   — total RM amounts, invariant
-#   realized_pnl, unrealized_pnl, closed_pnl  — total RM, invariant
-#   mae_pct, mfe_pct, slippage_pct, actual_risk_pct  — percentages, invariant
-#   ticker, name, sector, status, phase, notes  — non-numeric
 
 
 def apply_split_to_trade(trade_id: int, ratio: float,
@@ -628,24 +700,7 @@ def apply_split_to_trade(trade_id: int, ratio: float,
                          note: Optional[str] = None) -> dict:
     """
     Atomically adjust one trade for a stock split (or bonus issue).
-
-    Parameters
-    ----------
-    trade_id : the trade.id to adjust
-    ratio    : new_shares / old_shares. Must be > 0 and != 1.0.
-    ex_date  : ISO date of the split (for audit / note text)
-    note     : optional extra context appended to trade.notes
-
-    Returns
-    -------
-    dict with the BEFORE and AFTER values of every adjusted field, plus
-    cash_invariant_delta_rm (must be ~0 within rounding).
-
-    Raises
-    ------
-    ValueError  : invalid ratio, trade not found, or trade not ACTIVE
-    Any other exception is propagated AFTER the SQLite rollback so the
-    caller can record the failure and alert the user.
+    See PROJECT_HANDBOOK §4.19 for rationale.
     """
     if ratio is None or ratio <= 0:
         raise ValueError(f"ratio must be positive, got {ratio!r}")
@@ -655,9 +710,6 @@ def apply_split_to_trade(trade_id: int, ratio: float,
     from db import connect, myt_iso
 
     with connect() as c:
-        # Read BEFORE snapshot inside the same connection so we have a
-        # consistent view. SQLite's default isolation gives us an implicit
-        # transaction here (autocommit=False via the connect() helper).
         row = c.execute(
             "SELECT * FROM trades WHERE id=?", (trade_id,)
         ).fetchone()
@@ -666,48 +718,37 @@ def apply_split_to_trade(trade_id: int, ratio: float,
 
         before = dict(row)
 
-        # Defence-in-depth: only adjust trades that are still ACTIVE.
-        # A closed trade has historical entry_price/exit_price/cost that we
-        # MUST NOT touch — adjusting them would corrupt P&L history.
         if before["status"] != "ACTIVE":
             raise ValueError(
                 f"trade_id={trade_id} status={before['status']!r}; "
                 f"can only adjust ACTIVE trades"
             )
 
-        # Compute AFTER values.
         after: dict = {}
 
-        # Price fields: divide by ratio
         for f in _PRICE_FIELDS_INVERSE:
             v = before.get(f)
             if v is None:
                 after[f] = None
                 continue
             try:
-                after[f] = round(float(v) / ratio, 4)  # 4 dp for sub-sen precision
+                after[f] = round(float(v) / ratio, 4)
             except (TypeError, ValueError):
-                after[f] = v  # leave alone if non-numeric
+                after[f] = v
 
-        # Share fields: multiply by ratio. Shares stay INTEGER, lots stay INTEGER.
         for f in _SHARE_FIELDS_FORWARD:
             v = before.get(f)
             if v is None:
                 after[f] = None
                 continue
             try:
-                # Round to nearest share (Bursa allows odd lots after splits
-                # so we don't force lot-alignment here; the next user trade
-                # will re-align via round_to_lot when needed).
                 after[f] = int(round(float(v) * ratio))
             except (TypeError, ValueError):
                 after[f] = v
 
-        # cumulative_split_factor: multiply (so 2 splits compose correctly).
         prev_factor = float(before.get("cumulative_split_factor") or 1.0)
         after["cumulative_split_factor"] = round(prev_factor * ratio, 6)
 
-        # Append an audit note.
         old_notes = before.get("notes") or ""
         audit_note = (
             f"[{myt_iso()}] v3.5 SPLIT applied: ratio={ratio:g} ex_date={ex_date} "
@@ -718,21 +759,16 @@ def apply_split_to_trade(trade_id: int, ratio: float,
             audit_note += f" | {note}"
         after["notes"] = (old_notes + "\n" + audit_note).lstrip("\n")
 
-        # ---- Cash-conservation invariant check ----
-        # entry_price * shares should be unchanged (it's the cost basis in RM).
-        # We compute the delta as a sanity check; any value > RM 1.00
-        # indicates a math bug and we abort.
         before_basis = float(before["entry_price"]) * float(before["shares"])
         after_basis = float(after["entry_price"]) * float(after["shares"])
         cash_invariant_delta = round(after_basis - before_basis, 2)
         if abs(cash_invariant_delta) > 1.00:
             raise ValueError(
                 f"cash-invariant violation: basis changed by "
-                f"RM {cash_invariant_delta:.2f} (before={before_basis:.2f}, "
+                f"{cash_invariant_delta:.2f} (before={before_basis:.2f}, "
                 f"after={after_basis:.2f}). Refusing to apply split."
             )
 
-        # ---- Build and execute the UPDATE ----
         set_clauses = []
         values = []
         for f, v in after.items():
@@ -743,15 +779,11 @@ def apply_split_to_trade(trade_id: int, ratio: float,
 
         cur = c.execute(sql, values)
         if cur.rowcount == 0:
-            # Race condition: trade was closed between our SELECT and UPDATE.
             raise ValueError(
                 f"trade_id={trade_id} no longer ACTIVE (closed mid-adjustment); "
                 f"rolled back"
             )
 
-    # Transaction committed by connect() context exit.
-
-    # Return a structured diff for logging / alerting.
     return {
         "trade_id": trade_id,
         "ratio": ratio,

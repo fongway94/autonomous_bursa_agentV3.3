@@ -1,14 +1,19 @@
 # market_analyzer.py
 """
-Market Analyzer — KLCI regime, sector momentum, relative strength.
+Market Analyzer — regime detection, sector momentum, relative strength.
 
-Fixes vs v1
------------
-* Optional secondary data source fallback (placeholder hook).
-* ML regime classifier now uses proper TimeSeriesSplit + holdout test;
-  reported accuracy is OOS, not training.
-* Model persisted to disk so we don't retrain on every cold start.
-* Cache lives in SQLite (`scheduler_state.last_*` columns) rather than JSON.
+v3.6 multi-market change
+------------------------
+* KLCI_TICKER replaced by `_regime_ticker()` which reads from the active
+  market profile (^KLSE for MY, SPY for US, …).
+* The hardcoded SECTOR_TICKERS map is now a fallback for MY only. When
+  the active market is US (or any other), sector representatives are
+  computed dynamically from the profile's default watchlist by taking the
+  first 2 yf symbols per sector.
+* All public function signatures unchanged — screener.py and scheduler.py
+  need no changes.
+
+Original behaviour for MY is byte-identical to v3.3.
 """
 
 from __future__ import annotations
@@ -28,7 +33,9 @@ from logger import get_logger, log_learning_event
 
 log = get_logger("market_analyzer")
 
+# Legacy constant kept for tests; in practice always overridden by _regime_ticker()
 KLCI_TICKER = "^KLSE"
+
 MARKET_CACHE_FILE = os.path.join(DATA_DIR, "market_regime_cache.json")
 SECTOR_MOMENTUM_FILE = os.path.join(DATA_DIR, "sector_momentum.json")
 REGIME_MODEL_PATH = os.path.join(DATA_DIR, "regime_classifier.pkl")
@@ -37,6 +44,23 @@ REGIME_META_PATH = os.path.join(DATA_DIR, "regime_classifier_meta.json")
 
 def get_myt_now():
     return datetime.now(timezone(timedelta(hours=8)))
+
+
+def _regime_ticker() -> str:
+    """Active market's regime/benchmark ticker (yfinance form)."""
+    try:
+        from market_profiles import active_profile
+        return active_profile().regime_ticker_yf
+    except Exception:
+        return KLCI_TICKER
+
+
+def _active_market_code() -> str:
+    try:
+        from market_profiles import active_market_code
+        return active_market_code()
+    except Exception:
+        return "MY"
 
 
 def _robust_read_json(path, default):
@@ -58,32 +82,39 @@ def _robust_write_json(path, data):
 
 
 # -------------------------------------------------------------------------
-# KLCI fetch with validation + secondary source hook
+# Benchmark fetch with validation + secondary source hook
 # -------------------------------------------------------------------------
 
 def get_klci_data(period: str = "3mo") -> pd.DataFrame:
+    """LEGACY NAME — kept for backwards compatibility.
+
+    Actually returns the ACTIVE market's regime-benchmark series:
+        MY → ^KLSE
+        US → SPY
+    """
+    return get_regime_benchmark_data(period)
+
+
+def get_regime_benchmark_data(period: str = "3mo") -> pd.DataFrame:
+    ticker = _regime_ticker()
     try:
-        df = get_history(KLCI_TICKER, period=period, timeout=15)
+        df = get_history(ticker, period=period, timeout=15)
     except Exception as e:
-        log.warning(f"yf KLCI fail: {e}")
+        log.warning(f"yf {ticker} fail: {e}")
         df = pd.DataFrame()
 
     if df is None or df.empty:
-        # Secondary source hook — currently disabled, easy to plug in.
-        df = _try_secondary_klci(period)
+        df = _try_secondary_benchmark(ticker, period)
         if df is None or df.empty:
             return pd.DataFrame()
-    ok, _ = validate_ohlcv(df, KLCI_TICKER, min_rows=20)
+    ok, _ = validate_ohlcv(df, ticker, min_rows=20)
     if not ok:
         return pd.DataFrame()
     return df
 
 
-def _try_secondary_klci(period: str) -> pd.DataFrame:
-    """
-    Placeholder for a secondary data source. Returns empty df by default.
-    Wire investpy / a paid feed here when available.
-    """
+def _try_secondary_benchmark(ticker: str, period: str) -> pd.DataFrame:
+    """Placeholder for a secondary data source."""
     return pd.DataFrame()
 
 
@@ -91,15 +122,15 @@ def _try_secondary_klci(period: str) -> pd.DataFrame:
 # Regime detection
 # -------------------------------------------------------------------------
 
-def detect_market_regime(klci_df: pd.DataFrame | None = None) -> dict:
-    if klci_df is None:
-        klci_df = get_klci_data()
-    if klci_df.empty or len(klci_df) < 50:
+def detect_market_regime(benchmark_df: pd.DataFrame | None = None) -> dict:
+    if benchmark_df is None:
+        benchmark_df = get_regime_benchmark_data()
+    if benchmark_df.empty or len(benchmark_df) < 50:
         return {"regime": "UNCERTAIN", "conviction": 0,
-                "details": {"reason": "Insufficient KLCI data"}}
+                "details": {"reason": f"Insufficient {_regime_ticker()} data"}}
 
-    close = klci_df["Close"]
-    vol = klci_df["Volume"]
+    close = benchmark_df["Close"]
+    vol = benchmark_df["Volume"]
     e20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
     e50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
     e200 = close.ewm(span=200, adjust=False).mean().iloc[-1] \
@@ -115,7 +146,6 @@ def detect_market_regime(klci_df: pd.DataFrame | None = None) -> dict:
     elif e20 < e50 < e200:
         score -= 15
 
-    # KLCI RSI
     delta = close.diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1 / 14, adjust=False).mean()
@@ -148,8 +178,10 @@ def detect_market_regime(klci_df: pd.DataFrame | None = None) -> dict:
             "ema_20_vs_price": float((latest - e20) / e20 * 100),
             "ema_50_vs_price": float((latest - e50) / e50 * 100),
             "ema_200_vs_price": float((latest - e200) / e200 * 100),
-            "klci_rsi": rsi, "volume_ratio": vol_ratio,
+            "klci_rsi": rsi,  # field name kept for backwards-compat in regime_history schema
+            "volume_ratio": vol_ratio,
             "mom_20d_pct": mom, "last_price": float(latest),
+            "benchmark_ticker": _regime_ticker(),
             "last_updated": myt_iso(),
         },
     }
@@ -159,7 +191,8 @@ def detect_market_regime(klci_df: pd.DataFrame | None = None) -> dict:
 # Sector momentum
 # -------------------------------------------------------------------------
 
-SECTOR_TICKERS = {
+# MY-only hardcoded representatives (preserved verbatim from v3.3)
+_MY_SECTOR_TICKERS = {
     "Technology": ["0166.KL", "0097.KL", "5005.KL"],
     "Financial Services": ["1155.KL", "1295.KL", "1023.KL"],
     "Utilities": ["5347.KL", "6742.KL"],
@@ -172,10 +205,28 @@ SECTOR_TICKERS = {
     "Plantation": ["2445.KL", "5285.KL"],
 }
 
+# Module-level alias still importable as SECTOR_TICKERS for any consumer.
+SECTOR_TICKERS = _MY_SECTOR_TICKERS
+
+
+def _sector_representatives() -> dict[str, list[str]]:
+    """Up to 3 representative yf symbols per sector for the active market."""
+    if _active_market_code() == "MY":
+        return _MY_SECTOR_TICKERS
+    # Derive from profile watchlist
+    try:
+        from market_profiles import active_profile
+        out: dict[str, list[str]] = {}
+        for t in active_profile().default_watchlist:
+            out.setdefault(t.sector, []).append(t.yf_symbol)
+        return {sec: syms[:3] for sec, syms in out.items()}
+    except Exception:
+        return _MY_SECTOR_TICKERS
+
 
 def calculate_sector_momentum(lookback: int = 20) -> dict:
     out: dict = {}
-    for sector, tickers in SECTOR_TICKERS.items():
+    for sector, tickers in _sector_representatives().items():
         rets, rsis = [], []
         for t in tickers[:2]:
             try:
@@ -244,7 +295,7 @@ def calculate_relative_strength(ticker: str,
         if not ok:
             return None
         if klci_df is None:
-            klci_df = get_klci_data()
+            klci_df = get_regime_benchmark_data()
         stock_ret = float((df["Close"].iloc[-1] - df["Close"].iloc[-period]) /
                           df["Close"].iloc[-period] * 100)
         klci_ret = 0.0
@@ -300,18 +351,28 @@ def get_full_market_analysis(force_refresh: bool = False) -> dict:
         c = get_market_regime_cached()
         if c:
             return c
-    klci = get_klci_data()
-    regime_data = detect_market_regime(klci)
+    bench = get_regime_benchmark_data()
+    regime_data = detect_market_regime(bench)
     sector_mom = get_sector_momentum()
     regime = regime_data["regime"]
     conv = regime_data["conviction"]
 
+    # Per-regime position rules — pulled from active profile for max-positions
+    try:
+        from market_profiles import active_profile
+        prof = active_profile()
+        bull_max = prof.bull_max_positions
+        neut_max = prof.neutral_max_positions
+        bear_max = prof.bear_max_positions
+    except Exception:
+        bull_max, neut_max, bear_max = 8, 5, 3
+
     if regime == "BULL":
-        pos_mult, risk_adj, max_pos, thr = 1.0, 1.0, 8, 0.65
+        pos_mult, risk_adj, max_pos, thr = 1.0, 1.0, bull_max, 0.65
     elif regime == "NEUTRAL":
-        pos_mult, risk_adj, max_pos, thr = 0.75, 0.8, 5, 0.65
+        pos_mult, risk_adj, max_pos, thr = 0.75, 0.8, neut_max, 0.65
     else:
-        pos_mult, risk_adj, max_pos, thr = 0.50, 0.6, 3, 0.65
+        pos_mult, risk_adj, max_pos, thr = 0.50, 0.6, bear_max, 0.65
     effective = pos_mult * (0.5 + conv / 100)
 
     hot, cold = [], []
@@ -349,8 +410,13 @@ def _guidance(regime, conv, hot):
         return (f"🐂 BULL — conviction {conv:.0f}%. Hot: {hot_s}. "
                 "Favour momentum breakouts; hold winners longer.")
     if regime == "BEAR":
+        try:
+            from market_profiles import active_profile
+            bear_max = active_profile().bear_max_positions
+        except Exception:
+            bear_max = 3
         return (f"🐻 BEAR — conviction {conv:.0f}%. Avoid new entries; "
-                "short-term scalps only; max 3 positions.")
+                f"short-term scalps only; max {bear_max} positions.")
     if regime == "NEUTRAL":
         return (f"⚖️ NEUTRAL — conviction {conv:.0f}%. Selective entry, "
                 f"favour pullbacks. Hot: {hot_s}.")
@@ -361,8 +427,16 @@ def _guidance(regime, conv, hot):
 # ML regime classifier (CV + sealed holdout)
 # -------------------------------------------------------------------------
 
+def _classifier_training_tickers() -> list[str]:
+    """Tickers used to train the regime classifier. 5 representative names."""
+    if _active_market_code() == "MY":
+        return ["^KLSE", "1155.KL", "5347.KL", "0166.KL", "5285.KL"]
+    # US: regime + 4 high-quality liquid names
+    return ["SPY", "QQQ", "NVDA", "AAPL", "MSFT"]
+
+
 def train_market_regime_classifier(persist: bool = True):
-    tickers = ["^KLSE", "1155.KL", "5347.KL", "0166.KL", "5285.KL"]
+    tickers = _classifier_training_tickers()
     rows = []
     for t in tickers:
         try:
@@ -437,22 +511,22 @@ def get_market_ml_prediction() -> dict | None:
             _market_clf = train_market_regime_classifier()
     if _market_clf is None:
         return None
-    klci = get_klci_data(period="3mo")
-    if klci.empty or len(klci) < 200:
+    bench = get_regime_benchmark_data(period="3mo")
+    if bench.empty or len(bench) < 200:
         return None
     try:
-        close = klci["Close"]
+        close = bench["Close"]
         e20 = close.ewm(span=20).mean().iloc[-1]
         e50 = close.ewm(span=50).mean().iloc[-1]
         e200 = close.ewm(span=200).mean().iloc[-1]
-        v_avg = klci["Volume"].rolling(20).mean().iloc[-1]
-        v = klci["Volume"].iloc[-1]
+        v_avg = bench["Volume"].rolling(20).mean().iloc[-1]
+        v = bench["Volume"].iloc[-1]
         feats = np.array([[
             float((close.iloc[-1] - e20) / e20 * 100),
             float((close.iloc[-1] - e50) / e50 * 100),
             float((close.iloc[-1] - e200) / e200 * 100),
             float(v / (v_avg + 1e-9)),
-            float((klci["High"].iloc[-1] - klci["Low"].iloc[-1]) /
+            float((bench["High"].iloc[-1] - bench["Low"].iloc[-1]) /
                   close.iloc[-1] * 100),
         ]])
         prob = _market_clf.predict_proba(feats)[0]

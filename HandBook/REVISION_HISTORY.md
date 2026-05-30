@@ -6,7 +6,78 @@ Complete changelog from v1 through the current release.
 
 ---
 
-## v3.5 (current)
+## v3.6 (current)
+
+**Focus:** Multi-market — the Bursa-only agent becomes a dual-market agent (🇲🇾 MY + 🇺🇸 US) on a single repo, with full Moomoo US execution. Branch: `feat/us-market`.
+
+### Why
+Moomoo OpenAPI does **not** support Bursa (MY) for real-time data or order execution. The v4 dream of "real broker execution" is therefore impossible on MY — it stays notification-only on yfinance. The path to actual automation is US/HK, where OpenAPI is fully supported. v3.6 adds US (full execution) while leaving MY behaviour byte-identical and preserving every market's brain separately.
+
+### The data-source contract (most-asked design point)
+ONE mechanism, gated per market by `MarketProfile.moomoo_available`:
+- **Both markets fall back to yfinance** when Moomoo OpenD is absent.
+- **US** (`moomoo_available=True`) uses Moomoo when OpenD is connected; yfinance otherwise.
+- **MY** (`moomoo_available=False`) always uses yfinance today — the Moomoo path is *gated off, not deleted*. The day Moomoo adds Bursa: flip that one flag in `my_profile.py` + connect OpenD → MY auto-goes-live, no other code change. Guarded by `tests/test_data_provider.py::TestMarketGating` (incl. a flag-flip test).
+
+### Changes
+
+**NEW `market_profiles/` package (the multi-market spine):**
+- `base.py` — `MarketProfile` Protocol + shared value types (`TradingSession`, `TickerSpec`, slippage/calendar contracts) + display helpers `format_session_window()` / `format_time_with_user_local()`
+- `my_profile.py` — `MY_PROFILE` (RM, 100-share lot, 09:00–17:00 MYT, 0.15% fee, `^KLSE`, Shariah universe, `moomoo_available=False`)
+- `us_profile.py` — `US_PROFILE` (USD, 1-share, 09:30–16:00 ET, 0% fee, `SPY`, leveraged-ETF + mega-cap universe, `moomoo_available=True`)
+- `__init__.py` — `active_profile()` resolver (env `MARKET_MODE` → `.active_market` marker file → default MY), `set_active_market()`, `available_markets()`
+- Business modules (`screener`, `trading_engine`, `risk_manager`, `market_analyzer`, `market_calendar`, `watchlist`, `data_provider`, `persistence`, `db`) all dispatch on `active_profile()` instead of hardcoded Bursa constants
+
+**Per-market data isolation:**
+- One SQLite file per market: `bursa_agent_MY.db` / `bursa_agent_US.db` (full schema each)
+- Legacy `bursa_agent.db` auto-migrates to `bursa_agent_MY.db` on first boot (trades/brain/history preserved)
+- Per-market Gist backups: `bursa_agent_<CODE>_db.b64.gz` + `setup_classifier_<CODE>.pkl.b64.gz`
+- `db._resolve_db_path()` dispatches on the active market
+
+**US broker execution — NEW `broker_adapter.MoomooUSAdapter` (~440 LOC):**
+- Full `connect` / `unlock_trade` / `place_order` / `accinfo_query` / `position_list_query`, cherry-picked from the `WallTrading-Bot-MooMoo-Futu` reference pattern
+- Modes: NOOP (notify-only, default) / SIMULATE (moomoo paper account) / REAL (live; requires `MOOMOO_TRADING_PWD`)
+- MY always resolves to `NoopAdapter` regardless of mode (OpenAPI gap)
+- Fire-and-forget mirror hooks (`mirror_entry_to_broker` / `mirror_exit_to_broker`), NO-OP in NOOP
+- `broker_mode` is a per-market `scheduler_state` column
+
+**NEW `reconciliation.py` (~400 LOC):**
+- Compares internal positions/cash to the broker each cycle (US execute modes only)
+- Telegram `RECONCILE_DRIFT` alert when equity drift > 0.5% or position qty tolerance (1 share / 1%)
+- Observation-only — never mutates internal state from broker data
+- `scheduler._run_reconciliation_step` runs it at cycle end
+
+**UI (`app.py`):**
+- Sidebar 🌐 market switcher (writes `.active_market`, reloads)
+- Settings → 🎯 Execution Mode panel (NOOP/SIMULATE/REAL + connection test) and 🔄 Reconciliation status
+- Currency-aware throughout (Portfolio/Scanner/Performance/AI Learning/Reconciliation use the active profile's symbol)
+- Trading Window panel is profile-aware: description, TZ labels, defaults, and the safe-entry cutoff adapt to the active market. **Because the user trades from Malaysia, US times render as native ET + the MYT equivalent** (e.g. `09:30–16:00 ET (21:30–04:00 MYT)`)
+- Sidebar broker badge + per-rerun `init_db()` safety net
+
+**Currency/timezone correctness:**
+- Telegram/email alerts (`live_trigger.py`) use the active currency symbol
+- Scheduler "0 entries" log describes the active market's window via `format_session_window()`
+- Corp-action help text uses `{_ccy}`
+
+**Requirements:** added `pandas_market_calendars` (NYSE auto-extending holidays) and `moomoo-api` (optional, local-only for US execution).
+
+### Bug fixes (test-harness hardening)
+- **`db._resolve_db_path()` override detection by full path → stale path wins** ⭐ — a stale auto-computed `DB_PATH` (captured at first import vs the real `$HOME`, or left after `importlib.reload`) was mistaken for a deliberate test override and silently won, pointing the process at the wrong market DB → `no such table: account`. The full pytest suite failed (43 failures) even though every file passed alone. Fixed by detecting overrides **by basename** (`bursa_agent_<CODE>.db` = auto; foreign names like `fake.db`/`test.db` = real override).
+- **Test split-brain from `del sys.modules["db"]`** — `test_multi_market_dispatch._reimport()` created a *second* `db` module object; cross-module references diverged onto different WAL connections. Fixed: reload in place with `importlib.reload()`.
+- **Stale pre-v3.6 tests** updated to v3.6 reality (`test_data_provider` re-pointed to US live path + new `TestMarketGating`; `test_live_trigger` adapter contract; `test_ml_persistence` per-market filename).
+
+### Tests
+- **471 passing in ~46 s** (up from 240 mid-build), 35 test files. The full suite is green in a single `pytest tests/` run (deterministic across repeated runs), not just per-file.
+
+### Deferred
+- HK market profile (architecture supports it — one new `hk_profile.py`)
+- Live capital tracking table (reconciliation foundation landed here)
+- Stooq as a 2nd free data fallback
+- MY execution — blocked until Moomoo OpenAPI adds Bursa coverage
+
+---
+
+## v3.5
 
 **Focus:** Corporate-action handling — splits, bonus issues, and cash dividends no longer silently corrupt open trades.
 
@@ -79,7 +150,7 @@ Before v3.5 the agent had a silent failure mode: a stock doing a 1-for-5 split m
 
 ---
 
-## v3.4 (current)
+## v3.4
 
 **Focus:** Pluggable data-source abstraction with Moomoo OpenD ↔ yfinance auto-fallback.
 
@@ -117,7 +188,7 @@ The agent was hard-wired to yfinance — a single point of failure (handbook gap
 
 ---
 
-## v3.3 (current)
+## v3.3
 
 **Focus:** Code cleanup, system audit, unused import sweep.
 
