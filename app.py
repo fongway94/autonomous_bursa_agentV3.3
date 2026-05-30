@@ -1648,27 +1648,53 @@ with tab_settings:
     daily_cap = c1.number_input("Daily trade limit",
                                  value=int(rp["max_trades_per_day"]), step=1)
 
-    # ---- Trading window controls (v3.1.2) ----
-    st.markdown("##### 🕘 Trading Window")
-    st.caption(
-        "Bursa Malaysia native sessions: 09:00–12:30 (morning) and "
-        "14:30–17:00 (afternoon). Lunch break + weekends + public "
-        "holidays are auto-detected. The user-configured window below "
-        "can only TIGHTEN this — it cannot extend past Bursa hours."
+    # ---- Trading window controls (v3.1.2; v3.6 multi-market) ----
+    # The description, timezone labels, and example times all adapt to the
+    # active market. Because the user runs from Malaysia, non-MY markets ALSO
+    # show the equivalent MYT wall-clock so they know when to be watching.
+    from market_profiles import active_profile
+    from market_profiles.base import (
+        format_session_window, format_time_with_user_local, _tz_abbrev,
+        USER_LOCAL_TZ,
     )
+    _prof = active_profile()
+    _mkt_tz_abbr = _tz_abbrev(_prof.timezone)
+    _is_foreign_tz = str(_prof.timezone) != str(USER_LOCAL_TZ)
+    _sessions_str = format_session_window(_prof, with_user_local=True)
+    _cutoff_str = format_time_with_user_local(_prof.safe_entry_cutoff, _prof)
+
+    st.markdown("##### 🕘 Trading Window")
+    _caption = (
+        f"{_prof.flag_emoji} **{_prof.display_name}** native sessions: "
+        f"{_sessions_str}. Lunch break (if any) + weekends + public "
+        f"holidays are auto-detected. The user-configured window below "
+        f"can only TIGHTEN this — it cannot extend past market hours."
+    )
+    if _is_foreign_tz:
+        _caption += (
+            f"\n\n🌏 You're in Malaysia, so times are shown in "
+            f"**{_mkt_tz_abbr}** with the **MYT** equivalent in brackets. "
+            f"Enter the values below in **{_mkt_tz_abbr}** (the exchange's "
+            f"local time)."
+        )
+    st.caption(_caption)
+
     tw1, tw2 = st.columns(2)
+    # Default times come from the active profile's sessions/cutoff.
+    _default_before = _prof.sessions[0].start.strftime("%H:%M")
+    _default_after = _prof.sessions[-1].end.strftime("%H:%M")
     no_before = tw1.text_input(
-        "No entries before (HH:MM MYT)",
-        value=str(rp.get("no_entry_before_time", "09:00")),
-        help="Default 09:00. Set to a later time if you want to wait "
-             "for the opening volatility to settle (e.g. 09:30).",
+        f"No entries before (HH:MM {_mkt_tz_abbr})",
+        value=str(rp.get("no_entry_before_time", _default_before)),
+        help=f"Default {_default_before}. Set to a later time if you want "
+             f"to wait for the opening volatility to settle.",
     )
     no_after = tw2.text_input(
-        "No entries after (HH:MM MYT)",
-        value=str(rp.get("no_entry_after_time", "17:00")),
-        help="Default 17:00. Note: the agent already enforces a "
-             "separate hard 16:00 cutoff for auto-entries so trades "
-             "have time to develop before close.",
+        f"No entries after (HH:MM {_mkt_tz_abbr})",
+        value=str(rp.get("no_entry_after_time", _default_after)),
+        help=f"Default {_default_after}. Note: the agent already enforces a "
+             f"separate hard safe-entry cutoff at {_cutoff_str} for "
+             f"auto-entries so trades have time to develop before close.",
     )
     # Show current market status for sanity
     from market_calendar import market_status_text
@@ -2080,7 +2106,7 @@ with tab_settings:
                 "When ON (default), the scheduler automatically adjusts "
                 "shares × ratio, prices ÷ ratio for any split/bonus event "
                 "detected on a ticker you hold. Cash-conservation invariant "
-                "is preserved within RM 1.00. "
+                f"is preserved within {_ccy} 1.00. "
                 "When OFF (shadow mode), the agent only alerts you — you "
                 "must manually adjust trades."
             ),
