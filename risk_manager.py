@@ -2,8 +2,18 @@
 """
 Risk Manager — Central risk control hub.
 
-Fixed bugs from v1
-------------------
+v3.6 multi-market change
+------------------------
+* `min_risk_per_trade_rm` is reseeded from the ACTIVE market profile on
+  first init so US deployments get USD 20 (not RM 50) by default.
+* All user-facing reason strings still say "RM" for MY, "$" for US,
+  resolved from `active_profile().currency_symbol`.
+* Behaviour & math unchanged — same checks, same verdict shape. Cash
+  conservation, drawdown breaker, position limits all proceed exactly
+  as in v3.3/v3.5.
+
+Fixed bugs from v1 (still guarded)
+----------------------------------
 * `size_multiplier` is now ACTUALLY enforced by callers (engines respect it).
 * `check_risk_amount.adjusted_shares` removed (was nonsense formula).
 * `position_limit_check` returns `allowed=False` when *no* size reduction
@@ -18,9 +28,39 @@ import json
 from db import connect, myt_iso, get_myt_now
 
 
+def _ccy() -> str:
+    """Active market currency symbol for user-facing strings."""
+    try:
+        from market_profiles import active_profile
+        return active_profile().currency_symbol
+    except Exception:
+        return "RM"
+
+
+def _profile_min_risk() -> float:
+    """Per-market minimum risk floor; falls back to RM 50 (legacy MY default)."""
+    try:
+        from market_profiles import active_profile
+        return float(active_profile().min_risk_per_trade)
+    except Exception:
+        return 50.0
+
+
+def _profile_max_positions() -> int:
+    """BULL-regime concurrent-position ceiling from the active profile."""
+    try:
+        from market_profiles import active_profile
+        return int(active_profile().bull_max_positions)
+    except Exception:
+        return 8
+
+
 DEFAULT_RISK_PARAMS = {
     "max_drawdown_pct": 8.0,
     "max_drawdown_strict_pct": 15.0,
+    # NB: `min_risk_per_trade_rm` retains its legacy key name to avoid breaking
+    # existing JSON payloads in the DB. The value is currency-agnostic
+    # (RM for MY, USD for US — resolved at seed time below).
     "min_risk_per_trade_rm": 50.0,
     "max_risk_per_trade_pct": 1.0,  # v3: safer default for auto-trade
     "max_position_cost_pct": 20.0,
@@ -29,14 +69,32 @@ DEFAULT_RISK_PARAMS = {
     "max_correlation_threshold": 0.7,
     "max_trades_per_day": 5,
     "min_trades_per_week": 0,
-    "no_entry_before_time": "09:00",  # Bursa morning open
-    "no_entry_after_time": "17:00",   # Bursa TaL close
+    "no_entry_before_time": "09:00",  # MY morning open — US overrides on seed
+    "no_entry_after_time": "17:00",   # MY TaL close   — US overrides on seed
     "max_stop_loss_pct": 10.0,
     "min_stop_loss_pct": 1.5,
     "trailing_stop_activation": "TP1",
     "trailing_stop_buffer_pct": 0.5,
     "enforce_lot_size": True,
 }
+
+
+def _profile_seed_overrides() -> dict:
+    """Per-market overrides applied on first init only."""
+    try:
+        from market_profiles import active_profile, active_market_code
+        prof = active_profile()
+        out = {
+            "min_risk_per_trade_rm": prof.min_risk_per_trade,
+            "max_concurrent_positions": prof.bull_max_positions,
+        }
+        if active_market_code() == "US":
+            # US RTH: 09:30–16:00 ET. Times stored as HH:MM in market-local TZ.
+            out["no_entry_before_time"] = "09:30"
+            out["no_entry_after_time"] = "16:00"
+        return out
+    except Exception:
+        return {}
 
 
 def _ensure_risk_row():
@@ -48,9 +106,12 @@ def _ensure_risk_row():
             c.execute("CREATE TABLE IF NOT EXISTS risk_params "
                       "(id INTEGER PRIMARY KEY CHECK (id=1), payload TEXT, "
                       "updated_at TEXT)")
-            c.execute("INSERT OR IGNORE INTO risk_params (id, payload, updated_at) "
-                      "VALUES (1, ?, ?)",
-                      (json.dumps(DEFAULT_RISK_PARAMS), myt_iso()))
+        # Seed (idempotent — only inserts if id=1 missing)
+        seed = DEFAULT_RISK_PARAMS.copy()
+        seed.update(_profile_seed_overrides())
+        c.execute("INSERT OR IGNORE INTO risk_params (id, payload, updated_at) "
+                  "VALUES (1, ?, ?)",
+                  (json.dumps(seed), myt_iso()))
 
 
 def load_risk_params() -> dict:
@@ -58,6 +119,7 @@ def load_risk_params() -> dict:
     with connect(readonly=True) as c:
         row = c.execute("SELECT payload FROM risk_params WHERE id=1").fetchone()
     params = DEFAULT_RISK_PARAMS.copy()
+    params.update(_profile_seed_overrides())
     if row:
         try:
             params.update(json.loads(row["payload"]))
@@ -69,6 +131,7 @@ def load_risk_params() -> dict:
 def save_risk_params(params: dict) -> None:
     _ensure_risk_row()
     merged = DEFAULT_RISK_PARAMS.copy()
+    merged.update(_profile_seed_overrides())
     merged.update(params or {})
     with connect() as c:
         c.execute("UPDATE risk_params SET payload=?, updated_at=? WHERE id=1",
@@ -104,6 +167,7 @@ def check_drawdown_circuit_breaker(initial_capital: float,
 def check_position_limits(trades: list, new_trade_cost: float,
                           sector: str, capital: float) -> dict:
     p = load_risk_params()
+    ccy = _ccy()
     max_pos = p["max_concurrent_positions"]
     max_cost_pct = p["max_position_cost_pct"]
     max_sec_pct = p["max_sector_exposure_pct"]
@@ -119,7 +183,7 @@ def check_position_limits(trades: list, new_trade_cost: float,
         reduce_pct = min((new_trade_cost - max_cost) / new_trade_cost * 100, 80)
         if reduce_pct >= 80:
             return {"allowed": False,
-                    "reason": f"Position cost RM {new_trade_cost:,.0f} "
+                    "reason": f"Position cost {ccy} {new_trade_cost:,.0f} "
                               f"hugely over {max_cost_pct}% cap.",
                     "size_reduction_pct": 100}
         return {"allowed": True,
@@ -148,14 +212,15 @@ def check_position_limits(trades: list, new_trade_cost: float,
 
 def check_risk_amount(trade_risk_amount: float, capital: float) -> dict:
     p = load_risk_params()
+    ccy = _ccy()
     min_r = p["min_risk_per_trade_rm"]
     max_r = capital * (p["max_risk_per_trade_pct"] / 100)
     if trade_risk_amount < min_r:
         return {"allowed": False,
-                "reason": f"Risk RM {trade_risk_amount:.2f} below min RM {min_r:.2f}."}
+                "reason": f"Risk {ccy} {trade_risk_amount:.2f} below min {ccy} {min_r:.2f}."}
     if trade_risk_amount > max_r:
         return {"allowed": True,
-                "reason": f"Risk capped at RM {max_r:.2f} "
+                "reason": f"Risk capped at {ccy} {max_r:.2f} "
                           f"({p['max_risk_per_trade_pct']}% of capital)."}
     return {"allowed": True, "reason": "Risk amount OK."}
 
@@ -176,26 +241,26 @@ def check_daily_trade_limit(trades: list) -> dict:
 
 def check_trading_time_window() -> dict:
     """
-    Delegate to market_calendar for accurate Bursa session handling.
+    Delegate to market_calendar for accurate session handling.
 
-    Returns the same {allowed, reason, window} dict shape as before
-    (for backwards compatibility with existing callers in scheduler.py
-    and app.py), but now honours:
-      * Real Bursa sessions (09:00-12:30, 14:30-17:00)
-      * Lunch break (12:30-14:00) blocks scans
-      * Public holidays (Hari Raya, Wesak, Deepavali, etc.)
-      * Safe-entry cutoff at 16:00 for new auto-entries
-
-    User-tunable `no_entry_before_time` / `no_entry_after_time` in
-    risk_params are honoured as ADDITIONAL constraints — they can
-    only tighten the window, not extend it past Bursa hours.
+    market_calendar dispatches on the active market profile, so this works
+    for both MY (with lunch break + Bursa holidays) and US (RTH only).
     """
     from market_calendar import (
         is_market_open, is_safe_entry_window, market_status_text,
         current_session,
     )
     p = load_risk_params()
-    now = get_myt_now()
+    # Use the calendar's local-time helpers so we evaluate against the
+    # active market's timezone (MYT for MY, ET for US, etc.)
+    from datetime import datetime
+    try:
+        from market_profiles import active_profile
+        tz = active_profile().timezone
+    except Exception:
+        from datetime import timezone, timedelta
+        tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz)
     t = now.strftime("%H:%M")
 
     status = market_status_text(now)
@@ -210,20 +275,25 @@ def check_trading_time_window() -> dict:
     user_max = p.get("no_entry_after_time", "17:00")
     if t < user_min:
         return {"allowed": False,
-                "reason": f"User-configured pre-market: opens {user_min} MYT.",
+                "reason": f"User-configured pre-market: opens {user_min} local.",
                 "window": f"Before {user_min}"}
     if t > user_max:
         return {"allowed": False,
-                "reason": f"User-configured cutoff: after {user_max} MYT.",
+                "reason": f"User-configured cutoff: after {user_max} local.",
                 "window": f"After {user_max}"}
 
     # Optionally also block new entries in the no-safe-entry tail
     if not is_safe_entry_window(now):
         sess = current_session(now)
         sess_name = sess.name if sess else "?"
+        try:
+            from market_profiles import active_profile
+            cutoff = active_profile().safe_entry_cutoff.strftime("%H:%M")
+        except Exception:
+            cutoff = "16:00"
         return {"allowed": False,
                 "reason": (f"In {sess_name} — too late for new entries "
-                           "(safe-entry window ended 16:00)."),
+                           f"(safe-entry window ended {cutoff})."),
                 "window": sess_name}
 
     sess = current_session(now)
