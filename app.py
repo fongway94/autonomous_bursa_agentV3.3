@@ -340,6 +340,14 @@ with st.sidebar:
             swing_cycle_sec=int(getattr(_current_profile, "cycle_interval_sec", 3600)),
             intraday_cycle_sec=int(getattr(_current_profile, "intraday_cycle_sec", 300)),
         )
+        # v3.7 fix: ensure the NEW mode's DB is initialised BEFORE any write.
+        # Switching to INTRADAY points at a brand-new file; without init_db()
+        # the scheduler_state table doesn't exist yet → OperationalError.
+        try:
+            from db import init_db as _init_mode_db
+            _init_mode_db()
+        except Exception:
+            pass
         update_scheduler_state(interval_sec=_new_interval_sec)
         try:
             sched.force_restart(_new_interval_sec)
