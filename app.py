@@ -2388,7 +2388,17 @@ with tab_settings:
                 )
             if st.button(f"💾 Switch broker mode to {_new_mode}", type="primary"):
                 _br_set_mode(_new_mode)
-                _br_reset_cache()
+                # set_broker_mode() already calls reset_adapter_cache() internally.
+                # Do NOT call it again — double-reset leaves _CACHED_ADAPTER=None
+                # so the sidebar badge immediately shows "disconnected".
+                # Instead, eagerly connect the new adapter so the badge shows
+                # the real state right after the rerun.
+                try:
+                    from broker_adapter import get_broker_adapter as _ga
+                    _new_adapter = _ga()
+                    _new_adapter.connect()
+                except Exception:
+                    pass
                 st.success(
                     f"Broker mode set to **{_new_mode}**. "
                     "The next scheduler cycle will use the new mode."
