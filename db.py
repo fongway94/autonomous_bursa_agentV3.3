@@ -165,29 +165,42 @@ def _lock_for_path(path: str) -> threading.RLock:
         return lock
 
 
-# v3.7: migrate any v3.6-era per-market DB (without trading mode suffix)
-    # to the SWING variant. E.g. bursa_agent_MY.db → bursa_agent_MY_SWING.db
+def _migrate_v36_db_if_needed() -> None:
+    """One-shot rename of v3.6-era per-market DBs to the v3.7 (market, mode) scheme.
+
+    v3.6 produced one file per market:
+        bursa_agent_MY.db  →  bursa_agent_MY_SWING.db
+        bursa_agent_US.db  →  bursa_agent_US_SWING.db
+
+    We iterate ALL known markets so that both MY and US are migrated on the
+    first boot, regardless of which market is currently active.  This is safe
+    to call multiple times (checks existence before renaming).
+    """
     try:
-        from market_profiles import active_market_code, active_trading_mode
-        code = active_market_code()
-        mode = active_trading_mode()
-        legacy_per_market = os.path.join(DATA_DIR, f"bursa_agent_{code}.db")
-        target = os.path.join(DATA_DIR, f"bursa_agent_{code}_{mode}.db")
-        if os.path.exists(legacy_per_market) and not os.path.exists(target):
+        from market_profiles import available_markets
+        markets = available_markets()
+    except Exception:
+        markets = ["MY", "US"]
+
+    for code in markets:
+        legacy = os.path.join(DATA_DIR, f"bursa_agent_{code}.db")
+        target = os.path.join(DATA_DIR, f"bursa_agent_{code}_SWING.db")
+        if os.path.exists(legacy) and not os.path.exists(target):
             try:
-                os.rename(legacy_per_market, target)
+                os.rename(legacy, target)
                 for suffix in ("-wal", "-shm"):
-                    src = legacy_per_market + suffix
+                    src = legacy + suffix
                     dst = target + suffix
                     if os.path.exists(src) and not os.path.exists(dst):
                         try:
                             os.rename(src, dst)
                         except Exception:
                             pass
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                print(f"[db] v3.6→v3.7 migration skipped for {code}: {e}")
+
+
+_migrate_v36_db_if_needed()
 
 # Backward-compat: expose a `_WRITE_LOCK` that resolves to the active DB's
 # lock. Some test fixtures import it directly.
