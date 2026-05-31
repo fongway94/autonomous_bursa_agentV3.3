@@ -73,8 +73,6 @@ from intraday_backtest_v2 import (
 PASS = "[PASS]"
 FAIL = "[FAIL]"
 WARN = "[WARN]"
-EDGE = "[EDGE]"
-NO_EDGE = "[NO EDGE]"
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +80,9 @@ NO_EDGE = "[NO EDGE]"
 # ---------------------------------------------------------------------------
 
 BULL20 = [
-    # bull leveraged ETFs
     "TQQQ", "SPXL", "SOXL", "UPRO", "FNGU", "TNA",
-    # crypto-linked
     "IBIT", "MSTR", "COIN", "MARA",
-    # high-vol megacaps
     "NVDA", "TSLA", "AMD", "META", "AAPL", "MSFT", "GOOGL", "AMZN", "PLTR",
-    # vol hedge (works both directions, kept in)
     "UVXY",
 ]
 
@@ -135,11 +129,6 @@ def summarise(trades: list[Trade], label: str) -> str:
 def fetch_universe_intraday(tickers: list[str],
                             days: int,
                             verbose: bool = True) -> dict[str, pd.DataFrame]:
-    """Pull 5m history for each ticker, going back `days` calendar days.
-
-    Uses data_provider, which auto-routes to Moomoo OpenD if connected.
-    Returns dict[ticker -> DataFrame]. Skips tickers with no data.
-    """
     end = datetime.utcnow().date()
     start = end - timedelta(days=days)
     out: dict[str, pd.DataFrame] = {}
@@ -175,7 +164,6 @@ def fetch_universe_intraday(tickers: list[str],
 
 def fetch_universe_daily(tickers: list[str],
                          verbose: bool = True) -> dict[str, pd.DataFrame]:
-    """Pull daily history (1y) for each ticker -- used by the EMA-50 trend filter."""
     out: dict[str, pd.DataFrame] = {}
     for tk in tickers:
         try:
@@ -198,13 +186,11 @@ def run_validation(tickers: list[str],
                    days: int,
                    cfg: ORBConfig,
                    verbose: bool = True) -> dict:
-    """Pull data, run ORB, return rich dict for printing + JSON dump."""
     print("=" * 90)
     print(f"VALIDATION RUN -- {len(tickers)} tickers x {days} days x OR={cfg.opening_range_minutes}min R={cfg.target_r_multiple}")
     print("=" * 90)
     print()
 
-    # Surface which provider we're actually using.
     data_provider.ensure_probed()
     h = data_provider.health()
     moomoo_status = "Moomoo OpenD [CONNECTED]" if h["moomoo_available"] else "yfinance fallback (no OpenD)"
@@ -214,7 +200,6 @@ def run_validation(tickers: list[str],
         print(f"  (note: {h['init_error']})")
     print()
 
-    # Pull intraday + daily history.
     print("Fetching intraday 5m history...")
     intraday = fetch_universe_intraday(tickers, days, verbose=verbose)
     if not intraday:
@@ -225,7 +210,6 @@ def run_validation(tickers: list[str],
     daily = fetch_universe_daily(list(intraday.keys()), verbose=verbose)
     print()
 
-    # Run ORB per ticker, accumulate trades.
     all_trades: list[Trade] = []
     for tk, df_5m in intraday.items():
         df_d = daily.get(tk, pd.DataFrame())
@@ -253,7 +237,6 @@ def run_validation(tickers: list[str],
 
     all_trades.sort(key=lambda t: t.entry_time)
 
-    # ---- Aggregates ----
     summary = BacktestSummary(config=cfg, tickers=list(intraday.keys()))
     summary.trades = all_trades
 
@@ -263,7 +246,6 @@ def run_validation(tickers: list[str],
     print(summarise(all_trades, "FULL PERIOD"))
     print()
 
-    # ---- Walk-forward: split into 6 equal windows ----
     print("=" * 90)
     print("WALK-FORWARD -- 6 equal windows (to test regime stability)")
     print("=" * 90)
@@ -292,7 +274,6 @@ def run_validation(tickers: list[str],
         })
     print()
 
-    # ---- Monthly breakdown ----
     print("=" * 90)
     print("PER-MONTH BREAKDOWN")
     print("=" * 90)
@@ -315,7 +296,6 @@ def run_validation(tickers: list[str],
     print(f"\n  Monthly hit rate: {pos_months}/{len(months_data)} = {pos_months/len(months_data)*100:.0f}% net-positive")
     print()
 
-    # ---- Per-ticker breakdown ----
     print("=" * 90)
     print("PER-TICKER BREAKDOWN (sorted by total R)")
     print("=" * 90)
@@ -326,7 +306,6 @@ def run_validation(tickers: list[str],
               f"{row['avg_r']:>+8.3f} {row['total_r']:>+9.2f}")
     print()
 
-    # ---- R distribution ----
     print("=" * 90)
     print("R DISTRIBUTION")
     print("=" * 90)
@@ -361,7 +340,6 @@ def run_validation(tickers: list[str],
           f"= {top10_r/total_r*100:.0f}% from {top10n}/{n} trades")
     print()
 
-    # ---- Final verdict ----
     print("=" * 90)
     print("FINAL VERDICT")
     print("=" * 90)
@@ -392,13 +370,13 @@ def run_validation(tickers: list[str],
     print()
 
     if pass_count == 4:
-        recommend = f"{PASS} {EDGE} BUILD ENGINE -- edge holds across regimes. Proceed to Block 2."
+        recommend = f"{PASS} BUILD ENGINE -- edge holds across regimes. Proceed to Block 2."
     elif pass_count == 3:
         recommend = f"{WARN} MOSTLY VALID -- edge real but one weakness. Consider building Blocks 2-3 only, validate live before 4-7."
     elif pass_count == 2:
         recommend = f"{WARN} MIXED -- needs more tuning or only build plumbing (Block 2). Don't ship full engine."
     else:
-        recommend = f"{FAIL} {NO_EDGE} EDGE DOES NOT GENERALIZE -- DO NOT build engine. Shelve or pick different strategy."
+        recommend = f"{FAIL} EDGE DOES NOT GENERALIZE -- DO NOT build engine. Shelve or pick different strategy."
     print(f"  RECOMMENDATION: {recommend}")
     print()
 
