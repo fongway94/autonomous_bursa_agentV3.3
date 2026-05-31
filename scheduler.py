@@ -772,29 +772,23 @@ def _loop(interval_sec: int, my_pid: int):
         except Exception:
             pass
 
-        # Check market hours
-        if not _is_market_hours():
-            from risk_manager import check_trading_time_window
-            tw = check_trading_time_window()
-            log_scheduler_event(
-                "SKIP",
-                f"Outside market hours — {tw.get('reason','closed')}. "
-                f"Sleeping until {next_at}",
-            )
-        else:
+        # ---- v3.7: dispatch on trading mode ----
+        if _is_intraday_mode():
+            # INTRADAY PATH (5-min cadence, US RTH only)
             try:
-                autotrade = bool(state.get("autotrade_enabled", 1))
-                autoexit = bool(state.get("autoexit_enabled", 1))
                 t0 = time.time()
                 update_scheduler_state(cycle_started_at=myt_iso())
                 try:
-                    summary = _run_one_cycle(autotrade=autotrade,
-                                              autoexit=autoexit,
-                                              my_pid=my_pid)
+                    summary = _run_intraday_cycle(
+                        autotrade=bool(state.get("autotrade_enabled", 1)),
+                        autoexit=bool(state.get("autoexit_enabled", 1)),
+                        my_pid=my_pid,
+                    )
                     duration = time.time() - t0
                     update_scheduler_state(
                         last_run_at=myt_iso(),
-                        next_run_at=myt_iso(_next_run_at(interval_sec)),
+                        next_run_at=myt_iso(
+                            _next_run_at(INTRADAY_CYCLE_SEC)),
                         consecutive_failures=0,
                         last_error="",
                         cycle_started_at=None,
@@ -802,15 +796,15 @@ def _loop(interval_sec: int, my_pid: int):
                     if duration > CYCLE_DURATION_WARN_SEC:
                         log_scheduler_event(
                             "CYCLE_SLOW",
-                            f"Cycle completed in {duration:.0f}s "
-                            f"(> {CYCLE_DURATION_WARN_SEC}s warn threshold).",
-                            "WARN",
-                            duration_sec=duration,
+                            f"Intraday cycle {duration:.0f}s",
+                            "WARN", duration_sec=duration,
                         )
                     log_scheduler_event(
                         "CYCLE_OK",
-                        f"scan={summary['scan_count']} settled={summary['settled']} "
-                        f"partials={summary['partials']} entries={summary['auto_entries']}",
+                        f"intraday: scan={summary.get('scan_count', 0)} "
+                        f"settled={summary.get('settled', 0)} "
+                        f"entries={summary.get('auto_entries', 0)} "
+                        f"forced_flats={summary.get('forced_flats', 0)}",
                         duration_sec=duration, payload=summary,
                     )
                 finally:
@@ -821,11 +815,74 @@ def _loop(interval_sec: int, my_pid: int):
             except Exception as e:
                 tb = traceback.format_exc()
                 fails = (state.get("consecutive_failures") or 0) + 1
-                update_scheduler_state(consecutive_failures=fails,
-                                       last_error=f"{e}\n{tb}",
-                                       cycle_started_at=None)
-                log_scheduler_event("CYCLE_ERROR", str(e), "ERROR",
-                                    payload={"trace": tb})
+                update_scheduler_state(
+                    consecutive_failures=fails,
+                    last_error=f"{e}\n{tb}",
+                    cycle_started_at=None,
+                )
+                log_scheduler_event(
+                    "CYCLE_ERROR", str(e), "ERROR",
+                    payload={"trace": tb})
+
+            summary["_intraday_did_sleep"] = True
+            _STOP_EVENT.wait(timeout=INTRADAY_CYCLE_SEC)
+
+        else:
+            # SWING PATH (hourly, byte-identical to v3.6)
+            # Check market hours
+            if not _is_market_hours():
+                from risk_manager import check_trading_time_window
+                tw = check_trading_time_window()
+                log_scheduler_event(
+                    "SKIP",
+                    f"Outside market hours — {tw.get('reason','closed')}. "
+                    f"Sleeping until {next_at}",
+                )
+            else:
+                try:
+                    autotrade = bool(state.get("autotrade_enabled", 1))
+                    autoexit = bool(state.get("autoexit_enabled", 1))
+                    t0 = time.time()
+                    update_scheduler_state(cycle_started_at=myt_iso())
+                    try:
+                        summary = _run_one_cycle(autotrade=autotrade,
+                                                  autoexit=autoexit,
+                                                  my_pid=my_pid)
+                        duration = time.time() - t0
+                        update_scheduler_state(
+                            last_run_at=myt_iso(),
+                            next_run_at=myt_iso(_next_run_at(interval_sec)),
+                            consecutive_failures=0,
+                            last_error="",
+                            cycle_started_at=None,
+                        )
+                        if duration > CYCLE_DURATION_WARN_SEC:
+                            log_scheduler_event(
+                                "CYCLE_SLOW",
+                                f"Cycle completed in {duration:.0f}s "
+                                f"(> {CYCLE_DURATION_WARN_SEC}s warn threshold).",
+                                "WARN",
+                                duration_sec=duration,
+                            )
+                        log_scheduler_event(
+                            "CYCLE_OK",
+                            f"scan={summary['scan_count']} settled={summary['settled']} "
+                            f"partials={summary['partials']} entries={summary['auto_entries']}",
+                            duration_sec=duration, payload=summary,
+                        )
+                    finally:
+                        try:
+                            update_scheduler_state(cycle_started_at=None)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    fails = (state.get("consecutive_failures") or 0) + 1
+                    update_scheduler_state(consecutive_failures=fails,
+                                           last_error=f"{e}\n{tb}",
+                                           cycle_started_at=None)
+                    log_scheduler_event("CYCLE_ERROR", str(e), "ERROR",
+                                        payload={"trace": tb})
 
         # ---- Daily maintenance window (idempotent) ----
         try:
@@ -883,9 +940,16 @@ def _loop(interval_sec: int, my_pid: int):
                 "MAINTENANCE_ERROR", f"{e}", "ERROR")
 
         # Sleep until next scheduled time
-        nxt = _next_run_at(interval_sec)
-        sleep_secs = max(60, (nxt - get_myt_now()).total_seconds())
-        _STOP_EVENT.wait(timeout=sleep_secs)
+        # v3.7: intraday already slept inside its own dispatch branch above.
+        # Skip the generic sleep here if intraday ran this iteration.
+        try:
+            _skip_sleep = summary.get("_intraday_did_sleep", False)
+        except Exception:
+            _skip_sleep = False
+        if not _skip_sleep:
+            nxt = _next_run_at(interval_sec)
+            sleep_secs = max(60, (nxt - get_myt_now()).total_seconds())
+            _STOP_EVENT.wait(timeout=sleep_secs)
 
     update_scheduler_state(running=0,
                            last_heartbeat=myt_iso(),
@@ -1086,8 +1150,17 @@ def ensure_started(interval_sec: int = 3600,
 
 
 def run_once() -> dict:
-    """Trigger a single immediate cycle (used by 'Run now' button)."""
+    """Trigger a single immediate cycle (used by 'Run now' button).
+
+    v3.7: dispatches on active trading mode — intraday runs
+    _run_intraday_cycle(), swing runs _run_one_cycle().
+    """
     state = get_scheduler_state()
+    if _is_intraday_mode():
+        return _run_intraday_cycle(
+            autotrade=bool(state.get("autotrade_enabled", 1)),
+            autoexit=bool(state.get("autoexit_enabled", 1)),
+        )
     return _run_one_cycle(
         autotrade=bool(state.get("autotrade_enabled", 1)),
         autoexit=bool(state.get("autoexit_enabled", 1)),
@@ -1188,3 +1261,307 @@ if __name__ == "__main__":
             time.sleep(60)
     except KeyboardInterrupt:
         stop()
+
+
+# -------------------------------------------------------------------------
+# v3.7 — Intraday cycle helpers (Block 5)
+# -------------------------------------------------------------------------
+
+INTRADAY_CYCLE_SEC = 300  # 5-minute scan interval during US RTH
+
+
+def _build_intraday_bar_data() -> dict:
+    """Build {ticker: {price, high, low}} from the latest available 5m bar
+    for each active intraday trade.
+
+    Used by auto_settle_intraday() and force_flat_all_intraday().
+    Falls back to last known price from the DB if a live fetch fails.
+    """
+    bar_data: dict = {}
+    try:
+        from intraday_engine import get_active_intraday_tickers
+        tickers = get_active_intraday_tickers()
+    except Exception:
+        tickers = set()
+    if not tickers:
+        return bar_data
+
+    try:
+        from data_provider import get_history
+        for tk in tickers:
+            try:
+                df = get_history(tk, interval="5m", period="5d", timeout=30)
+                if df is None or df.empty:
+                    continue
+                last = df.iloc[-1]
+                bar_data[tk] = {
+                    "price": float(last["Close"]),
+                    "high": float(last["High"]),
+                    "low": float(last["Low"]),
+                }
+            except Exception:
+                # Fallback: use the trade's own highest/lowest tracking
+                try:
+                    from repository import active_trades
+                    for t in active_trades():
+                        if t["ticker"] == tk and t.get(
+                                "execution_type") == "AGENT_INTRADAY":
+                            px = float(t.get("highest_price",
+                                             t.get("entry_price", 0)))
+                            bar_data[tk] = {
+                                "price": px,
+                                "high": px,
+                                "low": float(t.get("lowest_price", px)),
+                            }
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return bar_data
+
+
+def _run_intraday_cycle(autotrade: bool, autoexit: bool,
+                        my_pid: int | None = None) -> dict:
+    """One 5-minute intraday scan + settle + entry cycle.
+
+    Runs only during US RTH. Uses the intraday screener and intraday
+    engine — completely separate from the swing path.
+
+    Session states:
+        PREMARKET      → do nothing
+        OR_WINDOW      → scan, build opening range, no entries yet
+        ACTIVE_TRADING → scan + settle + enter
+        FORCE_FLAT     → close everything
+        POSTMARKET     → do nothing
+    """
+    summary = {
+        "scan_count": 0, "settled": 0, "partials": 0,
+        "auto_entries": 0, "rejected": 0, "forced_flats": 0,
+        "errors": [], "aborted": False,
+    }
+
+    # ---- Ownership check ----
+    if my_pid is not None:
+        state = get_scheduler_state()
+        current_owner = state.get("owner_pid", 0) or 0
+        if current_owner and current_owner != my_pid:
+            log_scheduler_event(
+                "CYCLE_ABORT",
+                f"PID {my_pid} aborting intraday cycle — owner now {current_owner}",
+                "WARN",
+            )
+            summary["aborted"] = True
+            return summary
+
+    # ---- Session status ----
+    try:
+        from intraday_engine import intraday_session_status
+        status = intraday_session_status()
+    except Exception as e:
+        log_scheduler_event(
+            "ERROR", f"intraday_session_status failed: {e}", "ERROR")
+        summary["errors"].append(f"session_status: {e}")
+        return summary
+
+    state_name = status["state"]
+
+    # ---- FORCE_FLAT / POSTMARKET: close everything ----
+    if status["should_force_flat"]:
+        try:
+            from intraday_engine import force_flat_all_intraday
+            bar_data = _build_intraday_bar_data()
+            closed = force_flat_all_intraday(bar_data, actor="AGENT")
+            summary["forced_flats"] = closed
+            summary["settled"] = closed
+            if closed > 0:
+                log_scheduler_event(
+                    "INTRADAY_FORCE_FLAT",
+                    f"Force-flatted {closed} intraday position(s) "
+                    f"({state_name}).",
+                    payload={"state": state_name, "closed": closed},
+                )
+                try:
+                    from persistence import backup as _pers_backup, is_configured
+                    if is_configured():
+                        _pers_backup(reason=f"intraday force-flat: {closed} trades")
+                except Exception:
+                    pass
+        except Exception as e:
+            log_scheduler_event(
+                "ERROR", f"force_flat_all_intraday failed: {e}", "ERROR")
+            summary["errors"].append(f"force_flat: {e}")
+        return summary
+
+    # ---- PREMARKET / POSTMARKET: nothing to do ----
+    if not status["can_scan"]:
+        log_scheduler_event(
+            "SKIP",
+            f"Intraday {state_name} — sleeping {INTRADAY_CYCLE_SEC}s.",
+        )
+        return summary
+
+    # ---- Local-only enforcement: intraday requires Moomoo OpenD ----
+    try:
+        import data_provider
+        data_provider.ensure_probed()
+        h = data_provider.health()
+        moomoo_ok = bool(h.get("moomoo_available"))
+    except Exception:
+        moomoo_ok = False
+
+    if not moomoo_ok:
+        log_scheduler_event(
+            "INTRADAY_UNAVAILABLE",
+            "OpenD not connected — intraday trading disabled. "
+            "Set TRADING_MODE=SWING or connect Moomoo OpenD.",
+            "WARN",
+        )
+        return summary
+
+    # ---- OR_WINDOW / ACTIVE_TRADING: scan + settle + enter ----
+
+    # 1. Scan for new signals
+    try:
+        from intraday_screener import screen_intraday, DEFAULT_INTRADAY_WATCHLIST
+        from intraday_engine import get_active_intraday_tickers as _get_active
+
+        already_triggered = _get_active()
+        signals = screen_intraday(
+            DEFAULT_INTRADAY_WATCHLIST,
+            already_triggered=already_triggered,
+        )
+        summary["scan_count"] = len(signals)
+    except Exception as e:
+        log_scheduler_event(
+            "ERROR", f"Intraday scan failed: {e}", "ERROR")
+        summary["errors"].append(f"scan: {e}")
+        return summary
+
+    if not signals:
+        log_scheduler_event(
+            "INTRADAY_SCAN",
+            f"{state_name} — 0 signals for curated-6 watchlist.",
+        )
+        return summary
+
+    # 2. Build live bar data for settlement
+    bar_data = _build_intraday_bar_data()
+
+    # 3. Auto-settle (only if autoexit is on)
+    if autoexit and bar_data:
+        try:
+            from intraday_engine import auto_settle_intraday
+            settle_res = auto_settle_intraday(bar_data, actor="AGENT")
+            summary["settled"] = len(settle_res.get("settled", []))
+            summary["partials"] = len(settle_res.get("partials", []))
+
+            for ev in settle_res.get("settled", []):
+                try:
+                    from repository import get_trade
+                    t = get_trade(ev["trade_id"])
+                    if t and t.get("status") == "CLOSED":
+                        from learner import learn_from_trade_outcome
+                        learn_from_trade_outcome(t)
+                except Exception as e:
+                    log.error(
+                        f"intraday learning failed for "
+                        f"{ev.get('trade_id')}: {e}")
+
+            if settle_res.get("settled"):
+                try:
+                    from persistence import backup as _pers_backup, is_configured
+                    if is_configured():
+                        _pers_backup(
+                            reason=f"intraday: {len(settle_res['settled'])} closed")
+                except Exception:
+                    pass
+        except Exception as e:
+            log_scheduler_event(
+                "ERROR", f"Intraday settle failed: {e}", "ERROR")
+            summary["errors"].append(f"settle: {e}")
+
+    # 4. Auto-entry (only during ACTIVE_TRADING, not OR_WINDOW)
+    if autotrade and status["can_enter"] and moomoo_ok:
+        try:
+            from intraday_engine import execute_intraday_entry
+            from repository import load_account, load_trades
+            from risk_manager import run_full_risk_check
+
+            active_set = _get_active()
+            acc = load_account()
+            trades = load_trades()
+            cash = acc["cash_balance"]
+            initial_capital = acc["initial_capital"]
+
+            for sig in signals:
+                ticker = sig["ticker"]
+                if ticker in active_set:
+                    # Already have an open intraday position — skip
+                    continue
+
+                # Run risk checks
+                risk_result = run_full_risk_check(
+                    trades,
+                    {
+                        "ticker": ticker,
+                        "sector": sig.get("sector", ""),
+                        "entry": sig["entry"],
+                        "stop_loss": sig["stop_loss"],
+                        "cost": sig["entry"] * 10,
+                        "risk_amount": (
+                            sig["entry"] - sig["stop_loss"]) * 10,
+                    },
+                    cash,
+                    initial_capital,
+                )
+                if not risk_result.get("pass"):
+                    summary["rejected"] += 1
+                    from logger import log_trade_event
+                    log_trade_event(
+                        "RISK_REJECTED", trade_id=None, ticker=ticker,
+                        actor="AGENT",
+                        payload={"verdict": risk_result["final_verdict"]})
+                    continue
+
+                ok, tid, msg = execute_intraday_entry(sig, actor="AGENT")
+                if ok:
+                    summary["auto_entries"] += 1
+                    active_set.add(ticker)
+                else:
+                    summary["rejected"] += 1
+                    log_scheduler_event(
+                        "INTRADAY_ENTRY_REJECT",
+                        f"{ticker}: {msg}", "WARN")
+
+            if summary["auto_entries"] == 0:
+                log_scheduler_event(
+                    "INTRADAY_AUTO_ENTRY_END",
+                    f"0 intraday entries — {summary['rejected']} rejected, "
+                    f"{summary['scan_count']} signals scanned.",
+                    payload={"state": state_name},
+                )
+            else:
+                log_scheduler_event(
+                    "INTRADAY_AUTO_ENTRY_END",
+                    f"{summary['auto_entries']} intraday entries, "
+                    f"{summary['rejected']} rejected",
+                )
+        except Exception as e:
+            log_scheduler_event(
+                "ERROR", f"Intraday entry failed: {e}", "ERROR")
+            summary["errors"].append(f"entry: {e}")
+
+    return summary
+
+
+def _is_intraday_mode() -> bool:
+    """Check if the active trading mode is INTRADAY.
+
+    Returns False gracefully if the market_profiles module isn't available
+    (e.g. early bootstrap, tests without the module).
+    """
+    try:
+        from market_profiles import is_intraday as _is_intraday
+        return _is_intraday()
+    except Exception:
+        return False
