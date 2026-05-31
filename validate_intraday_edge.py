@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # validate_intraday_edge.py
 """
-OpenD-backed multi-year intraday-edge validator — v3.7 round 3.
+OpenD-backed multi-year intraday-edge validator -- v3.7 round 3.
 
 WHAT THIS DOES (and ONLY this):
     1. Connects to your local Moomoo OpenD (127.0.0.1:11111 by default).
     2. Pulls 5-minute history for the bull-leveraged + crypto + megacap US
        universe over a configurable look-back (default 365 days).
     3. Runs ORB with the round-2 winning params: OR=15min, target=2.0R,
-       longs-only, VWAP support, rel-vol≥1.2, EMA-50 daily trend filter.
+       longs-only, VWAP support, rel-vol>=1.2, EMA-50 daily trend filter.
     4. Aggregates per-window walk-forward + per-month results so you can
        see whether the edge holds across bull, chop, and bear regimes.
     5. Prints a markdown-formatted report to stdout AND a JSON dump.
@@ -68,6 +68,16 @@ from intraday_backtest_v2 import (
 
 
 # ---------------------------------------------------------------------------
+# ASCII-only output helpers (Windows cp1252 safe)
+# ---------------------------------------------------------------------------
+PASS = "[PASS]"
+FAIL = "[FAIL]"
+WARN = "[WARN]"
+EDGE = "[EDGE]"
+NO_EDGE = "[NO EDGE]"
+
+
+# ---------------------------------------------------------------------------
 # Universe (round-2 winner) + parameters (round-2 winner)
 # ---------------------------------------------------------------------------
 
@@ -111,13 +121,13 @@ def summarise(trades: list[Trade], label: str) -> str:
             run = 0
     win_rate = wins / n
     if avg >= 0.10 and win_rate >= 0.40 and worst <= 8:
-        v = "✅ EDGE"
+        v = f"{PASS} EDGE"
     elif avg >= 0.10 and win_rate >= 0.40:
-        v = "⚠️ rough DD"
+        v = f"{WARN} rough DD"
     elif avg > 0:
-        v = "⚠️ marginal"
+        v = f"{WARN} marginal"
     else:
-        v = "❌ no edge"
+        v = f"{FAIL} no edge"
     return (f"  {label:<35}  n={n:>4}  win={win_rate*100:>3.0f}%  "
             f"avg={avg:>+.3f}R  tot={tot:>+7.2f}R  cl={worst:>2}  {v}")
 
@@ -128,7 +138,7 @@ def fetch_universe_intraday(tickers: list[str],
     """Pull 5m history for each ticker, going back `days` calendar days.
 
     Uses data_provider, which auto-routes to Moomoo OpenD if connected.
-    Returns dict[ticker → DataFrame]. Skips tickers with no data.
+    Returns dict[ticker -> DataFrame]. Skips tickers with no data.
     """
     end = datetime.utcnow().date()
     start = end - timedelta(days=days)
@@ -165,7 +175,7 @@ def fetch_universe_intraday(tickers: list[str],
 
 def fetch_universe_daily(tickers: list[str],
                          verbose: bool = True) -> dict[str, pd.DataFrame]:
-    """Pull daily history (1y) for each ticker — used by the EMA-50 trend filter."""
+    """Pull daily history (1y) for each ticker -- used by the EMA-50 trend filter."""
     out: dict[str, pd.DataFrame] = {}
     for tk in tickers:
         try:
@@ -190,14 +200,15 @@ def run_validation(tickers: list[str],
                    verbose: bool = True) -> dict:
     """Pull data, run ORB, return rich dict for printing + JSON dump."""
     print("=" * 90)
-    print(f"VALIDATION RUN — {len(tickers)} tickers × {days} days × OR={cfg.opening_range_minutes}min R={cfg.target_r_multiple}")
+    print(f"VALIDATION RUN -- {len(tickers)} tickers x {days} days x OR={cfg.opening_range_minutes}min R={cfg.target_r_multiple}")
     print("=" * 90)
     print()
 
     # Surface which provider we're actually using.
     data_provider.ensure_probed()
     h = data_provider.health()
-    print(f"  Data source       : {'Moomoo OpenD ✅' if h['moomoo_available'] else 'yfinance fallback (no OpenD)'}")
+    moomoo_status = "Moomoo OpenD [CONNECTED]" if h["moomoo_available"] else "yfinance fallback (no OpenD)"
+    print(f"  Data source       : {moomoo_status}")
     print(f"  Provider env      : {h['provider_env']}")
     if h["init_error"]:
         print(f"  (note: {h['init_error']})")
@@ -254,12 +265,12 @@ def run_validation(tickers: list[str],
 
     # ---- Walk-forward: split into 6 equal windows ----
     print("=" * 90)
-    print("WALK-FORWARD — 6 equal windows (to test regime stability)")
+    print("WALK-FORWARD -- 6 equal windows (to test regime stability)")
     print("=" * 90)
     first = all_trades[0].entry_time.date()
     last  = all_trades[-1].entry_time.date()
     span_days = (last - first).days
-    print(f"  Trade span: {first} → {last}  ({span_days} days)")
+    print(f"  Trade span: {first} --> {last}  ({span_days} days)")
     print()
     n_windows = 6
     chunk = span_days // n_windows or 1
@@ -268,7 +279,7 @@ def run_validation(tickers: list[str],
         lo = first + timedelta(days=i * chunk)
         hi = first + timedelta(days=(i + 1) * chunk) if i < n_windows - 1 else last + timedelta(days=1)
         sub = [t for t in all_trades if lo <= t.entry_time.date() < hi]
-        line = summarise(sub, f"W{i+1}: {lo} → {hi-timedelta(days=1)}")
+        line = summarise(sub, f"W{i+1}: {lo} --> {hi-timedelta(days=1)}")
         print(line)
         windows_data.append({
             "window": i + 1,
@@ -340,7 +351,7 @@ def run_validation(tickers: list[str],
     ]
     for lo, hi, label in buckets:
         cnt = sum(1 for r in rs if lo <= r < hi)
-        bar = "█" * (cnt * 40 // max(1, n))
+        bar = "#" * (cnt * 40 // max(1, n))
         print(f"  {label:<30}  n={cnt:>4}  {bar}")
     print()
     top10n = max(1, n // 10)
@@ -365,24 +376,29 @@ def run_validation(tickers: list[str],
     monthly_hit_rate = pos_months / len(months_data)
 
     pass_count = 0
-    print(f"  [{'✅' if overall_avg >= 0.10 else '❌'}] Expectancy ≥ +0.10R    : {overall_avg:+.3f}R")
-    if overall_avg >= 0.10: pass_count += 1
-    print(f"  [{'✅' if overall_win >= 0.40 else '❌'}] Win rate ≥ 40%         : {overall_win*100:.0f}%")
-    if overall_win >= 0.40: pass_count += 1
-    print(f"  [{'✅' if worst_streak <= 8 else '❌'}] Max consec losers ≤ 8  : {worst_streak}")
-    if worst_streak <= 8: pass_count += 1
-    print(f"  [{'✅' if monthly_hit_rate >= 0.65 else '❌'}] Monthly hit rate ≥ 65%: {monthly_hit_rate*100:.0f}%")
-    if monthly_hit_rate >= 0.65: pass_count += 1
+    avg_pass = overall_avg >= 0.10
+    win_pass = overall_win >= 0.40
+    cl_pass = worst_streak <= 8
+    mhr_pass = monthly_hit_rate >= 0.65
+    if avg_pass: pass_count += 1
+    if win_pass: pass_count += 1
+    if cl_pass: pass_count += 1
+    if mhr_pass: pass_count += 1
+
+    print(f"  [{PASS if avg_pass else FAIL}] Expectancy >= +0.10R     : {overall_avg:+.3f}R")
+    print(f"  [{PASS if win_pass else FAIL}] Win rate >= 40%          : {overall_win*100:.0f}%")
+    print(f"  [{PASS if cl_pass else FAIL}] Max consec losers <= 8   : {worst_streak}")
+    print(f"  [{PASS if mhr_pass else FAIL}] Monthly hit rate >= 65% : {monthly_hit_rate*100:.0f}%")
     print()
 
     if pass_count == 4:
-        recommend = "✅ BUILD ENGINE — edge holds across regimes. Proceed to Block 2."
+        recommend = f"{PASS} {EDGE} BUILD ENGINE -- edge holds across regimes. Proceed to Block 2."
     elif pass_count == 3:
-        recommend = "⚠️ MOSTLY VALID — edge real but one weakness. Consider building Blocks 2-3 only, validate live before 4-7."
+        recommend = f"{WARN} MOSTLY VALID -- edge real but one weakness. Consider building Blocks 2-3 only, validate live before 4-7."
     elif pass_count == 2:
-        recommend = "⚠️ MIXED — needs more tuning or only build plumbing (Block 2). Don't ship full engine."
+        recommend = f"{WARN} MIXED -- needs more tuning or only build plumbing (Block 2). Don't ship full engine."
     else:
-        recommend = "❌ EDGE DOES NOT GENERALIZE — DO NOT build engine. Shelve or pick different strategy."
+        recommend = f"{FAIL} {NO_EDGE} EDGE DOES NOT GENERALIZE -- DO NOT build engine. Shelve or pick different strategy."
     print(f"  RECOMMENDATION: {recommend}")
     print()
 
