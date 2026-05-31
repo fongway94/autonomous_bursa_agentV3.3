@@ -35,10 +35,22 @@ Env / Streamlit secrets
 
 Public API
 ----------
-- `get_history(ticker, period=None, start=None, end=None, timeout=15)`
+- `get_history(ticker, period=None, start=None, end=None, timeout=15, interval="1d")`
 - `provider_name()`  → 'moomoo' | 'yfinance' (last call, or next-call guess)
 - `health()`         → dict for the Settings tab
 - `reset()`          → forget detection state (mainly for tests)
+
+v3.7 — Intraday support
+-----------------------
+`get_history` now accepts an `interval` argument:
+    - "1d" (default)           → byte-identical to the pre-v3.7 daily path
+    - "1m"/"5m"/"15m"/"30m"/"60m"/"1h" → intraday candles
+
+Data-source reality (do not pretend otherwise):
+    - Moomoo OpenD serves real intraday for US (local PC only).
+    - yfinance intraday is limited: 1m ≤ 7 days back, 5m/15m ≤ 60 days back.
+    - MY (Bursa) has NO reliable intraday feed → intraday is US-only today,
+      gated by MarketProfile.supports_intraday (flip the day Moomoo adds MY).
 """
 
 from __future__ import annotations
@@ -278,17 +290,84 @@ _PERIOD_TO_DAYS = {
     "ytd": None, "max": 3660,
 }
 
+# ---------------------------------------------------------------------------
+# Intraday support (v3.7) — interval handling
+# ---------------------------------------------------------------------------
+# The whole pre-v3.7 stack is daily-bar only. Intraday (ORB on 5m) needs
+# sub-daily candles. We thread an `interval` arg through get_history():
+#   - interval="1d" (default)  → byte-identical to the old daily behaviour
+#   - interval="5m"/"15m"/"1m" → intraday candles
+
+# yfinance interval strings we support → max look-back days yfinance allows.
+_INTRADAY_INTERVALS = {
+    "1m": 7,      # yfinance hard cap: ~7 days of 1-minute data
+    "2m": 60,
+    "5m": 60,     # ~60 days of 5-minute data (enough for a walk-forward)
+    "15m": 60,
+    "30m": 60,
+    "60m": 730,
+    "1h": 730,
+}
+
+
+def _is_intraday(interval: Optional[str]) -> bool:
+    return bool(interval) and interval.strip().lower() != "1d"
+
+
+def _moomoo_ktype_for_interval(interval: Optional[str]):
+    """Map a yfinance-style interval string to a moomoo KLType enum.
+
+    Returns None if the interval isn't representable in moomoo (caller
+    should fall back to yfinance).
+    """
+    try:
+        from moomoo import KLType
+    except Exception:
+        return None
+    iv = (interval or "1d").strip().lower()
+    table = {
+        "1d":  getattr(KLType, "K_DAY", None),
+        "1m":  getattr(KLType, "K_1M",  None),
+        "3m":  getattr(KLType, "K_3M",  None),
+        "5m":  getattr(KLType, "K_5M",  None),
+        "15m": getattr(KLType, "K_15M", None),
+        "30m": getattr(KLType, "K_30M", None),
+        "60m": getattr(KLType, "K_60M", None),
+        "1h":  getattr(KLType, "K_60M", None),
+    }
+    return table.get(iv)
+
+
+def _default_intraday_lookback_days(interval: str) -> int:
+    """How many calendar days back to request for an intraday interval by
+    default (when no explicit period/start/end is given). Capped to what
+    yfinance allows so the same default works for both providers."""
+    return _INTRADAY_INTERVALS.get((interval or "").strip().lower(), 60)
+
 
 def _resolve_window(period: Optional[str],
                     start: Optional[str],
-                    end: Optional[str]) -> Tuple[str, str]:
-    """Return (start_str, end_str) as YYYY-MM-DD for Moomoo."""
+                    end: Optional[str],
+                    interval: Optional[str] = None) -> Tuple[str, str]:
+    """Return (start_str, end_str) as YYYY-MM-DD for Moomoo.
+
+    `interval` only affects the *default* window when no period/start/end is
+    given: intraday intervals default to a recent-days look-back (capped to
+    what's actually available) instead of 1 year of (nonexistent) intraday.
+    """
     if start is not None or end is not None:
         end_d = pd.to_datetime(end).date() if end is not None else datetime.now(timezone.utc).date()
         if start is not None:
             start_d = pd.to_datetime(start).date()
         else:
-            start_d = end_d - timedelta(days=365)
+            default_back = (_default_intraday_lookback_days(interval)
+                            if _is_intraday(interval) else 365)
+            start_d = end_d - timedelta(days=default_back)
+        return str(start_d), str(end_d)
+
+    if _is_intraday(interval):
+        end_d = datetime.now(timezone.utc).date()
+        start_d = end_d - timedelta(days=_default_intraday_lookback_days(interval))
         return str(start_d), str(end_d)
 
     p = (period or "1y").lower()
@@ -353,12 +432,13 @@ def _fetch_moomoo(ticker: str,
                   period: Optional[str],
                   start: Optional[str],
                   end: Optional[str],
-                  timeout: float) -> Optional[pd.DataFrame]:
+                  timeout: float,
+                  interval: Optional[str] = None) -> Optional[pd.DataFrame]:
     """
     Returns a yfinance-shaped DataFrame, or None if Moomoo can't / won't
     serve this request (caller should fall back to yfinance).
     """
-    from moomoo import KLType, AuType, RET_OK
+    from moomoo import AuType, RET_OK
 
     code = _to_moomoo_code(ticker)
     if code is None:
@@ -369,7 +449,13 @@ def _fetch_moomoo(ticker: str,
         # MY today: OpenD doesn't serve it; skip silently rather than spam.
         return None
 
-    s_str, e_str = _resolve_window(period, start, end)
+    ktype = _moomoo_ktype_for_interval(interval)
+    if ktype is None:
+        # This moomoo SDK build can't represent the requested interval —
+        # let the caller fall back to yfinance.
+        return None
+
+    s_str, e_str = _resolve_window(period, start, end, interval)
 
     result: dict = {"df": None, "err": None}
 
@@ -386,7 +472,7 @@ def _fetch_moomoo(ticker: str,
                     code,
                     start=s_str,
                     end=e_str,
-                    ktype=KLType.K_DAY,
+                    ktype=ktype,
                     autype=AuType.QFQ,
                     max_count=1000,
                     page_req_key=page_key,
@@ -449,9 +535,23 @@ def _fetch_yfinance(ticker: str,
                     period: Optional[str],
                     start: Optional[str],
                     end: Optional[str],
-                    timeout: float) -> pd.DataFrame:
+                    timeout: float,
+                    interval: Optional[str] = None) -> pd.DataFrame:
+    iv = (interval or "1d").strip().lower()
     try:
-        if period is not None and start is None and end is None:
+        if _is_intraday(iv):
+            # yfinance intraday: must pass interval=, and respect the
+            # provider's look-back cap. If the caller gave explicit
+            # start/end (backtest), honour them; else use a recent window.
+            if start is not None or end is not None:
+                df = yf.Ticker(ticker).history(
+                    start=start, end=end, interval=iv, timeout=timeout)
+            else:
+                cap = _INTRADAY_INTERVALS.get(iv, 60)
+                # yfinance accepts e.g. period="60d" with interval="5m"
+                df = yf.Ticker(ticker).history(
+                    period=f"{cap}d", interval=iv, timeout=timeout)
+        elif period is not None and start is None and end is None:
             df = yf.Ticker(ticker).history(period=period, timeout=timeout)
         else:
             df = yf.Ticker(ticker).history(start=start, end=end, timeout=timeout)
@@ -471,7 +571,8 @@ def get_history(ticker: str,
                 period: Optional[str] = None,
                 start=None,
                 end=None,
-                timeout: float = DEFAULT_TIMEOUT_S) -> pd.DataFrame:
+                timeout: float = DEFAULT_TIMEOUT_S,
+                interval: str = "1d") -> pd.DataFrame:
     """
     Drop-in replacement for `yf.Ticker(ticker).history(...)`.
 
@@ -479,19 +580,25 @@ def get_history(ticker: str,
     moomoo supported list. Otherwise (or on any failure) falls back to
     yfinance for that single call. After repeated failures Moomoo is
     demoted for the rest of the process.
+
+    `interval` (v3.7): "1d" (default, daily — unchanged behaviour) or an
+    intraday string ("1m"/"5m"/"15m"/"30m"/"60m"/"1h"). Intraday is only
+    meaningful for markets with a real intraday feed (US via Moomoo OpenD;
+    yfinance intraday is limited and gappy). Daily callers are 100%
+    unaffected — the default keeps the exact pre-v3.7 code path.
     """
     global _last_served_by
 
     _ensure_provider_decided()
 
     if _moomoo_available and _market_supports_moomoo(ticker):
-        df = _fetch_moomoo(ticker, period, start, end, timeout)
+        df = _fetch_moomoo(ticker, period, start, end, timeout, interval=interval)
         if df is not None and not df.empty:
             _last_served_by = "moomoo"
             return df
         # Fall through to yfinance for this single call.
 
-    df = _fetch_yfinance(ticker, period, start, end, timeout)
+    df = _fetch_yfinance(ticker, period, start, end, timeout, interval=interval)
     _last_served_by = "yfinance"
     return df
 
