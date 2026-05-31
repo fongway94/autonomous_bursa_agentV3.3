@@ -215,6 +215,18 @@ class _USProfile:
     neutral_max_positions: int = 4
     bear_max_positions: int = 2
 
+    # v3.7 intraday — US-only today via Moomoo OpenD
+    # MY flips supports_intraday=True the day Moomoo adds Bursa coverage.
+    # These params are the result of the round-4 backtest validation.
+    supports_intraday: bool = True
+    intraday_interval: str = "5m"
+    intraday_flat_by: dtime = dtime(15, 55)   # hard exit 5 min before US close
+    intraday_cycle_sec: int = 300             # 5-min scheduler cadence
+    intraday_target_r_multiple: float = 2.0   # ORB target = entry + 2 × OR_range
+    intraday_require_trend: bool = True       # only long when prior daily close > EMA-200
+    intraday_ema_length: int = 200            # daily EMA for the trend filter
+    intraday_rel_vol_threshold: float = 1.2   # breakout bar must be 1.2× avg session vol
+
 
 US_PROFILE: MarketProfile = _USProfile()
 
