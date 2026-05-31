@@ -191,6 +191,16 @@ class _MYProfile:
     neutral_max_positions: int = 5
     bear_max_positions: int = 3
 
+    # v3.7 intraday (MY not yet supported by Moomoo OpenAPI)
+    supports_intraday: bool = False
+    intraday_interval: str = "5m"
+    intraday_flat_by: dtime = dtime(16, 0)    # not used; MY has no intraday today
+    intraday_cycle_sec: int = 300
+    intraday_target_r_multiple: float = 2.0
+    intraday_require_trend: bool = True
+    intraday_ema_length: int = 200
+    intraday_rel_vol_threshold: float = 1.2
+
 
 MY_PROFILE: MarketProfile = _MYProfile()
 
