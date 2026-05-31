@@ -324,7 +324,65 @@ class TestEdgeCases:
 # ---------------------------------------------------------------------------
 
 class TestScreenIntraday:
-    def test_returns_signals_for_valid_breakouts(self, monkeypatch):
+    """Integration tests for screen_intraday() runner with mocked data_provider.
+
+    These tests monkeypatch data_provider.get_history so no network calls are
+    made. They also reset the data_provider module state (reset()) before each
+    test so that stale probe results from prior full-suite tests don't leak in
+    and prevent the monkeypatched fake_get_history from being called.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_dp_state(self):
+        """Reset data_provider probe state so monkeypatches take effect.
+
+        In the full test suite a prior test may trigger a real TCP probe that
+        sets _moomoo_available=False. Without resetting this, the monkeypatched
+        ensure_probed no-op has no effect (the result is already cached) and
+        screen_intraday falls back to the real get_history instead of the fake.
+        Calling reset() clears _moomoo_available back to None so the next probe
+        goes through the monkeypatched path.
+        """
+        import data_provider as _dp
+        _dp.reset()
+        yield
+        _dp.reset()
+
+    def _make_fake_dp(self, fake_get_history):
+        """Build a minimal fake data_provider module substitute.
+
+        screen_intraday calls data_provider.ensure_probed(), data_provider.health(),
+        and data_provider.get_history(). We provide all three via a simple namespace
+        so no real probe is ever triggered — regardless of full-suite ordering.
+        """
+        import types
+        fake = types.SimpleNamespace(
+            ensure_probed=lambda: None,
+            health=lambda: {"moomoo_available": False},
+            get_history=fake_get_history,
+        )
+        return fake
+
+    def _run_screen(self, fake_get_history, tickers, now_et,
+                    already_triggered=None, monkeypatch=None):
+        """Run screen_intraday with a fully-faked data_provider.
+
+        Patches the `data_provider` name inside the intraday_screener module
+        so the runner never calls the real data_provider at all.
+        """
+        import intraday_screener as _is
+        fake = self._make_fake_dp(fake_get_history)
+        old_dp = _is.data_provider
+        try:
+            _is.data_provider = fake
+            return screen_intraday(
+                tickers, now_et=now_et,
+                already_triggered=already_triggered or set(),
+            )
+        finally:
+            _is.data_provider = old_dp
+
+    def test_returns_signals_for_valid_breakouts(self):
         d = date(2026, 6, 3)
         now = datetime.combine(d, dtime(10, 5))
         df_5m = _good_breakout_session(d)
@@ -334,16 +392,11 @@ class TestScreenIntraday:
             interval = kw.get("interval", "1d")
             return df_5m.copy() if interval == "5m" else df_d.copy()
 
-        monkeypatch.setattr("data_provider.get_history", fake_get_history)
-        monkeypatch.setattr("data_provider.ensure_probed", lambda: None)
-        monkeypatch.setattr("data_provider.health",
-                            lambda: {"moomoo_available": False})
-
-        results = screen_intraday(["TNA", "GOOGL"], now_et=now)
+        results = self._run_screen(fake_get_history, ["TNA", "GOOGL"], now)
         assert len(results) == 2
         assert all(r["source"] == "INTRADAY" for r in results)
 
-    def test_respects_already_triggered_set(self, monkeypatch):
+    def test_respects_already_triggered_set(self):
         d = date(2026, 6, 3)
         now = datetime.combine(d, dtime(10, 5))
         df_5m = _good_breakout_session(d)
@@ -353,34 +406,24 @@ class TestScreenIntraday:
             interval = kw.get("interval", "1d")
             return df_5m.copy() if interval == "5m" else df_d.copy()
 
-        monkeypatch.setattr("data_provider.get_history", fake_get_history)
-        monkeypatch.setattr("data_provider.ensure_probed", lambda: None)
-        monkeypatch.setattr("data_provider.health",
-                            lambda: {"moomoo_available": False})
-
-        results = screen_intraday(["TNA", "GOOGL"], now_et=now,
-                                  already_triggered={"TNA"})
+        results = self._run_screen(
+            fake_get_history, ["TNA", "GOOGL"], now,
+            already_triggered={"TNA"},
+        )
         assert len(results) == 1
         assert results[0]["ticker"] == "GOOGL"
 
-    def test_empty_when_no_data(self, monkeypatch):
-        def fake_get_history(ticker, **kw):
-            return pd.DataFrame()
-        monkeypatch.setattr("data_provider.get_history", fake_get_history)
-        monkeypatch.setattr("data_provider.ensure_probed", lambda: None)
-        monkeypatch.setattr("data_provider.health",
-                            lambda: {"moomoo_available": False})
-        results = screen_intraday(["TNA"], now_et=datetime.now())
+    def test_empty_when_no_data(self):
+        results = self._run_screen(
+            lambda ticker, **kw: pd.DataFrame(),
+            ["TNA"], datetime.now(),
+        )
         assert results == []
 
-    def test_handles_fetch_exceptions(self, monkeypatch):
-        def fake_get_history(ticker, **kw):
+    def test_handles_fetch_exceptions(self):
+        def _raise(ticker, **kw):
             raise RuntimeError("network down")
-        monkeypatch.setattr("data_provider.get_history", fake_get_history)
-        monkeypatch.setattr("data_provider.ensure_probed", lambda: None)
-        monkeypatch.setattr("data_provider.health",
-                            lambda: {"moomoo_available": False})
-        results = screen_intraday(["TNA"], now_et=datetime.now())
+        results = self._run_screen(_raise, ["TNA"], datetime.now())
         assert results == []
 
     def test_default_watchlist_is_curated_6(self):
