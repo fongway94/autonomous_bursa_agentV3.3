@@ -562,3 +562,191 @@ class TestPortPreCheck:
         # 127.0.0.1:1 is reserved and never listening in test envs.
         result = dp._is_port_open("127.0.0.1", 1, timeout=0.5)
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# v3.7 — Intraday interval support
+# ---------------------------------------------------------------------------
+
+class TestIntradayInterval:
+    """The `interval` arg added to get_history() in v3.7. Daily callers
+    (interval=\"1d\", the default) must be byte-identical to pre-v3.7; new
+    intraday callers (5m, 15m, …) get sub-daily candles."""
+
+    # ---- pure helpers ----
+
+    def test_is_intraday_helper(self, dp):
+        assert dp._is_intraday("5m") is True
+        assert dp._is_intraday("15m") is True
+        assert dp._is_intraday("1m") is True
+        # Defaults / daily / empties → NOT intraday.
+        assert dp._is_intraday("1d") is False
+        assert dp._is_intraday(None) is False
+        assert dp._is_intraday("") is False
+
+    def test_default_lookback_capped_to_provider_limit(self, dp):
+        # yfinance hard caps: 1m=7d, 5m/15m/30m=60d, 60m/1h=730d.
+        assert dp._default_intraday_lookback_days("1m") == 7
+        assert dp._default_intraday_lookback_days("5m") == 60
+        assert dp._default_intraday_lookback_days("15m") == 60
+        assert dp._default_intraday_lookback_days("60m") == 730
+        assert dp._default_intraday_lookback_days("1h") == 730
+        # Unknown interval falls back to 60 (safe default).
+        assert dp._default_intraday_lookback_days("99x") == 60
+
+    def test_moomoo_ktype_for_interval(self, monkeypatch, dp):
+        """When moomoo is installed, intervals map to the right KLType enum."""
+        _install_fake_moomoo(monkeypatch, connect_ok=True)
+        # Our fake module only has K_DAY; we add the others so the mapper
+        # has something to return (proving the mapper LOOKS at KLType.K_5M
+        # rather than always returning K_DAY).
+        import sys as _sys
+        mod = _sys.modules["moomoo"]
+        mod.KLType.K_5M = "K_5M_ENUM"
+        mod.KLType.K_15M = "K_15M_ENUM"
+        mod.KLType.K_1M = "K_1M_ENUM"
+        mod.KLType.K_60M = "K_60M_ENUM"
+
+        assert dp._moomoo_ktype_for_interval("1d") == "K_DAY"
+        assert dp._moomoo_ktype_for_interval("5m") == "K_5M_ENUM"
+        assert dp._moomoo_ktype_for_interval("15m") == "K_15M_ENUM"
+        assert dp._moomoo_ktype_for_interval("1m") == "K_1M_ENUM"
+        assert dp._moomoo_ktype_for_interval("1h") == "K_60M_ENUM"
+        # Unknown interval → None (caller must fall back to yfinance).
+        assert dp._moomoo_ktype_for_interval("99x") is None
+
+    def test_moomoo_ktype_returns_none_when_moomoo_absent(self, monkeypatch, dp):
+        _uninstall_moomoo(monkeypatch)
+        assert dp._moomoo_ktype_for_interval("5m") is None
+        assert dp._moomoo_ktype_for_interval("1d") is None
+
+    # ---- window resolution ----
+
+    def test_resolve_window_intraday_default_uses_intraday_lookback(self, dp):
+        """No period/start/end + 5m interval → defaults to a recent window
+        (≤ yfinance cap), NOT 1 year of (nonexistent) intraday data."""
+        s, e = dp._resolve_window(None, None, None, interval="5m")
+        s_d, e_d = pd.to_datetime(s).date(), pd.to_datetime(e).date()
+        span = (e_d - s_d).days
+        assert span <= 60, f"5m default lookback should be <=60d, got {span}d"
+        assert span >= 30, f"5m default lookback should be reasonably long"
+
+    def test_resolve_window_intraday_with_explicit_start(self, dp):
+        s, e = dp._resolve_window(None, "2025-01-10", "2025-01-15",
+                                  interval="5m")
+        assert s == "2025-01-10"
+        assert e == "2025-01-15"
+
+    def test_resolve_window_intraday_with_only_end_uses_intraday_default(self, dp):
+        """If only `end` is given (no start) with an intraday interval, the
+        default look-back must use the intraday cap, not 365 days."""
+        s, e = dp._resolve_window(None, None, "2025-03-01", interval="5m")
+        span = (pd.to_datetime(e).date() - pd.to_datetime(s).date()).days
+        assert span <= 60
+
+    def test_resolve_window_daily_unchanged(self, dp):
+        """Sanity: the daily-path window is byte-identical (1y default)."""
+        s, e = dp._resolve_window("1y", None, None)  # no interval arg
+        span = (pd.to_datetime(e).date() - pd.to_datetime(s).date()).days
+        assert span >= 360
+        # Same call with explicit interval="1d" must produce the same window.
+        s2, e2 = dp._resolve_window("1y", None, None, interval="1d")
+        assert (s, e) == (s2, e2)
+
+    # ---- end-to-end through get_history ----
+
+    def test_get_history_intraday_routes_through_yfinance_with_interval(
+            self, monkeypatch, dp):
+        """interval=\"5m\" on a US ticker, no Moomoo: yfinance must be called
+        with interval=\"5m\" AND a period inside the 60d cap."""
+        _uninstall_moomoo(monkeypatch)
+        with mock.patch.object(dp.yf, "Ticker") as MockTicker:
+            MockTicker.return_value.history.return_value = _fake_yf_df(30)
+            df = dp.get_history("AAPL", interval="5m")
+
+        assert not df.empty
+        MockTicker.assert_called_once_with("AAPL")
+        kwargs = MockTicker.return_value.history.call_args.kwargs
+        assert kwargs.get("interval") == "5m"
+        # When no explicit start/end was passed we use period="60d".
+        assert kwargs.get("period") == "60d"
+
+    def test_get_history_intraday_explicit_range_passed_through(
+            self, monkeypatch, dp):
+        _uninstall_moomoo(monkeypatch)
+        with mock.patch.object(dp.yf, "Ticker") as MockTicker:
+            MockTicker.return_value.history.return_value = _fake_yf_df(10)
+            dp.get_history("AAPL", start="2025-01-10", end="2025-01-15",
+                           interval="5m")
+
+        kwargs = MockTicker.return_value.history.call_args.kwargs
+        assert kwargs.get("interval") == "5m"
+        assert kwargs.get("start") == "2025-01-10"
+        assert kwargs.get("end") == "2025-01-15"
+        # When start/end is explicit, no period= is set.
+        assert kwargs.get("period") is None or "period" not in kwargs
+
+    def test_get_history_daily_default_unchanged(self, monkeypatch, dp):
+        """interval defaults to \"1d\". The yfinance call must look IDENTICAL
+        to what pre-v3.7 callers got — no interval=, no period=60d.
+
+        This is the byte-identical-daily-path guard.
+        """
+        _uninstall_moomoo(monkeypatch)
+        with mock.patch.object(dp.yf, "Ticker") as MockTicker:
+            MockTicker.return_value.history.return_value = _fake_yf_df(30)
+            dp.get_history("AAPL", period="1y")  # no interval arg
+
+        kwargs = MockTicker.return_value.history.call_args.kwargs
+        assert kwargs.get("period") == "1y"
+        # Must NOT have passed interval to yfinance on the daily path
+        # (would change v3.6 behaviour for downstream indicator code).
+        assert "interval" not in kwargs
+
+    def test_get_history_intraday_via_moomoo_uses_5m_ktype(
+            self, monkeypatch, dp):
+        """When OpenD is up AND interval=5m, the Moomoo call must use the
+        K_5M ktype (proved by inspecting what request_history_kline saw)."""
+        captured = {"ktype": None}
+
+        # Build a custom fake that captures the ktype it was asked for.
+        import sys as _sys, types as _types
+        fake = _types.ModuleType("moomoo")
+        fake.RET_OK = 0
+
+        class _KLType:
+            K_DAY = "K_DAY"
+            K_5M = "K_5M"
+            K_15M = "K_15M"
+
+        class _AuType:
+            QFQ = "QFQ"
+
+        fake.KLType = _KLType
+        fake.AuType = _AuType
+
+        class _Ctx:
+            def __init__(self, host=None, port=None):
+                pass
+
+            def get_global_state(self):
+                return 0, {}
+
+            def request_history_kline(self, code, start=None, end=None,
+                                      ktype=None, autype=None,
+                                      max_count=1000, page_req_key=None,
+                                      **kw):
+                captured["ktype"] = ktype
+                return 0, _fake_moomoo_kline_df(20), None
+
+            def close(self):
+                pass
+
+        fake.OpenQuoteContext = _Ctx
+        monkeypatch.setitem(_sys.modules, "moomoo", fake)
+        monkeypatch.setattr(dp, "_is_port_open",
+                            lambda h, p, timeout=1.0: True)
+
+        df = dp.get_history("AAPL", interval="5m")
+        assert not df.empty
+        assert captured["ktype"] == "K_5M"

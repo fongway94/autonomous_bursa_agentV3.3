@@ -16,6 +16,14 @@ Active profile selection priority (first match wins):
     2. Marker file `~/.bursa_agent_data/.active_market` (set by Settings tab)
     3. Default = MY (preserves v3.3 behaviour for existing deployments)
 
+Active trading mode selection priority (first match wins):
+    1. Environment variable `TRADING_MODE` (one of: SWING, INTRADAY)
+    2. Marker file `~/.bursa_agent_data/.trading_mode` (set by Settings tab)
+    3. Default = SWING (preserves v3.3/v3.6 daily-only behaviour)
+
+DB isolation: each (market, mode) pair has its own SQLite file so the
+daily Bayesian brain and the intraday Bayesian brain never cross-contaminate.
+
 NB: We deliberately do NOT read the market from the SQLite `meta` table —
 that would create a chicken-and-egg with `db.py` (whose DB_PATH depends on
 the active market). The text-file marker breaks the cycle cleanly.
@@ -41,6 +49,14 @@ _LOCK = threading.RLock()
 # (no `from db import DATA_DIR` to avoid circular import).
 _DATA_DIR = Path(os.path.expanduser("~")) / ".bursa_agent_data"
 _MARKER_FILE = _DATA_DIR / ".active_market"
+_TRADING_MODE_FILE = _DATA_DIR / ".trading_mode"
+
+# Valid trading modes.
+TRADING_MODES = ("SWING", "INTRADAY")
+_DEFAULT_TRADING_MODE = "SWING"
+
+# Cached trading mode (reset via set_trading_mode).
+_CACHED_TRADING_MODE: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +125,75 @@ def available_markets() -> list[str]:
     return ["MY", "US"]
 
 
+# ---------------------------------------------------------------------------
+# Trading mode API (v3.7)
+# ---------------------------------------------------------------------------
+
+def active_trading_mode() -> str:
+    """Current trading mode: 'SWING' (default, daily) or 'INTRADAY'.
+
+    Resolution order:
+        1. env var TRADING_MODE
+        2. ~/.bursa_agent_data/.trading_mode marker file
+        3. default 'SWING'
+
+    Intraday is only available on markets that have `supports_intraday=True`
+    in their profile. Calling code must check `active_profile().supports_intraday`
+    before running intraday logic.
+    """
+    global _CACHED_TRADING_MODE
+    if _CACHED_TRADING_MODE is not None:
+        return _CACHED_TRADING_MODE
+    mode = _detect_trading_mode()
+    _CACHED_TRADING_MODE = mode
+    return mode
+
+
+def is_intraday() -> bool:
+    """True if the active mode is INTRADAY."""
+    return active_trading_mode() == "INTRADAY"
+
+
+def set_trading_mode(mode: str, persist: bool = True) -> str:
+    """Switch trading mode at runtime.
+
+    Args:
+        mode: 'SWING' or 'INTRADAY' (case-insensitive)
+        persist: if True, write to marker file so next boot picks it up
+
+    Returns:
+        The newly-set mode string.
+
+    Raises:
+        ValueError: if mode is not SWING or INTRADAY.
+    """
+    global _CACHED_TRADING_MODE
+    m = mode.upper().strip()
+    if m not in TRADING_MODES:
+        raise ValueError(
+            f"Unknown trading mode {m!r}. Available: {TRADING_MODES}"
+        )
+    _CACHED_TRADING_MODE = m
+    if persist:
+        _persist_trading_mode_to_marker(m)
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Reset helpers (for tests)
+# ---------------------------------------------------------------------------
+
 def reset_cache() -> None:
-    """Force re-resolution on next active_profile() call. For tests."""
+    """Force re-resolution of active profile on next active_profile() call. For tests."""
     global _ACTIVE_PROFILE
     with _LOCK:
         _ACTIVE_PROFILE = None
+
+
+def reset_trading_mode_cache() -> None:
+    """Force re-resolution of trading mode on next active_trading_mode() call. For tests."""
+    global _CACHED_TRADING_MODE
+    _CACHED_TRADING_MODE = None
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +219,26 @@ def _detect_market_code() -> str:
     return "MY"
 
 
+def _detect_trading_mode() -> str:
+    """Detect the active trading mode (SWING or INTRADAY)."""
+    # 1. env var wins
+    env = os.environ.get("TRADING_MODE", "").upper().strip()
+    if env in TRADING_MODES:
+        return env
+
+    # 2. marker file
+    try:
+        if _TRADING_MODE_FILE.exists():
+            v = _TRADING_MODE_FILE.read_text(encoding="utf-8").strip().upper()
+            if v in TRADING_MODES:
+                return v
+    except Exception:
+        pass
+
+    # 3. default
+    return _DEFAULT_TRADING_MODE
+
+
 def _resolve_profile(code: str) -> MarketProfile:
     if code == "MY":
         from market_profiles.my_profile import MY_PROFILE
@@ -160,6 +260,14 @@ def _persist_market_to_marker(code: str) -> None:
         pass
 
 
+def _persist_trading_mode_to_marker(mode: str) -> None:
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _TRADING_MODE_FILE.write_text(mode, encoding="utf-8")
+    except Exception:
+        pass
+
+
 __all__ = [
     "MarketProfile",
     "active_profile",
@@ -167,5 +275,10 @@ __all__ = [
     "set_active_market",
     "available_markets",
     "reset_cache",
+    # v3.7 trading mode API
+    "active_trading_mode",
+    "is_intraday",
+    "set_trading_mode",
+    "reset_trading_mode_cache",
+    "TRADING_MODES",
 ]
-

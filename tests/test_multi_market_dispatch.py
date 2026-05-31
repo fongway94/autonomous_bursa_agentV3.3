@@ -23,7 +23,7 @@ import pytest
 
 @pytest.fixture
 def isolated_home(tmp_path, monkeypatch):
-    """Just isolate market_profiles state + ensure no MARKET_MODE leak.
+    """Just isolate market_profiles state + ensure no MARKET_MODE or TRADING_MODE leak.
 
     NB: we deliberately do NOT change $HOME — the session-scoped
     `_isolate_data_dir` fixture in conftest.py already redirects DATA_DIR
@@ -33,11 +33,15 @@ def isolated_home(tmp_path, monkeypatch):
     own multi-market path resolution.
     """
     import market_profiles
-    # Direct the marker file at a per-test tempdir so MY/US flips don't leak
+    # Direct both marker files at a per-test tempdir so MY/US or SWING/INTRADAY flips don't leak
     monkeypatch.setattr(market_profiles, "_MARKER_FILE",
                         tmp_path / ".active_market")
+    monkeypatch.setattr(market_profiles, "_TRADING_MODE_FILE",
+                        tmp_path / ".trading_mode")
     market_profiles.reset_cache()
+    market_profiles.reset_trading_mode_cache()
     monkeypatch.delenv("MARKET_MODE", raising=False)
+    monkeypatch.delenv("TRADING_MODE", raising=False)
     yield tmp_path
 
 
@@ -76,14 +80,17 @@ def _reimport(modnames: list[str]):
 
 def test_db_path_dispatches_on_active_market_my(isolated_home, monkeypatch):
     monkeypatch.setenv("MARKET_MODE", "MY")
+    monkeypatch.setenv("TRADING_MODE", "SWING")
     db, = _reimport(["db"])
-    assert db.current_db_path().endswith("bursa_agent_MY.db")
+    # v3.7: DB path splits on (market, mode) -> bursa_agent_<CODE>_<MODE>.db
+    assert db.current_db_path().endswith("bursa_agent_MY_SWING.db")
 
 
 def test_db_path_dispatches_on_active_market_us(isolated_home, monkeypatch):
     monkeypatch.setenv("MARKET_MODE", "US")
+    monkeypatch.setenv("TRADING_MODE", "SWING")
     db, = _reimport(["db"])
-    assert db.current_db_path().endswith("bursa_agent_US.db")
+    assert db.current_db_path().endswith("bursa_agent_US_SWING.db")
 
 
 def test_db_files_are_distinct_per_market(isolated_home, monkeypatch):
@@ -378,3 +385,105 @@ def test_data_provider_health_surfaces_active_market(isolated_home, monkeypatch)
     h = dp.health()
     assert h["active_market"] == "US"
     assert h["moomoo_supports_active_market"] is True
+
+
+# ---------------------------------------------------------------------------
+# v3.7 trading mode API (SWING / INTRADAY)
+# ---------------------------------------------------------------------------
+
+def test_trading_mode_defaults_to_swings(isolated_home, monkeypatch):
+    """Fresh module state must default to SWING without any marker file."""
+    import market_profiles
+    monkeypatch.delenv("TRADING_MODE", raising=False)
+    market_profiles.reset_trading_mode_cache()
+    # Remove any lingering marker file
+    try:
+        if market_profiles._TRADING_MODE_FILE.exists():
+            market_profiles._TRADING_MODE_FILE.unlink()
+    except Exception:
+        pass
+    assert market_profiles.active_trading_mode() == "SWING"
+
+
+def test_trading_mode_switch_via_env(isolated_home, monkeypatch):
+    """TRADING_MODE env var must be respected before any marker file."""
+    import market_profiles
+    monkeypatch.setenv("TRADING_MODE", "INTRADAY")
+    market_profiles.reset_trading_mode_cache()
+    try:
+        if market_profiles._TRADING_MODE_FILE.exists():
+            market_profiles._TRADING_MODE_FILE.unlink()
+    except Exception:
+        pass
+    assert market_profiles.active_trading_mode() == "INTRADAY"
+
+
+def test_set_trading_mode_persists_to_marker(isolated_home, monkeypatch):
+    """set_trading_mode must write the marker file."""
+    import market_profiles
+    monkeypatch.setenv("TRADING_MODE", "SWING")  # start clean
+    market_profiles.reset_trading_mode_cache()
+    market_profiles.set_trading_mode("INTRADAY", persist=True)
+    assert market_profiles.active_trading_mode() == "INTRADAY"
+    # Marker file must exist and contain INTRADAY
+    assert market_profiles._TRADING_MODE_FILE.exists()
+    assert market_profiles._TRADING_MODE_FILE.read_text().strip() == "INTRADAY"
+
+
+def test_is_intraday_true_when_mode_intraday(isolated_home, monkeypatch):
+    import market_profiles
+    monkeypatch.setenv("TRADING_MODE", "INTRADAY")
+    market_profiles.reset_trading_mode_cache()
+    assert market_profiles.is_intraday() is True
+
+
+def test_is_intraday_false_when_mode_swing(isolated_home, monkeypatch):
+    import market_profiles
+    monkeypatch.setenv("TRADING_MODE", "SWING")
+    market_profiles.reset_trading_mode_cache()
+    assert market_profiles.is_intraday() is False
+
+
+def test_db_path_includes_trading_mode_suffix(isolated_home, monkeypatch):
+    """DB path must reflect both market AND mode."""
+    monkeypatch.setenv("MARKET_MODE", "US")
+    monkeypatch.setenv("TRADING_MODE", "INTRADAY")
+    db, = _reimport(["db"])
+    assert db.current_db_path().endswith("bursa_agent_US_INTRADAY.db")
+
+
+def test_my_profile_supports_intraday_is_false(isolated_home, monkeypatch):
+    """MY has no intraday today — Moomoo OpenAPI doesn't support Bursa."""
+    monkeypatch.setenv("MARKET_MODE", "MY")
+    import market_profiles
+    market_profiles.reset_cache()
+    assert market_profiles.active_profile().supports_intraday is False
+
+
+def test_us_profile_supports_intraday_is_true(isolated_home, monkeypatch):
+    """US has intraday via Moomoo OpenD."""
+    monkeypatch.setenv("MARKET_MODE", "US")
+    import market_profiles
+    market_profiles.reset_cache()
+    p = market_profiles.active_profile()
+    assert p.supports_intraday is True
+    # Intraday params must be present and sane
+    assert p.intraday_interval == "5m"
+    assert p.intraday_flat_by.hour == 15 and p.intraday_flat_by.minute == 55
+    assert p.intraday_cycle_sec == 300
+    assert p.intraday_target_r_multiple == 2.0
+    assert p.intraday_require_trend is True
+    assert p.intraday_ema_length == 200
+    assert p.intraday_rel_vol_threshold == 1.2
+
+
+def test_trading_mode_reset_clears_cache(isolated_home, monkeypatch):
+    """reset_trading_mode_cache must force re-detection from env/marker."""
+    import market_profiles
+    monkeypatch.setenv("TRADING_MODE", "INTRADAY")
+    market_profiles.reset_trading_mode_cache()
+    assert market_profiles.active_trading_mode() == "INTRADAY"
+    # Swap env and reset cache — must pick up new value
+    monkeypatch.setenv("TRADING_MODE", "SWING")
+    market_profiles.reset_trading_mode_cache()
+    assert market_profiles.active_trading_mode() == "SWING"

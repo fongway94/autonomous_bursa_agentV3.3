@@ -61,32 +61,37 @@ _LEGACY_DB_PATH = os.path.join(DATA_DIR, "bursa_agent.db")
 
 
 def _resolve_db_path() -> str:
-    """Active DB path, dispatched on market_profiles.active_market_code().
+    """Active DB path, dispatched on (market_code, trading_mode).
+
+    v3.7: The DB file splits on BOTH the active market AND the active
+    trading mode. SWING and INTRADAY have separate brains and must never
+    cross-contaminate their Bayesian priors.
+
+    Paths:
+        ~/.bursa_agent_data/bursa_agent_MY_SWING.db
+        ~/.bursa_agent_data/bursa_agent_MY_INTRADAY.db
+        ~/.bursa_agent_data/bursa_agent_US_SWING.db      (live today)
+        ~/.bursa_agent_data/bursa_agent_US_INTRADAY.db   (live today)
 
     v3.6 back-compat: if a caller (typically a v3.3 test) has monkey-patched
-    `db.DB_PATH` to a custom path that DOESN'T match the auto-derived
-    per-market path of any known market, honour it. This lets old tests
-    using `monkeypatch.setattr(db, 'DB_PATH', tmp.db)` keep working.
-
-    Override detection is by BASENAME, not full path. A genuine test override
-    uses a foreign filename (e.g. `fake.db`, `test.db`, `restored.db`). An
-    *auto-computed* value always has the basename `bursa_agent_<CODE>.db`
-    (or the legacy `bursa_agent.db`). We must treat any auto-pattern basename
-    as "not an override" even when its directory differs — otherwise a stale
-    DB_PATH captured at first import (e.g. against the real $HOME before a
-    test fixture redirected HOME, or left over after importlib.reload) would
-    be mistaken for a deliberate override and silently win, pointing the
-    whole process at the wrong data dir / market.
+    `db.DB_PATH` to a custom path that DOESN'T match any auto-derived path,
+    honour it. Override detection is by BASENAME — foreign filenames
+    (e.g. `fake.db`, `test.db`, `restored.db`) are always real overrides;
+    auto-computed basenames (always `bursa_agent_<CODE>_<MODE>.db` or the
+    legacy `bursa_agent.db`) are never overrides.
     """
     overridden = globals().get("DB_PATH")
     try:
-        from market_profiles import active_market_code, available_markets
+        from market_profiles import active_market_code, active_trading_mode, available_markets
         code = active_market_code()
-        real = os.path.join(DATA_DIR, f"bursa_agent_{code}.db")
+        mode = active_trading_mode()
+        real = os.path.join(DATA_DIR, f"bursa_agent_{code}_{mode}.db")
         # Basenames that are auto-computed (never a deliberate override),
         # regardless of which directory they live in.
         auto_basenames = {
-            f"bursa_agent_{c}.db" for c in available_markets()
+            f"bursa_agent_{c}_{m}.db"
+            for c in available_markets()
+            for m in ("SWING", "INTRADAY")
         }
         auto_basenames.add(os.path.basename(_LEGACY_DB_PATH))  # bursa_agent.db
     except Exception:
@@ -98,12 +103,16 @@ def _resolve_db_path() -> str:
 
 
 def _migrate_legacy_db_if_needed() -> None:
-    """One-shot rename of legacy `bursa_agent.db` → `bursa_agent_MY.db`.
+    """One-shot rename of legacy `bursa_agent.db` → `bursa_agent_MY_SWING.db`.
+
+    The legacy file was the single-DB era (v3.3–v3.5). Today every market
+    has two DB files (SWING + INTRADAY). The legacy MY data becomes MY_SWING
+    so existing deployments migrate cleanly.
 
     Only runs if:
       * legacy file exists
       * active market is MY
-      * no `bursa_agent_MY.db` yet
+      * no `bursa_agent_MY_SWING.db` yet
     Otherwise a no-op.
     """
     try:
@@ -112,7 +121,7 @@ def _migrate_legacy_db_if_needed() -> None:
             return
     except Exception:
         return
-    target = os.path.join(DATA_DIR, "bursa_agent_MY.db")
+    target = os.path.join(DATA_DIR, "bursa_agent_MY_SWING.db")
     if os.path.exists(_LEGACY_DB_PATH) and not os.path.exists(target):
         try:
             os.rename(_LEGACY_DB_PATH, target)
@@ -155,6 +164,30 @@ def _lock_for_path(path: str) -> threading.RLock:
             _WRITE_LOCKS_BY_PATH[path] = lock
         return lock
 
+
+# v3.7: migrate any v3.6-era per-market DB (without trading mode suffix)
+    # to the SWING variant. E.g. bursa_agent_MY.db → bursa_agent_MY_SWING.db
+    try:
+        from market_profiles import active_market_code, active_trading_mode
+        code = active_market_code()
+        mode = active_trading_mode()
+        legacy_per_market = os.path.join(DATA_DIR, f"bursa_agent_{code}.db")
+        target = os.path.join(DATA_DIR, f"bursa_agent_{code}_{mode}.db")
+        if os.path.exists(legacy_per_market) and not os.path.exists(target):
+            try:
+                os.rename(legacy_per_market, target)
+                for suffix in ("-wal", "-shm"):
+                    src = legacy_per_market + suffix
+                    dst = target + suffix
+                    if os.path.exists(src) and not os.path.exists(dst):
+                        try:
+                            os.rename(src, dst)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 # Backward-compat: expose a `_WRITE_LOCK` that resolves to the active DB's
 # lock. Some test fixtures import it directly.

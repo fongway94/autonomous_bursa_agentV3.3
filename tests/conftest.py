@@ -61,39 +61,55 @@ def _isolate_data_dir():
 
 @pytest.fixture(autouse=True)
 def _reset_market_cache_between_tests():
-    """v3.6: reset the cached MarketProfile + clear any cross-test leakage.
+    """v3.6/v3.7: reset the cached MarketProfile + trading mode + clear any cross-test leakage.
 
-    Tests that set MARKET_MODE env var or write the marker file MUST not
-    leak state into the next test. We:
-        1. Snapshot the env var on entry, restore on exit
-        2. Reset the profile cache before and after
-        3. Delete the marker file so it doesn't outlive the test
+    Tests that set MARKET_MODE or TRADING_MODE env vars or write marker files
+    MUST not leak state into the next test. We:
+        1. Snapshot both env vars on entry, restore on exit
+        2. Reset both profile caches before and after
+        3. Delete both marker files so they don't outlive the test
     """
     import os
-    saved_env = os.environ.get("MARKET_MODE")
+    saved_market = os.environ.get("MARKET_MODE")
+    saved_mode   = os.environ.get("TRADING_MODE")
     try:
         import market_profiles
         market_profiles.reset_cache()
-        # Wipe any leftover marker file from previous tests
+        market_profiles.reset_trading_mode_cache()
         try:
             if market_profiles._MARKER_FILE.exists():
                 market_profiles._MARKER_FILE.unlink()
         except Exception:
             pass
+        try:
+            if market_profiles._TRADING_MODE_FILE.exists():
+                market_profiles._TRADING_MODE_FILE.unlink()
+        except Exception:
+            pass
     except Exception:
         pass
     yield
-    # Restore MARKET_MODE
-    if saved_env is None:
+    # Restore both env vars
+    if saved_market is None:
         os.environ.pop("MARKET_MODE", None)
     else:
-        os.environ["MARKET_MODE"] = saved_env
+        os.environ["MARKET_MODE"] = saved_market
+    if saved_mode is None:
+        os.environ.pop("TRADING_MODE", None)
+    else:
+        os.environ["TRADING_MODE"] = saved_mode
     try:
         import market_profiles
         market_profiles.reset_cache()
+        market_profiles.reset_trading_mode_cache()
         try:
             if market_profiles._MARKER_FILE.exists():
                 market_profiles._MARKER_FILE.unlink()
+        except Exception:
+            pass
+        try:
+            if market_profiles._TRADING_MODE_FILE.exists():
+                market_profiles._TRADING_MODE_FILE.unlink()
         except Exception:
             pass
     except Exception:
@@ -195,35 +211,41 @@ def _reset_one_db():
 
 @pytest.fixture(autouse=True)
 def _reset_db_between_tests():
-    """v3.6: reset ALL per-market DBs (MY + US) before each test.
+    """v3.7: reset ALL (market, mode) DBs before each test.
 
-    Tests that flip MARKET_MODE=US would otherwise leave stale data in
-    bursa_agent_US.db that leaks into the next test using US mode.
-
-    We iterate every market, temporarily activate it, init_db() and
-    _reset_one_db(), then restore the original MARKET_MODE so the test
-    starts on whichever market it expects.
+    Tests that flip MARKET_MODE or TRADING_MODE would otherwise leave stale
+    data in the previous DB that leaks into the next test. We iterate every
+    market × trading mode combination, temporarily activate it, init_db() and
+    _reset_one_db(), then restore the original settings so each test starts
+    clean.
     """
     import os as _os
     from db import init_db
     from market_profiles import available_markets, reset_cache as _reset_mp
 
-    saved_env = _os.environ.get("MARKET_MODE")
+    saved_market = _os.environ.get("MARKET_MODE")
+    saved_mode   = _os.environ.get("TRADING_MODE")
     for code in available_markets():
-        _os.environ["MARKET_MODE"] = code
-        _reset_mp()
-        try:
-            init_db()
-        except Exception:
-            pass
-        try:
-            _reset_one_db()
-        except Exception:
-            pass
+        for mode in ("SWING", "INTRADAY"):
+            _os.environ["MARKET_MODE"] = code
+            _os.environ["TRADING_MODE"] = mode
+            _reset_mp()
+            try:
+                init_db()
+            except Exception:
+                pass
+            try:
+                _reset_one_db()
+            except Exception:
+                pass
 
-    # Restore env so the test's own MARKET_MODE setup wins
-    if saved_env is None:
+    # Restore env so the test's own MARKET_MODE/TRADING_MODE setup wins
+    if saved_market is None:
         _os.environ.pop("MARKET_MODE", None)
     else:
-        _os.environ["MARKET_MODE"] = saved_env
+        _os.environ["MARKET_MODE"] = saved_market
+    if saved_mode is None:
+        _os.environ.pop("TRADING_MODE", None)
+    else:
+        _os.environ["TRADING_MODE"] = saved_mode
     _reset_mp()

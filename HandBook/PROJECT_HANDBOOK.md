@@ -1138,4 +1138,177 @@ sqlite3 ~/.bursa_agent_data/bursa_agent.db \
 
 ---
 
+---
+
+## 15. Intraday Architecture (v3.7)
+
+v3.7 adds a second trading mode — **INTRADAY** — running alongside the existing
+SWING mode. Both modes share the same repo, the same scheduler process, and the
+same data layer, but use completely separate brains, DBs, screeners, and engines.
+
+### 15.1 Why intraday, and why US-only
+
+Moomoo OpenAPI serves real-time 5-minute bars for US tickers from a locally-running
+OpenD desktop instance. Bursa (MY) has no intraday feed via OpenAPI — MY stays
+SWING-only until that changes. The `supports_intraday` flag in each market
+profile is the single gate: flip `US_PROFILE.supports_intraday` to `False` or
+`MY_PROFILE.supports_intraday` to `True` and everything adjusts automatically.
+
+### 15.2 Strategy — Opening Range Breakout (ORB)
+
+Validated over 360 days of real Moomoo OpenD 5m data (June 2025–May 2026).
+
+**Setup:**
+1. Opening Range (OR) = high/low of the first **15 minutes** of the US session
+   (09:30–09:45 ET = 6 five-minute bars).
+2. After 09:45, scan each 5m bar. A LONG entry fires on the FIRST bar where ALL of:
+   - close > OR_high (breakout)
+   - session relative volume ≥ 1.2× average (volume confirms)
+   - close > session VWAP (trend-aligned price)
+   - prior daily close > daily EMA-200 (macro trend filter — the critical one)
+3. Stop = OR_low (structural invalidation).
+4. Target = entry + 2.0 × OR_range (TP2, the primary target; TP1 at 1.5×, TP3 at 2.5×).
+5. Force-flat at **15:55 ET** — every position is closed regardless. No overnight risk.
+6. One trade per ticker per session.
+
+**Locked parameters (from round-4 360-day validation):**
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| Universe | TNA, GOOGL, TQQQ, MSTR, SOXL, PLTR (curated-6) | Structural losers (FNGU, MARA, IBIT, NVDA…) dilute edge to break-even when included |
+| OR minutes | 15 | Round-2 winner; stable across 10/20 min neighbors |
+| Target | 2.0R | Round-4 best; stable from 1.5R to 3.0R |
+| Rel-vol threshold | 1.2× | Baseline |
+| VWAP support | Required | Cheap insurance; barely changes results alone |
+| EMA length | 200 (daily) | The critical filter — EMA-50 and EMA-100 produce identical results to no filter on the full universe |
+| Direction | Longs only | Shorts hurt in all tested regimes |
+| Flat-by | 15:55 ET | Hard invariant |
+| Cycle interval | 300 s (5 min) | Matches bar size |
+| Explorer target | 100 trades | ~3-4 weeks of intraday paper trading before EXPLOIT mode |
+
+**Honest edge summary:**
+- +0.090R expectancy (just under +0.10R threshold; realistic post-slippage: ~+0.07R)
+- 52% win rate, 83% monthly hit rate (10/12 months positive)
+- Max consecutive losers: 8 (on the survivability line)
+- The **universe curation does the heavy lifting**, not the EMA length
+
+### 15.3 Validation history
+
+| Round | Data | Verdict |
+|---|---|---|
+| 1 (yfinance, 60d) | Full-23 universe, longs-only, no trend filter | ⚠️ Marginal: +0.04–0.07R |
+| 2 (yfinance, 60d) | EMA-50 trend filter + bull-20 universe | ✅ +0.110R, 51% win, 8 max CL |
+| 3 (yfinance, 60d walk-forward) | Edge decays from +0.25R → +0.075R, fragile | ⚠️ |
+| 4 (Moomoo OpenD, 360d) | Full-20 universe, all EMA lengths | ❌ +0.012R, 50% monthly hit |
+| 4b (Moomoo OpenD, 360d) | EMA-200 + curated-6 | ✅ +0.090R, 83% monthly hit, 3/4 pass |
+
+### 15.4 Mode resolution and DB isolation
+
+Active trading mode priority (first match wins):
+1. Env var `TRADING_MODE` (SWING or INTRADAY)
+2. Marker file `~/.bursa_agent_data/.trading_mode`
+3. Default = SWING
+
+Each (market, mode) pair has its own SQLite file:
+
+```
+~/.bursa_agent_data/
+├── .trading_mode                        # marker: "SWING" or "INTRADAY"
+├── bursa_agent_MY_SWING.db             # MY daily brain + trades
+├── bursa_agent_MY_INTRADAY.db          # MY intraday (empty until MY gets intraday)
+├── bursa_agent_US_SWING.db             # US daily brain + trades
+└── bursa_agent_US_INTRADAY.db          # US intraday brain + trades  ← live today
+```
+
+**Cross-contamination is impossible by design.** Intraday outcomes can never
+pollute swing Bayesian priors (different reward horizon, different state space).
+
+### 15.5 Module map — intraday-specific files
+
+| Module | Purpose |
+|---|---|
+| `intraday_screener.py` | Pure-function ORB scanner. Outputs the same signal dict shape as `screener.screen_all_stocks()` + `source: "INTRADAY"`. Reuses VWAP/rel-vol/OR functions from `intraday_backtest.py`. |
+| `intraday_engine.py` | `execute_intraday_entry()`, `auto_settle_intraday()`, `force_flat_all_intraday()`, `intraday_session_status()` (5 states), `get_active_intraday_tickers()`. |
+| `intraday_backtest.py` | Standalone ORB simulator (research only — not imported by live runtime). |
+| `intraday_backtest_v2.py` | Round-2 tuning: EMA trend filter + short ORB option. |
+| `intraday_backtest_v3.py` | Round-4 parameter grid sweep (EMA-100/200, curated-6, 1.5/2.0R). |
+| `validate_intraday_edge.py` | OpenD-backed multi-year edge validator (read-only, local-only). |
+| `ui_mode_helpers.py` | Pure UI helper functions for mode-aware rendering. |
+
+### 15.6 Scheduler dispatch
+
+`scheduler._loop()` checks `_is_intraday_mode()` at the top of each iteration:
+
+```
+SWING path (default):  hourly, unchanged from v3.6
+INTRADAY path:         5-min cadence, US RTH only
+  ├── OR_WINDOW (09:30–09:45 ET):     scan, build OR, no entries yet
+  ├── ACTIVE_TRADING (09:45–15:55 ET): scan + settle + auto-entry
+  ├── FORCE_FLAT_WINDOW (15:55–16:00): close ALL open intraday positions
+  └── PRE/POSTMARKET:                  idle (log SKIP, wait 5 min)
+```
+
+**Local-only enforcement:** if `data_provider.health()["moomoo_available"]` is
+`False` (Streamlit Cloud, or PC with OpenD offline), the intraday cycle logs
+`INTRADAY_UNAVAILABLE` and refuses to open new entries. It will still settle
+and force-flat any positions that were opened while OpenD was connected.
+
+### 15.7 The force-flat invariant
+
+**Every intraday position MUST be closed by 15:55 ET. No overnight risk. Ever.**
+
+This is enforced at three levels:
+1. `intraday_engine.force_flat_all_intraday()` — closes every `AGENT_INTRADAY`
+   trade at the current market price regardless of P&L.
+2. `scheduler._run_intraday_cycle()` — calls force-flat when
+   `intraday_session_status()["should_force_flat"]` is True.
+3. `tests/test_intraday_engine.py` — dedicated `test_force_flat_closes_all_open`
+   test guards the invariant at the unit level.
+
+### 15.8 Signal grading and execution
+
+| Grade | Condition |
+|---|---|
+| GOLD BUY (ORB) | All filters pass: OR breakout + rel-vol ≥ 1.2× + VWAP support + EMA-200 UP |
+| SILVER BUY (ORB) | Most filters pass, one minor weakness |
+| No signal | No breakout OR any major filter blocks |
+
+The signal dict is identical to the swing screener shape (same keys, `source: "INTRADAY"`).
+The trading engine, learner, and UI consume both without code changes.
+
+Position sizing uses the same 1%-risk logic as swing, adapted for intraday:
+`shares = floor((capital × risk_pct) / risk_per_share)` where
+`risk_per_share = entry_price − OR_low`. Lot size = 1 (US).
+
+### 15.9 Exploration and learning
+
+Intraday trades feed the **same Bayesian Beta(α,β) learner** as swing, but
+into the **separate** `bursa_agent_US_INTRADAY.db` brain. The explorer target
+is set to **100 trades** (vs 50 for swing) because intraday accumulates samples
+faster (~5-6 trades/day at full cadence) and the intraday state space is
+different enough that convergence needs more data.
+
+At 100 closed intraday trades (~3-4 weeks of US RTH paper trading), the agent
+auto-switches from Thompson sampling (EXPLORE) to lower-confidence-bound (EXPLOIT).
+
+### 15.10 Running intraday research scripts locally
+
+These scripts require a local PC with Moomoo OpenD running on `127.0.0.1:11111`:
+
+```bash
+# Run the ORB backtest on the default US watchlist (60 days, yfinance)
+python intraday_backtest.py
+
+# Run the 360-day OpenD-backed edge validator
+python validate_intraday_edge.py
+
+# Re-run the parameter grid sweep (EMA-100/200, curated-6, 1.5/2.0R)
+python intraday_backtest_v3.py | Tee-Object -FilePath v3_report.txt
+```
+
+See `HandBook/orb_backtest_results.md` for the full round-1 through round-4
+results and the honest caveats about edge concentration.
+
+---
+
 **This handbook supersedes any verbal description of how the system works. When in doubt, read here first.**

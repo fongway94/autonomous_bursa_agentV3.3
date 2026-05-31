@@ -124,6 +124,18 @@ class MarketProfile(Protocol):
     neutral_max_positions: int
     bear_max_positions: int
 
+    # --- v3.7 intraday (see PROJECT_HANDBOOK §15) ---
+    # Intraday support is US-only today. MY flips `supports_intraday=True`
+    # the day Moomoo OpenAPI adds Bursa coverage.
+    supports_intraday: bool            # True = this market can run intraday mode
+    intraday_interval: str             # "5m" — candle size for intraday scanning
+    intraday_flat_by: dtime            # hard exit time (market-local), e.g. 15:55 ET
+    intraday_cycle_sec: int            # scheduler tick rate for intraday mode, e.g. 300 (5 min)
+    intraday_target_r_multiple: float  # ORB target, e.g. 2.0R
+    intraday_require_trend: bool       # require daily close > EMA for longs
+    intraday_ema_length: int           # EMA length for the daily trend filter
+    intraday_rel_vol_threshold: float  # breakout-bar volume vs session-avg, e.g. 1.2
+
 
 # ---------------------------------------------------------------------------
 # Helper functions usable by every profile
@@ -244,4 +256,3 @@ __all__ = [
     "format_time_with_user_local",
     "USER_LOCAL_TZ",
 ]
-

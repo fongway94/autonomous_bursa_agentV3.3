@@ -32,6 +32,12 @@ from watchlist import (
 from screener import (
     screen_all_stocks, fetch_and_calculate, get_recent_5day_analysis,
 )
+from intraday_screener import (
+    screen_intraday, DEFAULT_INTRADAY_WATCHLIST, INTRADAY_EXPLORER_TARGET,
+)
+from intraday_engine import (
+    execute_intraday_entry, intraday_position_size, intraday_session_status,
+)
 from repository import (
     load_account, save_account, reset_account,
     load_parameters, save_parameters,
@@ -60,10 +66,24 @@ from logger import (
     get_parameter_history, get_bias_history, get_data_quality_log,
 )
 from evaluation import full_evaluation_report
-from data_provider import health as data_provider_health, reset as data_provider_reset, provider_name
+from data_provider import (
+    health as data_provider_health,
+    reset as data_provider_reset,
+    provider_name,
+    ensure_probed as data_provider_ensure_probed,
+    get_history as data_provider_get_history,
+)
 import scheduler as sched
 
 from db import get_myt_now
+from ui_mode_helpers import (
+    available_trading_modes_for_profile,
+    trading_mode_label,
+    effective_scheduler_interval_sec,
+    intraday_unavailable_message,
+    mode_specific_scanner_columns,
+    intraday_settings_rows,
+)
 
 # =========================================================================
 # CONFIG
@@ -205,10 +225,20 @@ if "ml_classifier_checked" not in st.session_state:
         pass
     st.session_state["ml_classifier_checked"] = True
 
-# v3: call ensure_started on EVERY rerun — it's now self-healing
-# (will force-restart if the heartbeat is stale).
+# v3.7: call ensure_started on EVERY rerun using the currently-selected
+# trading mode's cadence. SWING stays hourly; INTRADAY runs every 5 min.
 try:
-    sched.ensure_started(interval_sec=3600)
+    from market_profiles import active_profile as _boot_active_profile
+    from market_profiles import active_trading_mode as _boot_active_mode
+    _boot_profile = _boot_active_profile()
+    _boot_mode = _boot_active_mode()
+    _boot_interval_sec = effective_scheduler_interval_sec(
+        supports_intraday=bool(getattr(_boot_profile, "supports_intraday", False)),
+        trading_mode=_boot_mode,
+        swing_cycle_sec=int(getattr(_boot_profile, "cycle_interval_sec", 3600)),
+        intraday_cycle_sec=int(getattr(_boot_profile, "intraday_cycle_sec", 300)),
+    )
+    sched.ensure_started(interval_sec=_boot_interval_sec)
 except Exception as e:
     st.warning(f"Scheduler did not start: {e}")
 
@@ -231,23 +261,39 @@ if "log_deduped" not in st.session_state:
 # =========================================================================
 
 with st.sidebar:
-    # v3.6 Block 7 — Multi-market switcher.
-    # The active market governs which DB file is used, the watchlist,
-    # the trading calendar/timezone, the currency, lot size, fees,
-    # and whether SIMULATE/REAL execution modes are even available.
+    # v3.7 — Multi-market + trading-mode switcher.
+    # Market chooses the active DB family (MY/US). Trading mode chooses the
+    # active brain inside that family (SWING/INTRADAY).
     from market_profiles import (
         active_profile as _active_profile_fn,
         active_market_code as _active_code_fn,
         set_active_market as _set_market_fn,
         available_markets as _avail_markets_fn,
+        active_trading_mode as _active_mode_fn,
+        set_trading_mode as _set_mode_fn,
     )
     _current_profile = _active_profile_fn()
     _current_market = _current_profile.code
+    _current_mode = _active_mode_fn()
     _ccy = _current_profile.currency_symbol  # "RM" or "$"
+
+    # Safety net: if the marker/env says INTRADAY on an unsupported market,
+    # collapse back to SWING immediately.
+    if _current_mode == "INTRADAY" and not getattr(_current_profile, "supports_intraday", False):
+        _set_mode_fn("SWING", persist=True)
+        st.info("Intraday is not available for the active market. Reverting to SWING…")
+        st.rerun()
+
+    _effective_interval_sec = effective_scheduler_interval_sec(
+        supports_intraday=bool(getattr(_current_profile, "supports_intraday", False)),
+        trading_mode=_current_mode,
+        swing_cycle_sec=int(getattr(_current_profile, "cycle_interval_sec", 3600)),
+        intraday_cycle_sec=int(getattr(_current_profile, "intraday_cycle_sec", 300)),
+    )
 
     st.markdown(f"## 🚀 {_current_profile.flag_emoji} BursaAI Agent")
     st.caption(
-        f"{_current_profile.display_name} · Paper Trading · v3.6 multi-market"
+        f"{_current_profile.display_name} · {_current_mode} mode · Paper Trading · v3.7"
     )
 
     # Market switcher
@@ -271,6 +317,35 @@ with st.sidebar:
     if new_market != _current_market:
         _set_market_fn(new_market, persist=True)
         st.success(f"Market switched to {new_market}. Reloading…")
+        st.rerun()
+
+    _mode_options = available_trading_modes_for_profile(
+        bool(getattr(_current_profile, "supports_intraday", False))
+    )
+    new_mode = st.selectbox(
+        "🧭 Trading Mode",
+        options=_mode_options,
+        index=_mode_options.index(_current_mode),
+        format_func=trading_mode_label,
+        help=(
+            "SWING = hourly scanner + daily holding period. "
+            "INTRADAY = 5-minute ORB engine, separate DB and separate brain."
+        ),
+    )
+    if new_mode != _current_mode:
+        _set_mode_fn(new_mode, persist=True)
+        _new_interval_sec = effective_scheduler_interval_sec(
+            supports_intraday=bool(getattr(_current_profile, "supports_intraday", False)),
+            trading_mode=new_mode,
+            swing_cycle_sec=int(getattr(_current_profile, "cycle_interval_sec", 3600)),
+            intraday_cycle_sec=int(getattr(_current_profile, "intraday_cycle_sec", 300)),
+        )
+        update_scheduler_state(interval_sec=_new_interval_sec)
+        try:
+            sched.force_restart(_new_interval_sec)
+        except Exception:
+            pass
+        st.success(f"Trading mode switched to {new_mode}. Reloading…")
         st.rerun()
 
     # v3.6 hotfix: ensure the active market's DB has schema + seed rows
@@ -330,8 +405,10 @@ with st.sidebar:
             <span class="v">{ss.get('next_run_at') or '—'}</span></div>
           <div class="kvp"><span class="k">Heartbeat</span>
             <span class="v">{ss.get('last_heartbeat') or '—'}</span></div>
+          <div class="kvp"><span class="k">Trading mode</span>
+            <span class="v">{_current_mode}</span></div>
           <div class="kvp"><span class="k">Interval</span>
-            <span class="v">{ss.get('interval_sec', 3600)//60} min</span></div>
+            <span class="v">{_effective_interval_sec//60} min</span></div>
           <div class="kvp"><span class="k">Auto-exit</span>
             <span class="v">{'ON' if ss.get('autoexit_enabled') else 'OFF'}</span></div>
           <div class="kvp"><span class="k">Auto-entry</span>
@@ -379,6 +456,26 @@ with st.sidebar:
         # broker_adapter not importable — non-fatal, just skip the badge
         pass
 
+    # v3.7: Intraday availability banner.
+    try:
+        data_provider_ensure_probed()
+        _dp_sidebar = data_provider_health()
+        _intraday_msg = intraday_unavailable_message(
+            market_code=_current_market,
+            supports_intraday=bool(getattr(_current_profile, "supports_intraday", False)),
+            moomoo_available=bool(_dp_sidebar.get("moomoo_available")),
+        )
+        if _current_mode == "INTRADAY":
+            if _intraday_msg:
+                st.warning(_intraday_msg)
+            else:
+                st.success(
+                    f"Intraday ready: curated-6 ORB · {_effective_interval_sec//60}-min cadence · "
+                    f"force-flat {getattr(_current_profile, 'intraday_flat_by', '15:55')}"
+                )
+    except Exception:
+        pass
+
     # v3.1.9: Persist the Start button result in session_state so the
     # warning survives the immediate st.rerun() and is visible to the user.
     if "_scheduler_start_result" in st.session_state:
@@ -390,7 +487,7 @@ with st.sidebar:
 
     if not running:
         if st.button("♻️ Start Robo-Trader", use_container_width=True):
-            ok = sched.start(interval_sec=int(ss.get("interval_sec", 3600)))
+            ok = sched.start(interval_sec=int(_effective_interval_sec))
             if ok:
                 st.session_state["_scheduler_start_result"] = {
                     "ok": True, "msg": "Robo-Trader started."}
@@ -435,10 +532,14 @@ with st.sidebar:
 # Tabs
 # =========================================================================
 
+_scanner_tab_label = "⚡ Intraday Scanner" if _current_mode == "INTRADAY" else "🔍 Scanner"
+_robo_tab_label = "⚡ Intraday Robo-Trader" if _current_mode == "INTRADAY" else "🤖 Robo-Trader"
+_settings_tab_label = "⚙️ Settings"
+
 tab_scanner, tab_portfolio, tab_learning, tab_perf, tab_robo, tab_logs, tab_alerts, tab_settings = st.tabs(
-    ["🔍 Scanner", "💼 Portfolio", "🧠 AI Learning",
-     "📊 Performance", "🤖 Robo-Trader", "📜 Logs",
-     "🔔 Live Alerts", "⚙️ Settings"]
+    [_scanner_tab_label, "💼 Portfolio", "🧠 AI Learning",
+     "📊 Performance", _robo_tab_label, "📜 Logs",
+     "🔔 Live Alerts", _settings_tab_label]
 )
 
 # ---------------------------------------------------------------------------
@@ -490,11 +591,28 @@ except Exception as _e:
 # TAB 1 — Scanner
 # =========================================================================
 with tab_scanner:
+    _ui_is_intraday = (_current_mode == "INTRADAY")
     c1, c2 = st.columns([1, 4])
-    run_scan = c1.button("🔥 SCAN MARKET", type="primary",
-                          use_container_width=True)
-    c2.caption("Background agent scans hourly during market hours. "
-               "Manual scan overrides the schedule.")
+    run_scan = c1.button(
+        "⚡ SCAN INTRADAY" if _ui_is_intraday else "🔥 SCAN MARKET",
+        type="primary",
+        use_container_width=True,
+    )
+    c2.caption(
+        "Background agent scans every 5 minutes during US RTH. "
+        "Manual scan uses the validated curated-6 ORB universe."
+        if _ui_is_intraday else
+        "Background agent scans hourly during market hours. "
+        "Manual scan overrides the schedule."
+    )
+
+    data_provider_ensure_probed()
+    _scanner_dp_health = data_provider_health()
+    _intraday_ui_warning = intraday_unavailable_message(
+        market_code=_current_market,
+        supports_intraday=bool(getattr(_current_profile, "supports_intraday", False)),
+        moomoo_available=bool(_scanner_dp_health.get("moomoo_available")),
+    )
 
     if "screener_df" not in st.session_state:
         cached_records, cached_regime, cached_ts = load_scan_cache()
@@ -504,38 +622,94 @@ with tab_scanner:
         if cached_ts:
             st.caption(f"📦 Loaded cached scan from {cached_ts}")
 
+    if _ui_is_intraday and _intraday_ui_warning:
+        st.warning(_intraday_ui_warning)
+
     if run_scan:
-        with st.spinner("Scanning Bursa Malaysia…"):
-            prog = st.progress(0.0)
-            mr = get_full_market_analysis(force_refresh=True)
-            df = screen_all_stocks(progress_callback=prog.progress, market_regime=mr)
-            prog.empty()
-        st.session_state["screener_df"] = df
-        st.session_state["market_regime"] = mr
-        if not df.empty:
-            save_scan_cache(df.to_dict("records"), mr)
-        st.rerun()
+        if _ui_is_intraday:
+            if _intraday_ui_warning:
+                st.warning(_intraday_ui_warning)
+            else:
+                with st.spinner("Scanning US intraday ORB watchlist…"):
+                    sigs = screen_intraday(DEFAULT_INTRADAY_WATCHLIST)
+                    df = pd.DataFrame(sigs) if sigs else pd.DataFrame()
+                    mr = {
+                        "regime_data": {"regime": "INTRADAY"},
+                        "guidance": intraday_session_status().get("message", "Intraday mode"),
+                        "session_status": intraday_session_status(),
+                    }
+                st.session_state["screener_df"] = df
+                st.session_state["market_regime"] = mr
+                save_scan_cache(df.to_dict("records") if not df.empty else [], mr)
+                st.rerun()
+        else:
+            with st.spinner(f"Scanning {_current_profile.display_name}…"):
+                prog = st.progress(0.0)
+                mr = get_full_market_analysis(force_refresh=True)
+                df = screen_all_stocks(progress_callback=prog.progress, market_regime=mr)
+                prog.empty()
+            st.session_state["screener_df"] = df
+            st.session_state["market_regime"] = mr
+            if not df.empty:
+                save_scan_cache(df.to_dict("records"), mr)
+            st.rerun()
 
     mr = st.session_state.get("market_regime", {}) or {}
-    regime = mr.get("regime_data", {}).get("regime", "NEUTRAL")
-    icons = {"BULL": "🐂", "NEUTRAL": "⚖️", "BEAR": "🐻", "UNCERTAIN": "❓"}
-    colors = {"BULL": "var(--good)", "NEUTRAL": "var(--warn)",
-              "BEAR": "var(--bad)", "UNCERTAIN": "var(--text-soft)"}
-    st.markdown(
-        f"""
-        <div class="bursa-card" style="border-left:5px solid {colors.get(regime,'gray')};">
-            <span style="font-size:1.6rem;">{icons.get(regime,'⚖️')}</span>
-            <strong style="font-size:1.05rem; color:{colors.get(regime,'gray')};">
-                {regime}</strong>
-            <span style="margin-left:8px; color:var(--text-soft);">
-                {mr.get('guidance','Market data unavailable.')}</span>
-        </div>
-        """, unsafe_allow_html=True,
-    )
+    if _ui_is_intraday:
+        _sess = intraday_session_status()
+        _state = _sess.get("state", "UNKNOWN")
+        _state_colors = {
+            "PREMARKET": "var(--text-soft)",
+            "OR_WINDOW": "var(--warn)",
+            "ACTIVE_TRADING": "var(--good)",
+            "FORCE_FLAT_WINDOW": "var(--bad)",
+            "POSTMARKET": "var(--text-soft)",
+        }
+        _provider_txt = "Moomoo OpenD ✅" if _scanner_dp_health.get("moomoo_available") else "yfinance fallback ⚠️"
+        st.markdown(
+            f"""
+            <div class="bursa-card" style="border-left:5px solid {_state_colors.get(_state, 'gray')};">
+                <span style="font-size:1.6rem;">⚡</span>
+                <strong style="font-size:1.05rem; color:{_state_colors.get(_state, 'gray')};">
+                    {_state}</strong>
+                <span style="margin-left:8px; color:var(--text-soft);">
+                    {_sess.get('message', 'Intraday session state unavailable.')}
+                </span>
+                <div class="kvp"><span class="k">Watchlist</span>
+                    <span class="v">{len(DEFAULT_INTRADAY_WATCHLIST)} ticker(s)</span></div>
+                <div class="kvp"><span class="k">Strategy</span>
+                    <span class="v">15m ORB · EMA-200 · VWAP · rel-vol 1.2×</span></div>
+                <div class="kvp"><span class="k">Data source</span>
+                    <span class="v">{_provider_txt}</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        regime = mr.get("regime_data", {}).get("regime", "NEUTRAL")
+        icons = {"BULL": "🐂", "NEUTRAL": "⚖️", "BEAR": "🐻", "UNCERTAIN": "❓"}
+        colors = {"BULL": "var(--good)", "NEUTRAL": "var(--warn)",
+                  "BEAR": "var(--bad)", "UNCERTAIN": "var(--text-soft)"}
+        st.markdown(
+            f"""
+            <div class="bursa-card" style="border-left:5px solid {colors.get(regime,'gray')};">
+                <span style="font-size:1.6rem;">{icons.get(regime,'⚖️')}</span>
+                <strong style="font-size:1.05rem; color:{colors.get(regime,'gray')};">
+                    {regime}</strong>
+                <span style="margin-left:8px; color:var(--text-soft);">
+                    {mr.get('guidance','Market data unavailable.')}
+                </span>
+            </div>
+            """, unsafe_allow_html=True,
+        )
 
     df = st.session_state.get("screener_df")
     if df is None or df.empty:
-        st.info("No scan results yet — click **SCAN MARKET** above.")
+        st.info(
+            "No intraday signals yet — click **SCAN INTRADAY** above."
+            if _ui_is_intraday else
+            "No scan results yet — click **SCAN MARKET** above."
+        )
     else:
         signal_filter = st.multiselect(
             "Filter signals",
@@ -544,10 +718,7 @@ with tab_scanner:
         )
         view = df[df["signal"].isin(signal_filter)] if signal_filter else df
 
-        display_cols = ["ticker", "name", "sector", "signal", "confidence",
-                        "price", "change_pct", "vol_ratio", "rsi",
-                        "entry", "stop_loss", "tp1", "tp2", "tp3",
-                        "risk_pct", "rs_signal"]
+        display_cols = mode_specific_scanner_columns(_current_mode)
         st.dataframe(view[display_cols], use_container_width=True,
                      hide_index=True, height=400)
 
@@ -562,161 +733,246 @@ with tab_scanner:
         if sel:
             row = view[view["ticker"] == sel].iloc[0].to_dict()
             params_p = load_parameters()
-            _, df_ind = fetch_and_calculate(sel, params_p)
+            df_ind = None
+            if _ui_is_intraday:
+                try:
+                    df_ind = data_provider_get_history(
+                        sel, interval="5m", period="5d", timeout=30,
+                    )
+                except Exception:
+                    df_ind = None
+            else:
+                _, df_ind = fetch_and_calculate(sel, params_p)
+
             is_buy = "GOLD BUY" in row.get("signal", "")
             is_sell = "SELL" in row.get("signal", "")
+            ind = row.get("indicators") or {}
 
             col_a, col_b = st.columns([1, 1])
             with col_a:
                 badge_class = ("bursa-card-good" if is_buy
                                else "bursa-card-bad" if is_sell
                                else "bursa-card-info")
-                st.markdown(
-                    f"""
-                    <div class="bursa-card {badge_class}">
-                      <div style="font-weight:700; font-size:1.1rem;">
-                        {row['ticker']} · {row['signal']}</div>
-                      <div class="kvp"><span class="k">Confidence</span>
-                          <span class="v">{row['confidence']:.0f}/100</span></div>
-                      <div class="kvp"><span class="k">Price</span>
-                          <span class="v">{_ccy} {row['price']:.3f}
-                          ({row['change_pct']:+.2f}%)</span></div>
-                      <div class="kvp"><span class="k">Entry</span>
-                          <span class="v">{_ccy} {row['entry']:.3f}</span></div>
-                      <div class="kvp"><span class="k">Stop Loss</span>
-                          <span class="v">{_ccy} {row['stop_loss']:.3f}
-                          ({row['risk_pct']:.1f}% risk)</span></div>
-                      <div class="kvp"><span class="k">TP1 / TP2 / TP3</span>
-                          <span class="v">{_ccy} {row['tp1']:.3f} ·
-                          {row['tp2']:.3f} · {row['tp3']:.3f}</span></div>
-                      <div class="kvp"><span class="k">RSI / Vol×</span>
-                          <span class="v">{row['rsi']:.1f} ·
-                          {row['vol_ratio']:.2f}×</span></div>
-                    </div>
-                    """, unsafe_allow_html=True,
-                )
+                if _ui_is_intraday:
+                    st.markdown(
+                        f"""
+                        <div class="bursa-card {badge_class}">
+                          <div style="font-weight:700; font-size:1.1rem;">
+                            {row['ticker']} · {row['signal']}</div>
+                          <div class="kvp"><span class="k">Confidence</span>
+                              <span class="v">{row['confidence']:.0f}/100</span></div>
+                          <div class="kvp"><span class="k">Entry</span>
+                              <span class="v">{_ccy} {row['entry']:.3f}</span></div>
+                          <div class="kvp"><span class="k">Stop Loss</span>
+                              <span class="v">{_ccy} {row['stop_loss']:.3f}
+                              ({row['risk_pct']:.1f}% risk)</span></div>
+                          <div class="kvp"><span class="k">TP1 / TP2 / TP3</span>
+                              <span class="v">{_ccy} {row['tp1']:.3f} ·
+                              {row['tp2']:.3f} · {row['tp3']:.3f}</span></div>
+                          <div class="kvp"><span class="k">VWAP / Rel-vol</span>
+                              <span class="v">{ind.get('vwap', '—')} ·
+                              {row.get('vol_ratio', 0):.2f}×</span></div>
+                          <div class="kvp"><span class="k">OR High / Low</span>
+                              <span class="v">{ind.get('or_high', '—')} /
+                              {ind.get('or_low', '—')}</span></div>
+                          <div class="kvp"><span class="k">Trend</span>
+                              <span class="v">EMA-200 {ind.get('ema_trend_direction', '—')}</span></div>
+                          <div class="kvp"><span class="k">Force-flat</span>
+                              <span class="v">15:55 ET</span></div>
+                        </div>
+                        """, unsafe_allow_html=True,
+                    )
 
-                if is_buy:
-                    risk_per_share = max(row["entry"] - row["stop_loss"], 0.001)
-                    suggested_shares = round_to_lot(int(risk_amount / risk_per_share))
-                    shares = st.number_input(
-                        "Shares (multiples of 100)",
-                        min_value=LOT_SIZE, max_value=1_000_000,
-                        value=max(suggested_shares, LOT_SIZE),
-                        step=LOT_SIZE,
+                    acc_now = load_account()
+                    est_shares = intraday_position_size(
+                        row["entry"], row["stop_loss"],
+                        capital=acc_now.get("total_equity", acc_now.get("cash_balance", 5000.0)),
+                        risk_pct=risk_pct,
                     )
-                    shares = round_to_lot(int(shares))
-                    cost_info = calculate_trade_cost(shares, row["entry"])
-                    actual_risk = risk_per_share * shares
+                    est_cost = calculate_trade_cost(max(est_shares, 1), row["entry"])
+                    est_risk = max(row["entry"] - row["stop_loss"], 0.001) * max(est_shares, 1)
                     st.caption(
-                        f"Outlay ≈ {_ccy} {cost_info['gross']:,.0f} "
-                        f"+ fee {_ccy} {cost_info['fee']:.2f} "
-                        f"| Risk {_ccy} {actual_risk:,.0f}"
+                        f"Estimated size ≈ {est_shares} share(s) | "
+                        f"Outlay ≈ {_ccy} {est_cost['gross']:,.0f} | "
+                        f"Risk ≈ {_ccy} {est_risk:,.0f}"
                     )
-                    if st.button("✅ EXECUTE BUY ORDER",
+                    if st.button("✅ EXECUTE INTRADAY ORDER",
                                  use_container_width=True, type="primary"):
-                        acc_now = load_account()
                         trades_now = load_trades()
                         rc = run_full_risk_check(
                             trades_now,
                             {"ticker": sel, "sector": row["sector"],
                              "entry": row["entry"], "stop_loss": row["stop_loss"],
-                             "cost": cost_info["gross"],
-                             "risk_amount": actual_risk},
+                             "cost": est_cost["gross"],
+                             "risk_amount": est_risk},
                             acc_now["cash_balance"], acc_now["initial_capital"],
                         )
                         if rc["pass"]:
-                            sized = int(round_to_lot(int(shares * rc["size_multiplier"])))
-                            if sized < LOT_SIZE:
-                                st.error("Risk check reduced size below 100-share lot.")
+                            ok, tid, msg = execute_intraday_entry(
+                                row, actor="USER", risk_pct=risk_pct,
+                            )
+                            if ok:
+                                st.success(f"Trade #{tid}: {msg}")
+                                st.rerun()
                             else:
-                                ok, tid, msg = execute_entry(
-                                    sel, row["name"], row["sector"],
-                                    row["entry"], row["stop_loss"],
-                                    row["tp1"], row["tp2"], row["tp3"],
-                                    row["signal"], sized,
-                                    {"reasoning": row.get("reasoning",""),
-                                     "rsi": row.get("rsi"),
-                                     "vol_ratio": row.get("vol_ratio"),
-                                     "atr": row.get("atr"),
-                                     "support": row.get("support"),
-                                     "resistance": row.get("resistance"),
-                                     "macd_hist": row.get("macd_hist"),
-                                     "ema_trend": row.get("ema_trend", row["entry"])},
-                                    mr, row["confidence"], execution_type="MANUAL",
-                                    actor="USER",
-                                )
-                                if ok:
-                                    st.success(f"Trade #{tid}: {msg}")
-                                    st.rerun()
-                                else:
-                                    st.error(msg)
+                                st.error(msg)
                         else:
                             st.error(rc["final_verdict"])
+                else:
+                    st.markdown(
+                        f"""
+                        <div class="bursa-card {badge_class}">
+                          <div style="font-weight:700; font-size:1.1rem;">
+                            {row['ticker']} · {row['signal']}</div>
+                          <div class="kvp"><span class="k">Confidence</span>
+                              <span class="v">{row['confidence']:.0f}/100</span></div>
+                          <div class="kvp"><span class="k">Price</span>
+                              <span class="v">{_ccy} {row['price']:.3f}
+                              ({row['change_pct']:+.2f}%)</span></div>
+                          <div class="kvp"><span class="k">Entry</span>
+                              <span class="v">{_ccy} {row['entry']:.3f}</span></div>
+                          <div class="kvp"><span class="k">Stop Loss</span>
+                              <span class="v">{_ccy} {row['stop_loss']:.3f}
+                              ({row['risk_pct']:.1f}% risk)</span></div>
+                          <div class="kvp"><span class="k">TP1 / TP2 / TP3</span>
+                              <span class="v">{_ccy} {row['tp1']:.3f} ·
+                              {row['tp2']:.3f} · {row['tp3']:.3f}</span></div>
+                          <div class="kvp"><span class="k">RSI / Vol×</span>
+                              <span class="v">{row['rsi']:.1f} ·
+                              {row['vol_ratio']:.2f}×</span></div>
+                        </div>
+                        """, unsafe_allow_html=True,
+                    )
 
-                elif is_sell:
-                    active_for_t = [t for t in active_trades()
-                                    if t["ticker"] == sel]
-                    if active_for_t:
-                        tid = active_for_t[0]["id"]
-                        if st.button(f"🔒 Close {sel} as WIN",
-                                     use_container_width=True):
-                            ok, msg = execute_full_exit(
-                                tid, row["price"], reason="Sell signal",
-                                outcome="WIN", actor="USER")
-                            if ok:
-                                t = get_trade(tid)
-                                if t:
-                                    learn_from_trade_outcome(t)
-                                st.success(msg); st.rerun()
-                        if st.button(f"🔒 Close {sel} as LOSS",
-                                     use_container_width=True):
-                            ok, msg = execute_full_exit(
-                                tid, row["price"], reason="Sell signal",
-                                outcome="LOSS", actor="USER")
-                            if ok:
-                                t = get_trade(tid)
-                                if t:
-                                    learn_from_trade_outcome(t)
-                                st.error(msg); st.rerun()
-                    else:
-                        st.caption("No active position for this ticker.")
+                    if is_buy:
+                        risk_per_share = max(row["entry"] - row["stop_loss"], 0.001)
+                        suggested_shares = round_to_lot(int(risk_amount / risk_per_share))
+                        shares = st.number_input(
+                            "Shares (multiples of 100)",
+                            min_value=LOT_SIZE, max_value=1_000_000,
+                            value=max(suggested_shares, LOT_SIZE),
+                            step=LOT_SIZE,
+                        )
+                        shares = round_to_lot(int(shares))
+                        cost_info = calculate_trade_cost(shares, row["entry"])
+                        actual_risk = risk_per_share * shares
+                        st.caption(
+                            f"Outlay ≈ {_ccy} {cost_info['gross']:,.0f} "
+                            f"+ fee {_ccy} {cost_info['fee']:.2f} "
+                            f"| Risk {_ccy} {actual_risk:,.0f}"
+                        )
+                        if st.button("✅ EXECUTE BUY ORDER",
+                                     use_container_width=True, type="primary"):
+                            acc_now = load_account()
+                            trades_now = load_trades()
+                            rc = run_full_risk_check(
+                                trades_now,
+                                {"ticker": sel, "sector": row["sector"],
+                                 "entry": row["entry"], "stop_loss": row["stop_loss"],
+                                 "cost": cost_info["gross"],
+                                 "risk_amount": actual_risk},
+                                acc_now["cash_balance"], acc_now["initial_capital"],
+                            )
+                            if rc["pass"]:
+                                sized = int(round_to_lot(int(shares * rc["size_multiplier"])))
+                                if sized < LOT_SIZE:
+                                    st.error("Risk check reduced size below 100-share lot.")
+                                else:
+                                    ok, tid, msg = execute_entry(
+                                        sel, row["name"], row["sector"],
+                                        row["entry"], row["stop_loss"],
+                                        row["tp1"], row["tp2"], row["tp3"],
+                                        row["signal"], sized,
+                                        {"reasoning": row.get("reasoning",""),
+                                         "rsi": row.get("rsi"),
+                                         "vol_ratio": row.get("vol_ratio"),
+                                         "atr": row.get("atr"),
+                                         "support": row.get("support"),
+                                         "resistance": row.get("resistance"),
+                                         "macd_hist": row.get("macd_hist"),
+                                         "ema_trend": row.get("ema_trend", row["entry"])},
+                                        mr, row["confidence"], execution_type="MANUAL",
+                                        actor="USER",
+                                    )
+                                    if ok:
+                                        st.success(f"Trade #{tid}: {msg}")
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+                            else:
+                                st.error(rc["final_verdict"])
+
+                    elif is_sell:
+                        active_for_t = [t for t in active_trades()
+                                        if t["ticker"] == sel]
+                        if active_for_t:
+                            tid = active_for_t[0]["id"]
+                            if st.button(f"🔒 Close {sel} as WIN",
+                                         use_container_width=True):
+                                ok, msg = execute_full_exit(
+                                    tid, row["price"], reason="Sell signal",
+                                    outcome="WIN", actor="USER")
+                                if ok:
+                                    t = get_trade(tid)
+                                    if t:
+                                        learn_from_trade_outcome(t)
+                                    st.success(msg); st.rerun()
+                            if st.button(f"🔒 Close {sel} as LOSS",
+                                         use_container_width=True):
+                                ok, msg = execute_full_exit(
+                                    tid, row["price"], reason="Sell signal",
+                                    outcome="LOSS", actor="USER")
+                                if ok:
+                                    t = get_trade(tid)
+                                    if t:
+                                        learn_from_trade_outcome(t)
+                                    st.error(msg); st.rerun()
+                        else:
+                            st.caption("No active position for this ticker.")
 
             with col_b:
-                st.markdown("**🧠 AI Reasoning**")
-                st.info(row.get("reasoning", "—"))
-                if row.get("q_reasoning"):
-                    st.caption(f"🤖 Bayesian brain: {row['q_reasoning']}")
-                if df_ind is not None and not df_ind.empty:
-                    hist5 = get_recent_5day_analysis(df_ind, params_p)
-                    if hist5:
-                        st.markdown("**📅 5-Day Tape**")
-                        st.dataframe(pd.DataFrame(hist5),
-                                     hide_index=True, use_container_width=True)
+                if _ui_is_intraday:
+                    st.markdown("**⚡ Intraday ORB Reasoning**")
+                    st.info(row.get("reasoning", "—"))
+                    _rows = [
+                        {"Field": "Entry timestamp", "Value": ind.get("entry_timestamp", "—")},
+                        {"Field": "VWAP", "Value": ind.get("vwap", "—")},
+                        {"Field": "Relative volume", "Value": row.get("vol_ratio", "—")},
+                        {"Field": "OR range", "Value": ind.get("or_range", "—")},
+                        {"Field": "Trend direction", "Value": ind.get("ema_trend_direction", "—")},
+                        {"Field": "Force-flat", "Value": "15:55 ET"},
+                    ]
+                    st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+                    st.caption(
+                        "Mode-specific DB isolation applies here: intraday entries and outcomes go to the "
+                        "US_INTRADAY brain, never the swing brain."
+                    )
+                else:
+                    st.markdown("**🧠 AI Reasoning**")
+                    st.info(row.get("reasoning", "—"))
+                    if row.get("q_reasoning"):
+                        st.caption(f"🤖 Bayesian brain: {row['q_reasoning']}")
+                    if df_ind is not None and not df_ind.empty:
+                        hist5 = get_recent_5day_analysis(df_ind, params_p)
+                        if hist5:
+                            st.markdown("**📅 5-Day Tape**")
+                            st.dataframe(pd.DataFrame(hist5),
+                                         hide_index=True, use_container_width=True)
 
             # Chart
             if df_ind is not None and not df_ind.empty:
-                st.markdown("**📈 Chart (90 days)**")
-                d = df_ind.tail(90)
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                    vertical_spacing=0.05,
-                                    row_heights=[0.72, 0.28])
-                fig.add_trace(go.Candlestick(
-                    x=d.index, open=d["Open"], high=d["High"],
-                    low=d["Low"], close=d["Close"], name="Price",
-                    increasing_line_color="#16a34a",
-                    decreasing_line_color="#dc2626",
-                ), row=1, col=1)
-                for nm, col, c, w in [
-                    ("EMA-Trend", "EMA_Trend", "#1f6feb", 2),
-                    ("EMA-Slow", "EMA_Slow", "#d97706", 1.5),
-                    ("EMA-Fast", "EMA_Fast", "#16a34a", 1.5),
-                ]:
-                    if col in d.columns:
-                        fig.add_trace(go.Scatter(x=d.index, y=d[col],
-                                                 line=dict(color=c, width=w),
-                                                 name=nm), row=1, col=1)
-                if is_buy:
+                if _ui_is_intraday:
+                    st.markdown("**📈 Intraday 5m Chart (last 5 days)**")
+                    d = df_ind.tail(120)
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                        vertical_spacing=0.05,
+                                        row_heights=[0.72, 0.28])
+                    fig.add_trace(go.Candlestick(
+                        x=d.index, open=d["Open"], high=d["High"],
+                        low=d["Low"], close=d["Close"], name="Price",
+                        increasing_line_color="#16a34a",
+                        decreasing_line_color="#dc2626",
+                    ), row=1, col=1)
                     for y, c, dash, lbl in [
                         (row["entry"], "#16a34a", "dash", "Entry"),
                         (row["stop_loss"], "#dc2626", "dot", "SL"),
@@ -726,14 +982,58 @@ with tab_scanner:
                     ]:
                         fig.add_hline(y=y, line_dash=dash, line_color=c,
                                       annotation_text=lbl, row=1, col=1)
-                bar_colors = ["#16a34a" if d["Close"].iloc[i] >= d["Open"].iloc[i]
-                              else "#dc2626" for i in range(len(d))]
-                fig.add_trace(go.Bar(x=d.index, y=d["Volume"],
-                                     marker_color=bar_colors, name="Vol"),
-                              row=2, col=1)
-                fig.update_layout(height=520, xaxis_rangeslider_visible=False,
-                                  showlegend=True, **PLOTLY_LAYOUT)
-                st.plotly_chart(fig, use_container_width=True)
+                    if ind.get("or_high") is not None and ind.get("or_low") is not None:
+                        fig.add_hline(y=float(ind["or_high"]), line_dash="dot", line_color="#1f6feb",
+                                      annotation_text="OR High", row=1, col=1)
+                        fig.add_hline(y=float(ind["or_low"]), line_dash="dot", line_color="#d97706",
+                                      annotation_text="OR Low", row=1, col=1)
+                    bar_colors = ["#16a34a" if d["Close"].iloc[i] >= d["Open"].iloc[i]
+                                  else "#dc2626" for i in range(len(d))]
+                    fig.add_trace(go.Bar(x=d.index, y=d["Volume"],
+                                         marker_color=bar_colors, name="Vol"),
+                                  row=2, col=1)
+                    fig.update_layout(height=520, xaxis_rangeslider_visible=False,
+                                      showlegend=True, **PLOTLY_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.markdown("**📈 Chart (90 days)**")
+                    d = df_ind.tail(90)
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                        vertical_spacing=0.05,
+                                        row_heights=[0.72, 0.28])
+                    fig.add_trace(go.Candlestick(
+                        x=d.index, open=d["Open"], high=d["High"],
+                        low=d["Low"], close=d["Close"], name="Price",
+                        increasing_line_color="#16a34a",
+                        decreasing_line_color="#dc2626",
+                    ), row=1, col=1)
+                    for nm, col, c, w in [
+                        ("EMA-Trend", "EMA_Trend", "#1f6feb", 2),
+                        ("EMA-Slow", "EMA_Slow", "#d97706", 1.5),
+                        ("EMA-Fast", "EMA_Fast", "#16a34a", 1.5),
+                    ]:
+                        if col in d.columns:
+                            fig.add_trace(go.Scatter(x=d.index, y=d[col],
+                                                     line=dict(color=c, width=w),
+                                                     name=nm), row=1, col=1)
+                    if is_buy:
+                        for y, c, dash, lbl in [
+                            (row["entry"], "#16a34a", "dash", "Entry"),
+                            (row["stop_loss"], "#dc2626", "dot", "SL"),
+                            (row["tp1"], "#16a34a", "longdash", "TP1"),
+                            (row["tp2"], "#9333ea", "longdash", "TP2"),
+                            (row["tp3"], "#0891b2", "longdash", "TP3"),
+                        ]:
+                            fig.add_hline(y=y, line_dash=dash, line_color=c,
+                                          annotation_text=lbl, row=1, col=1)
+                    bar_colors = ["#16a34a" if d["Close"].iloc[i] >= d["Open"].iloc[i]
+                                  else "#dc2626" for i in range(len(d))]
+                    fig.add_trace(go.Bar(x=d.index, y=d["Volume"],
+                                         marker_color=bar_colors, name="Vol"),
+                                  row=2, col=1)
+                    fig.update_layout(height=520, xaxis_rangeslider_visible=False,
+                                      showlegend=True, **PLOTLY_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
 
 
 # =========================================================================
@@ -1069,6 +1369,18 @@ with tab_robo:
     st.markdown("## 🤖 Robo-Trader Control Centre")
     ss = get_scheduler_state()
     running = sched.is_running()
+    _robo_is_intraday = (_current_mode == "INTRADAY")
+    _robo_interval_sec = effective_scheduler_interval_sec(
+        supports_intraday=bool(getattr(_current_profile, "supports_intraday", False)),
+        trading_mode=_current_mode,
+        swing_cycle_sec=int(getattr(_current_profile, "cycle_interval_sec", 3600)),
+        intraday_cycle_sec=int(getattr(_current_profile, "intraday_cycle_sec", 300)),
+    )
+
+    st.caption(
+        f"Current context: {_current_profile.flag_emoji} {_current_profile.display_name} · "
+        f"{_current_mode} mode · DB isolated by ({_current_market}, {_current_mode})."
+    )
 
     a, b, c = st.columns(3)
     a.metric("Status", "🟢 RUNNING" if running else "🔴 STOPPED")
@@ -1076,7 +1388,27 @@ with tab_robo:
     b.metric("Last Run", ss.get("last_run_at") or "never")
     b.caption(f"Failures (recent): {ss.get('consecutive_failures', 0)}")
     c.metric("Next Run", ss.get("next_run_at") or "—")
-    c.caption(f"Interval: {ss.get('interval_sec', 3600)//60} min")
+    c.caption(f"Interval: {_robo_interval_sec//60} min")
+
+    if _robo_is_intraday:
+        _sess = intraday_session_status()
+        data_provider_ensure_probed()
+        _dp_h = data_provider_health()
+        _msg = intraday_unavailable_message(
+            market_code=_current_market,
+            supports_intraday=bool(getattr(_current_profile, "supports_intraday", False)),
+            moomoo_available=bool(_dp_h.get("moomoo_available")),
+        )
+        if _msg:
+            st.warning(_msg)
+        else:
+            st.info(
+                f"Intraday session: {_sess.get('state', 'UNKNOWN')} · {_sess.get('message', '')}"
+            )
+        st.caption(
+            f"Validated strategy: curated-6 ORB · 15m opening range · EMA-200 trend · "
+            f"VWAP support · rel-vol 1.2× · explorer target {INTRADAY_EXPLORER_TARGET} trades."
+        )
 
     if ss.get("last_error"):
         st.error(f"Last error: `{ss['last_error'][:400]}`")
@@ -1179,7 +1511,7 @@ with tab_robo:
     # v3.1.9: honest feedback when start() returns False (zombie thread dying)
     if not running:
         if cc[0].button("▶️ Start", use_container_width=True, type="primary"):
-            ok = sched.start(int(ss.get("interval_sec", 3600)))
+            ok = sched.start(int(_robo_interval_sec))
             if ok:
                 st.success("Started.")
             else:
@@ -1192,7 +1524,7 @@ with tab_robo:
         if cc[0].button("🛑 Stop", use_container_width=True):
             sched.stop(); st.warning("Stopped."); st.rerun()
     if cc[1].button("♻️ Force Restart", use_container_width=True):
-        sched.force_restart(int(ss.get("interval_sec", 3600)))
+        sched.force_restart(int(_robo_interval_sec))
         st.success("Restarted."); st.rerun()
     if cc[2].button("⚡ Run Cycle Now", use_container_width=True):
         with st.spinner("Running cycle…"):
@@ -1208,34 +1540,45 @@ with tab_robo:
     cc2 = st.columns(3)
     cur_autoexit = bool(ss.get("autoexit_enabled", 1))
     cur_autotrade = bool(ss.get("autotrade_enabled", 1))   # v3: default ON
-    new_autoexit = cc2[0].checkbox("Auto-settle SL/TP/Trailing/Time exits",
-                                    cur_autoexit)
-    new_autotrade = cc2[1].checkbox("Auto-execute new GOLD BUY entries",
-                                     cur_autotrade)
-    new_interval_min = cc2[2].selectbox(
-        "Cycle interval",
-        [15, 30, 60, 120],
-        index=[15, 30, 60, 120].index(
-            max(15, min(120, ss.get("interval_sec", 3600) // 60))) if
-        ss.get("interval_sec", 3600) // 60 in [15, 30, 60, 120] else 2,
+    new_autoexit = cc2[0].checkbox(
+        "Auto-settle SL/TP/Trailing/Time exits" if not _robo_is_intraday else "Auto-settle intraday exits",
+        cur_autoexit,
     )
+    new_autotrade = cc2[1].checkbox(
+        "Auto-execute new GOLD BUY entries" if not _robo_is_intraday else "Auto-execute new ORB entries",
+        cur_autotrade,
+    )
+    if _robo_is_intraday:
+        cc2[2].metric("Cycle interval", f"{_robo_interval_sec//60} min")
+        cc2[2].caption("Locked by intraday mode")
+        new_interval_min = _robo_interval_sec // 60
+    else:
+        new_interval_min = cc2[2].selectbox(
+            "Cycle interval",
+            [15, 30, 60, 120],
+            index=[15, 30, 60, 120].index(
+                max(15, min(120, ss.get("interval_sec", 3600) // 60))) if
+            ss.get("interval_sec", 3600) // 60 in [15, 30, 60, 120] else 2,
+        )
     if (new_autoexit != cur_autoexit
             or new_autotrade != cur_autotrade
-            or new_interval_min * 60 != ss.get("interval_sec", 3600)):
+            or (not _robo_is_intraday and new_interval_min * 60 != ss.get("interval_sec", 3600))):
         if st.button("💾 Save Robo-Trader settings", type="primary"):
+            _save_interval_sec = int(_robo_interval_sec if _robo_is_intraday else new_interval_min * 60)
             update_scheduler_state(
                 autoexit_enabled=int(new_autoexit),
                 autotrade_enabled=int(new_autotrade),
-                interval_sec=int(new_interval_min * 60),
+                interval_sec=_save_interval_sec,
             )
-            sched.force_restart(int(new_interval_min * 60))
+            sched.force_restart(_save_interval_sec)
             st.success("Saved + restarted."); st.rerun()
 
     # ---- v3: Exploration-mode controls ----
     st.markdown("### 🧪 Learning Mode")
     from repository import closed_trades as _ct
     done = len(_ct())
-    target = int(ss.get("exploration_trades_target", 50) or 50)
+    _default_explore_target = INTRADAY_EXPLORER_TARGET if _robo_is_intraday else 50
+    target = int(ss.get("exploration_trades_target", _default_explore_target) or _default_explore_target)
     in_explore = bool(ss.get("exploration_mode", 1))
     if in_explore:
         st.info(
@@ -1264,8 +1607,15 @@ with tab_robo:
         st.rerun()
 
     st.markdown("### Trading-Time Window")
-    tw = check_trading_time_window()
-    st.info(f"Window: {tw['window']} — {tw['reason']}")
+    if _robo_is_intraday:
+        _sess = intraday_session_status()
+        st.info(
+            f"Session state: {_sess['state']} — {_sess['message']} "
+            f"(force-flat at 15:55 ET)."
+        )
+    else:
+        tw = check_trading_time_window()
+        st.info(f"Window: {tw['window']} — {tw['reason']}")
 
     st.markdown("### Recent Scheduler Log (50)")
     sl = get_scheduler_log(limit=50)
@@ -1580,8 +1930,25 @@ with tab_alerts:
 # =========================================================================
 with tab_settings:
     st.markdown("## ⚙️ Settings")
+    st.caption(
+        f"Current context: {_current_profile.flag_emoji} {_current_profile.display_name} · {_current_mode} mode. "
+        "All settings and data panels below are isolated to the active market/mode DB."
+    )
+
+    if _current_mode == "INTRADAY":
+        st.markdown("### ⚡ Intraday Mode Defaults (validated, read-only)")
+        _rows = pd.DataFrame(intraday_settings_rows(DEFAULT_INTRADAY_WATCHLIST), columns=["Setting", "Value"])
+        st.dataframe(_rows, hide_index=True, use_container_width=True)
+        st.caption(
+            "The intraday defaults were locked in from the round-4 OpenD validation. "
+            "If you want to widen the universe or retune OR/target/rel-vol, rerun the backtest scripts first."
+        )
 
     st.markdown("### Scanner Parameters")
+    if _current_mode == "INTRADAY":
+        st.info(
+            "These parameters govern the SWING scanner only. Intraday uses its own locked ORB settings shown above."
+        )
     p = load_parameters()
     c1, c2, c3 = st.columns(3)
     ema_trend = c1.number_input("EMA Trend",
@@ -1894,6 +2261,19 @@ with tab_settings:
                 cc.execute("DELETE FROM scan_cache")
             reset_account(new_cap)
             st.warning("All trades cleared."); st.rerun()
+
+    if _current_mode == "INTRADAY":
+        st.markdown("### 🧪 Intraday Research Tools")
+        st.code(
+            "python intraday_backtest.py\n"
+            "python validate_intraday_edge.py\n"
+            "python intraday_backtest_v3.py",
+            language="bash",
+        )
+        st.caption(
+            "Use these local scripts on the PC that has Moomoo OpenD. "
+            "`intraday_backtest.py` is the base harness, `validate_intraday_edge.py` does the 360-day OpenD validation, and `intraday_backtest_v3.py` reruns the stricter parameter grid."
+        )
 
     # -----------------------------------------------------------------
     # Data Source (read-only diagnostic — added in v3.4)
