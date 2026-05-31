@@ -6,7 +6,146 @@ Complete changelog from v1 through the current release.
 
 ---
 
-## v3.6 (current)
+## v3.7 (current) — Intraday Mode
+
+**Focus:** Add a second trading mode — **INTRADAY** — as a 5-minute Opening
+Range Breakout (ORB) engine for US markets, running alongside the existing
+SWING daily engine. Branch: `feat/intraday`.
+
+### Why
+
+The SWING engine can only observe Bursa and US on hourly candles, missing
+intraday momentum setups. Moomoo OpenD provides real-time 5m US data locally.
+The ORB strategy has a validated edge on a curated-6 US universe over 360 days
+of real data (+0.090R expectancy, 83% monthly hit rate).
+
+### Strategy (locked parameters from round-4 360-day validation)
+
+| Parameter | Value |
+|---|---|
+| Universe | TNA, GOOGL, TQQQ, MSTR, SOXL, PLTR (curated-6) |
+| OR window | 15 minutes |
+| Target | 2.0R |
+| Rel-vol | 1.2× session average |
+| VWAP support | Required |
+| Trend filter | Daily EMA-200 (prior close > EMA = longs only) |
+| Force-flat | 15:55 ET — no overnight risk |
+| Cycle | 5 minutes |
+| Explorer target | 100 trades |
+
+Honest caveat: +0.090R expectancy, just under the +0.10R threshold. Edge is
+concentrated in the curated-6 universe and the EMA-200 filter. Use
+**explorer-only mode** for the first 100 intraday trades before exploiting.
+
+### Changes by block
+
+**Block 1 — `data_provider.py` interval support (+12 tests):**
+- Added `interval=` parameter to `get_history()` (default `"1d"` = byte-identical)
+- Helpers: `_INTRADAY_INTERVALS`, `_is_intraday()`, `_moomoo_ktype_for_interval()`
+- Intraday-aware `_resolve_window()` (caps look-back to yfinance limits)
+- `_fetch_moomoo` and `_fetch_yfinance` both respect the interval arg
+- 5m data via Moomoo OpenD when connected, yfinance fallback (≤60 days)
+
+**Backtest harness (+27 tests):**
+- `intraday_backtest.py` — pure ORB simulator: VWAP, rel-vol, opening range,
+  R-multiple math, `backtest_ticker()`, `run_backtest()`, `format_text_report()`
+- `intraday_backtest_v2.py` — round-2 tuning: EMA-50 trend filter + short ORB
+- `intraday_backtest_v3.py` — round-4 parameter grid (EMA-100/200, curated-6, 1.5/2.0R)
+- `validate_intraday_edge.py` — OpenD-backed multi-year validator (read-only)
+- `HandBook/orb_backtest_results.md` — full 4-round write-up with honest caveats
+
+**Block 2 — Trading mode resolver + per-(market,mode) DB split (+9 tests):**
+- `market_profiles/base.py`: extended `MarketProfile` Protocol with 8 intraday fields
+  (`supports_intraday`, `intraday_interval`, `intraday_flat_by`, `intraday_cycle_sec`,
+  `intraday_target_r_multiple`, `intraday_require_trend`, `intraday_ema_length`,
+  `intraday_rel_vol_threshold`)
+- `market_profiles/my_profile.py`: `supports_intraday=False`
+- `market_profiles/us_profile.py`: `supports_intraday=True` + all locked intraday params
+- `market_profiles/__init__.py`: `active_trading_mode()`, `set_trading_mode()`,
+  `is_intraday()`, `reset_trading_mode_cache()`, `.trading_mode` marker file support
+- `db.py`: `_resolve_db_path()` now splits on `(market, mode)` →
+  `bursa_agent_<CODE>_<MODE>.db`. Legacy v3.3 `bursa_agent.db` → `bursa_agent_MY_SWING.db`
+  migration. Legacy v3.6 `bursa_agent_<CODE>.db` → `bursa_agent_<CODE>_SWING.db` migration.
+- `tests/conftest.py`: reset `TRADING_MODE` env + trading mode cache between tests;
+  reset both SWING and INTRADAY DBs for every market
+
+**Block 3 — `intraday_screener.py` (+32 tests):**
+- ORB breakout scanner with pure functions (reuses from `intraday_backtest.py`)
+- Filters: OR breakout, VWAP support, relative volume, daily EMA-200 trend
+- Output: same signal dict shape as `screener.screen_all_stocks()` + `source: "INTRADAY"`
+- `DEFAULT_INTRADAY_WATCHLIST` = curated-6
+- `compute_intraday_signal()` — pure function, no I/O, fully testable
+- `screen_intraday()` — runner with data_provider fetch + per-ticker pure call
+
+**Block 4 — `intraday_engine.py` (+29 tests):**
+- `intraday_position_size()` — US lot=1, risk-pct based
+- `execute_intraday_entry()` — time guards, delegates to `trading_engine.execute_entry()`
+  with `execution_type="AGENT_INTRADAY"`
+- `auto_settle_intraday()` — TP3 → SL → TP2 partial → TP1 priority; no trailing stop
+- `force_flat_all_intraday()` — THE invariant: closes all `AGENT_INTRADAY` positions
+  at market price, logs each, raises if any remain
+- `get_active_intraday_tickers()` — for screener's `already_triggered` set
+- `intraday_session_status()` — 5 states: PREMARKET / OR_WINDOW / ACTIVE_TRADING /
+  FORCE_FLAT_WINDOW / POSTMARKET
+
+**Block 5 — `scheduler.py` intraday cycle path (+15 tests):**
+- `INTRADAY_CYCLE_SEC = 300` constant
+- `_is_intraday_mode()` — checks `market_profiles.is_intraday()` gracefully
+- `_build_intraday_bar_data()` — fetches latest 5m bar for active intraday tickers
+- `_run_intraday_cycle()` — dispatches on session state; OpenD-guard; force-flat at
+  15:55 ET; scan + settle + entry during ACTIVE_TRADING
+- `_loop()` modified: branches on `_is_intraday_mode()` at top of each iteration;
+  intraday sleeps 300s, swing sleeps `interval_sec`; daily maintenance runs for both
+- `run_once()` updated: dispatches on mode (`_run_intraday_cycle` vs `_run_one_cycle`)
+- **SWING path is byte-identical** — the else: branch is the exact v3.6 code
+
+**Block 6 — `app.py` + `ui_mode_helpers.py` (+10 tests):**
+- `ui_mode_helpers.py` — pure helper functions:
+  `available_trading_modes_for_profile()`, `trading_mode_label()`,
+  `effective_scheduler_interval_sec()`, `intraday_unavailable_message()`,
+  `mode_specific_scanner_columns()`, `intraday_settings_rows()`
+- Sidebar: Trading Mode switcher (SWING / INTRADAY); auto-reverts to SWING if
+  selected market doesn't support intraday; intraday availability banner
+- Scheduler boot: uses mode-correct cadence on every Streamlit rerun
+- Scanner tab: full mode-awareness (intraday scan, session state card, 5m chart,
+  intraday detail panel with VWAP/rel-vol/OR fields, execute intraday order button)
+- Robo-Trader tab: shows mode context, session state, fixed 5-min interval display
+- Settings tab: read-only intraday defaults panel; intraday research tools section
+
+**Block 7 — Tests + Docs (this version):**
+- Fixed 2 known full-suite-only `TestScreenIntraday` runner test failures (root cause:
+  stale `data_provider._moomoo_available` probe from prior tests; fix: swap
+  `data_provider` module reference inside `intraday_screener` during test)
+- **All 605 tests pass in one `pytest tests/` run — zero failures**
+- `HandBook/PROJECT_HANDBOOK.md` §15 — full intraday architecture documentation
+- `HandBook/REVISION_HISTORY.md` — this entry
+- `HandBook/AI_CHAT_HANDOFF.md` — updated to v3.7 complete state
+
+### Test count progression
+
+| Block | +Tests | Running Total |
+|---|---|---|
+| v3.6 baseline | — | 471 |
+| Block 1 | +12 | 483 |
+| Backtest harness | +27 | 510 |
+| Block 2 | +9 | 519 |
+| Block 3 | +32 | 551 |
+| Block 4 | +29 | 580 |
+| Block 5 | +15 | 595 |
+| Block 6 | +10 | 605 |
+| Block 7 (flaky fix) | 0 net new | **605 (0 failures)** |
+
+### Invariants added (v3.7)
+
+- **Force-flat:** every intraday position closed by 15:55 ET. Tested at unit level.
+- **Mode isolation:** intraday DB ≠ swing DB. `_resolve_db_path()` ensures no cross-contamination.
+- **Daily engine byte-identical:** TRADING_MODE=SWING → code path unchanged from v3.6.
+- **Local-only intraday:** on Streamlit Cloud (no OpenD), agent refuses new intraday entries.
+- **Curated-6 only:** adding structural losers destroys the edge (proven by 360-day backtest).
+
+---
+
+## v3.6
 
 **Focus:** Multi-market — the Bursa-only agent becomes a dual-market agent (🇲🇾 MY + 🇺🇸 US) on a single repo, with full Moomoo US execution. Branch: `feat/us-market`.
 
