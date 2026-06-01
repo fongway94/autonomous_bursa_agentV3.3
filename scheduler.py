@@ -465,14 +465,23 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
 
         risk_per_trade_rm = 0.01 * acc["initial_capital"]
 
+        # v3.7 fix: use profile lot size (MY=100, US=1) not hardcoded 100.
+        # Hardcoded 100 silently zeroed all US positions ($50 risk / $5 per share
+        # = 10 shares → 10//100*100 = 0) causing "Unknown reason for zero entries".
+        try:
+            from trading_engine import lot_size as _lot_size
+            _lot = _lot_size()
+        except Exception:
+            _lot = 100  # safe fallback for MY
+
         for _, row in gold_buys.iterrows():
             if row["ticker"] in active_tickers:
                 continue
             entry = row["entry"]; sl = row["stop_loss"]
             risk_per_share = max(entry - sl, 0.001)
             target_shares = int(risk_per_trade_rm / risk_per_share)
-            target_shares = (target_shares // 100) * 100
-            if target_shares < 100:
+            target_shares = (target_shares // _lot) * _lot
+            if target_shares < max(_lot, 1):
                 continue
             actual_cost = target_shares * entry
             risk_check = run_full_risk_check(
@@ -501,8 +510,8 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
                 "position_size_mult", 1.0)
             sized_shares = int(target_shares * risk_check["size_multiplier"]
                                * regime_size_mult)
-            sized_shares = (sized_shares // 100) * 100
-            if sized_shares < 100:
+            sized_shares = (sized_shares // _lot) * _lot
+            if sized_shares < max(_lot, 1):
                 continue
             try:
                 ok, tid, msg = execute_entry(
