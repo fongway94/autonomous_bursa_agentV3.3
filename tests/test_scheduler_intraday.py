@@ -338,3 +338,69 @@ class TestCadence:
     def test_intraday_cycle_sec_is_300(self):
         from scheduler import INTRADAY_CYCLE_SEC
         assert INTRADAY_CYCLE_SEC == 300
+
+
+# ---------------------------------------------------------------------------
+# Regression test: US SWING lot-size bug
+# "Unknown reason for zero entries" was caused by hardcoded // 100 rounding
+# zeroing all US share quantities (lot size=1, not 100).
+# ---------------------------------------------------------------------------
+
+class TestUSSwingLotSizeBug:
+    """Regression guard for the lot-size hardcoding bug.
+
+    Before fix: target_shares = (shares // 100) * 100
+      e.g. $50 risk / $5 risk_per_share = 10 shares
+      10 // 100 * 100 = 0 → silently skipped → "Unknown reason"
+
+    After fix: uses lot_size() from trading_engine (1 for US, 100 for MY)
+      10 // 1 * 1 = 10 → enters trade correctly
+    """
+
+    def test_us_lot_size_is_1(self, monkeypatch):
+        """trading_engine.lot_size() must return 1 for US market."""
+        import os
+        os.environ["MARKET_MODE"] = "US"
+        import market_profiles
+        market_profiles.reset_cache()
+        from trading_engine import lot_size
+        assert lot_size() == 1, (
+            "US lot size must be 1 — hardcoding 100 breaks US auto-entry"
+        )
+
+    def test_my_lot_size_is_100(self, monkeypatch):
+        """trading_engine.lot_size() must return 100 for MY market."""
+        import os
+        os.environ["MARKET_MODE"] = "MY"
+        import market_profiles
+        market_profiles.reset_cache()
+        from trading_engine import lot_size
+        assert lot_size() == 100
+
+    def test_us_shares_not_zeroed_by_lot_rounding(self, monkeypatch):
+        """10 shares rounded to US lot (1) must still be 10, not 0."""
+        import os
+        os.environ["MARKET_MODE"] = "US"
+        import market_profiles
+        market_profiles.reset_cache()
+        from trading_engine import lot_size
+        _lot = lot_size()
+        # Simulate: $50 risk / $5 risk_per_share = 10 shares
+        target_shares = 10
+        rounded = (target_shares // _lot) * _lot
+        assert rounded == 10, (
+            f"US: 10 shares should round to 10 with lot=1, got {rounded}. "
+            "Bug: hardcoded // 100 would give 0."
+        )
+
+    def test_my_shares_rounded_to_100(self, monkeypatch):
+        """137 shares rounded to MY lot (100) must be 100."""
+        import os
+        os.environ["MARKET_MODE"] = "MY"
+        import market_profiles
+        market_profiles.reset_cache()
+        from trading_engine import lot_size
+        _lot = lot_size()
+        target_shares = 137
+        rounded = (target_shares // _lot) * _lot
+        assert rounded == 100
