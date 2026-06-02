@@ -300,6 +300,18 @@ def execute_entry(ticker, name, sector, entry_price, stop_loss,
     except Exception:
         pass
 
+    # v3.7 fix: backup immediately on entry so open positions survive
+    # app restarts / Streamlit Cloud redeployments.
+    # Previously only closed trades triggered a backup — open trades
+    # were only saved on the hourly heartbeat and lost if the app was
+    # deleted/redeployed between heartbeats (as happened with NVIDIA).
+    try:
+        from persistence import backup as _pers_backup, is_configured
+        if is_configured():
+            _pers_backup(reason=f"entry trade #{trade_id} {ticker}")
+    except Exception:
+        pass
+
     # v3.6: real-broker mirror — fires only when broker_mode is SIMULATE/REAL.
     # NOOP returns immediately. Silent failure is OK; reconciliation will catch drift.
     try:
