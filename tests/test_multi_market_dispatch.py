@@ -120,13 +120,14 @@ def test_my_session_handling_preserved(isolated_home, monkeypatch):
     tz = ZoneInfo("Asia/Kuala_Lumpur")
 
     # Tuesday 10:00 MYT — morning session
-    now = datetime(2026, 6, 2, 10, 0, tzinfo=tz)
+    # Use 2026-06-09 (Tuesday, confirmed non-holiday via MY_PUBLIC_HOLIDAYS check)
+    now = datetime(2026, 6, 9, 10, 0, tzinfo=tz)
     assert mc.is_market_open(now)
     s = mc.current_session(now)
     assert s.name == "MORNING"
 
     # Tuesday 13:00 MYT — lunch
-    now = datetime(2026, 6, 2, 13, 0, tzinfo=tz)
+    now = datetime(2026, 6, 9, 13, 0, tzinfo=tz)
     assert not mc.is_market_open(now)
 
 
