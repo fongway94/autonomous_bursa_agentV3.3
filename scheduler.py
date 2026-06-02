@@ -456,6 +456,18 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
         active_tickers = {t["ticker"] for t in active}
         acc = load_account()
         cash = acc["cash_balance"]
+        # v3.7 fix: use total_equity (cash + market value of positions) for
+        # drawdown check, not cash_balance alone. Using cash_balance causes a
+        # false drawdown trigger when positions are open — cash drops by the
+        # position cost but equity is unchanged (cash + position value = same).
+        try:
+            _active_mv = sum(
+                float(t.get("entry_price", 0)) * int(t.get("shares_remaining", 0))
+                for t in active
+            )
+        except Exception:
+            _active_mv = 0.0
+        total_equity = cash + _active_mv
         threshold = regime.get("position_rules", {}).get("new_signal_threshold", 0.70) * 100
 
         gold_buys = df[df["signal"].astype(str).str.contains("GOLD BUY", regex=False)]
@@ -489,7 +501,7 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
                          "entry": entry, "stop_loss": sl,
                          "cost": actual_cost,
                          "risk_amount": risk_per_share * target_shares},
-                cash, acc["initial_capital"])
+                total_equity, acc["initial_capital"])
             if not risk_check["pass"]:
                 summary["rejected"] += 1
                 from logger import log_trade_event
