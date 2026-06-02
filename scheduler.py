@@ -1513,6 +1513,19 @@ def _run_intraday_cycle(autotrade: bool, autoexit: bool,
             trades = load_trades()
             cash = acc["cash_balance"]
             initial_capital = acc["initial_capital"]
+            # v3.7 fix: use total_equity not cash_balance for drawdown check.
+            # Same fix as SWING path — cash drops when position opens but
+            # equity stays flat (cash + position value = same).
+            try:
+                from repository import active_trades as _at_intraday
+                _intraday_mv = sum(
+                    float(t.get("entry_price", 0)) * int(t.get("shares_remaining", 0))
+                    for t in _at_intraday()
+                    if t.get("execution_type") == "AGENT_INTRADAY"
+                )
+            except Exception:
+                _intraday_mv = 0.0
+            intraday_total_equity = cash + _intraday_mv
 
             for sig in signals:
                 ticker = sig["ticker"]
@@ -1532,7 +1545,7 @@ def _run_intraday_cycle(autotrade: bool, autoexit: bool,
                         "risk_amount": (
                             sig["entry"] - sig["stop_loss"]) * 10,
                     },
-                    cash,
+                    intraday_total_equity,
                     initial_capital,
                 )
                 if not risk_result.get("pass"):
