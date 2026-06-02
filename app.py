@@ -807,13 +807,20 @@ with tab_scanner:
                     if st.button("✅ EXECUTE INTRADAY ORDER",
                                  use_container_width=True, type="primary"):
                         trades_now = load_trades()
+                        # v3.7 fix: use total_equity not cash_balance
+                        _active_now = active_trades()
+                        _mv_now = sum(
+                            float(t.get("entry_price", 0)) * int(t.get("shares_remaining", 0))
+                            for t in _active_now
+                        )
+                        _equity_now = acc_now["cash_balance"] + _mv_now
                         rc = run_full_risk_check(
                             trades_now,
                             {"ticker": sel, "sector": row["sector"],
                              "entry": row["entry"], "stop_loss": row["stop_loss"],
                              "cost": est_cost["gross"],
                              "risk_amount": est_risk},
-                            acc_now["cash_balance"], acc_now["initial_capital"],
+                            _equity_now, acc_now["initial_capital"],
                         )
                         if rc["pass"]:
                             ok, tid, msg = execute_intraday_entry(
@@ -873,13 +880,20 @@ with tab_scanner:
                                      use_container_width=True, type="primary"):
                             acc_now = load_account()
                             trades_now = load_trades()
+                            # v3.7 fix: use total_equity not cash_balance
+                            _active_now2 = active_trades()
+                            _mv_now2 = sum(
+                                float(t.get("entry_price", 0)) * int(t.get("shares_remaining", 0))
+                                for t in _active_now2
+                            )
+                            _equity_now2 = acc_now["cash_balance"] + _mv_now2
                             rc = run_full_risk_check(
                                 trades_now,
                                 {"ticker": sel, "sector": row["sector"],
                                  "entry": row["entry"], "stop_loss": row["stop_loss"],
                                  "cost": cost_info["gross"],
                                  "risk_amount": actual_risk},
-                                acc_now["cash_balance"], acc_now["initial_capital"],
+                                _equity_now2, acc_now["initial_capital"],
                             )
                             if rc["pass"]:
                                 sized = int(round_to_lot(int(shares * rc["size_multiplier"])))
