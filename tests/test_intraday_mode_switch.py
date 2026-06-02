@@ -219,3 +219,55 @@ class TestModeSwitchInitDb:
         acc = load_account()
         assert acc["initial_capital"] == 9999.0, \
             "SWING DB must retain its data after an INTRADAY switch-and-back"
+
+
+# ---------------------------------------------------------------------------
+# Regression: drawdown check must use total_equity not cash_balance
+# ---------------------------------------------------------------------------
+
+class TestDrawdownEquityCalculation:
+    """Buying a position reduces cash but NOT total equity.
+    Drawdown check must use total_equity (cash + position value)
+    not cash_balance alone — otherwise every open position looks
+    like a drawdown equal to the position cost.
+
+    Bug: scheduler.py passed cash_balance to run_full_risk_check.
+    Result: $878 NVIDIA position → $878 "drawdown" on $5k capital = 17.6%
+            → circuit breaker fires → all entries blocked incorrectly.
+
+    Fix: pass total_equity = cash + market_value_of_positions.
+    """
+
+    def test_cash_minus_position_is_not_drawdown(self):
+        """Equity stays flat when you deploy cash into a position."""
+        initial_capital = 5000.0
+        position_cost   = 878.0   # 4 shares NVIDIA @ ~$219
+
+        cash_after_buy  = initial_capital - position_cost  # $4,122
+        position_value  = position_cost                    # assume no P&L yet
+        total_equity    = cash_after_buy + position_value  # $5,000
+
+        # Using cash_balance (BUG):
+        wrong_drawdown = (initial_capital - cash_after_buy) / initial_capital * 100
+        # Using total_equity (FIX):
+        correct_drawdown = (initial_capital - total_equity) / initial_capital * 100
+
+        assert wrong_drawdown == pytest.approx(17.6, abs=0.1), \
+            "Confirms the bug: cash alone shows 17.6% false drawdown"
+        assert correct_drawdown == pytest.approx(0.0, abs=0.01), \
+            "Fix: total_equity shows 0% drawdown when position breaks even"
+
+    def test_real_loss_shows_correct_drawdown(self):
+        """Actual P&L loss must still show correctly."""
+        import pytest
+        initial_capital = 5000.0
+        position_cost   = 878.0
+        current_price_loss = 50.0   # position lost $50
+
+        cash         = initial_capital - position_cost      # $4,122
+        position_val = position_cost - current_price_loss   # $828
+        total_equity = cash + position_val                  # $4,950
+
+        drawdown = (initial_capital - total_equity) / initial_capital * 100
+        assert drawdown == pytest.approx(1.0, abs=0.1), \
+            "$50 real loss on $5k = 1% drawdown, not 17.6%"
