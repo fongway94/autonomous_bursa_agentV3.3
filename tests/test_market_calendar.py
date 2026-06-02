@@ -202,17 +202,22 @@ def test_next_session_skips_holiday():
 # ---- Backwards compat with risk_manager ----
 
 def test_risk_manager_check_trading_time_window_uses_calendar():
-    """check_trading_time_window must now reject lunch break.
+    """check_trading_time_window must now reject lunch break."""
+    from unittest.mock import patch
+    from risk_manager import check_trading_time_window
 
-    NOTE: This test verifies that is_market_open() correctly identifies
-    lunch break (13:00 MYT) as closed. The check_trading_time_window()
-    call uses the real wall clock so we only test is_market_open directly.
-    """
-    from market_calendar import is_market_open
-
-    # Monday 13:00 MYT = lunch break → must be closed
+    # Force "now" = Monday 13:00 (in lunch break)
     fake_now = _t("2026-06-15 13:00")
-    assert not is_market_open(fake_now), (
-        "Lunch break (13:00 MYT) must be closed — "
-        "is_market_open() should return False"
-    )
+    with patch("risk_manager.get_myt_now", return_value=fake_now), \
+         patch("market_calendar.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.combine = datetime.combine
+        mock_dt.strptime = datetime.strptime
+        from market_calendar import is_market_open
+        assert not is_market_open(fake_now)
+        result = check_trading_time_window()
+        assert result["allowed"] is False
+        # The key invariant: trading must be disallowed during lunch break.
+        # The exact window label / reason text varies with the profile-aware
+        # market_calendar path, so we only assert the allow flag.
+        assert result["allowed"] is False
