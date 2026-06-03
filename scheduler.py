@@ -384,15 +384,36 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
                         payload={"regime": regime.get("regime_data", {}).get("regime")})
 
     # ---- Auto-settle existing positions ----
-    if autoexit and not df.empty:
+    if autoexit:
         log_scheduler_event("SETTLE_START", "Auto-settling active trades")
         price_lookup = {}
-        for _, row in df.iterrows():
-            price_lookup[row["ticker"]] = {
-                "price": float(row["price"]),
-                "high": float(row.get("price", 0)) * 1.0,
-                "low": float(row.get("price", 0)) * 1.0,
-            }
+        
+        # Populate price_lookup with default prices from scan cache
+        if not df.empty:
+            for _, row in df.iterrows():
+                price_lookup[row["ticker"]] = {
+                    "price": float(row["price"]),
+                    "high": float(row["price"]),
+                    "low": float(row["price"]),
+                }
+                
+        # Fetch true live daily High/Low for active trades to prevent missing intraday moves
+        from repository import active_trades
+        from data_provider import get_history
+        for t in active_trades():
+            ticker = t["ticker"]
+            try:
+                df_t = get_history(ticker, period="5d", timeout=15)
+                if df_t is not None and not df_t.empty:
+                    last_row = df_t.iloc[-1]
+                    price_lookup[ticker] = {
+                        "price": float(last_row["Close"]),
+                        "high": float(last_row["High"]),
+                        "low": float(last_row["Low"]),
+                    }
+            except Exception as e:
+                log.warning(f"Failed to fetch live exit price for {ticker}: {e}")
+
         try:
             settle_res = auto_settle_trades(price_lookup, regime, actor="AGENT")
             summary["settled"] = len(settle_res.get("settled", []))
