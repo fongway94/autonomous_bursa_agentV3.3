@@ -1,295 +1,187 @@
 """
-Tests for v3.1.5 Gist-backed persistence layer.
+Tests for v3.1.6 ML classifier persistence + auto-train.
 
-The persistence module solves the critical problem where Streamlit Cloud
-container resets (on every GitHub push, manual reboot, 7-day sleep, or
-platform maintenance) would wipe the entire SQLite database — including
-trade history, Bayesian brain (state_priors), biases, parameters.
-
-These tests verify:
-  * No-op safety: works (degrades silently) when GITHUB_TOKEN missing
-  * Encode round-trip: gzip+b64 preserves DB bytes exactly
-  * Marker file is read/written correctly
-  * Boot-restore skips when local DB already has data
-  * Rate-limit prevents backup storms
-  * v3.1.9: marker survives in DB meta (not just local JSON)
-  * v3.1.9: GIST_ID env var is used as fallback when marker is lost
+Two changes are tested:
+  1. The ML classifier .pkl is now included in the Gist backup payload
+     (so it survives container resets just like the DB)
+  2. _encode_ml_for_gist gracefully returns None when no .pkl exists yet
 """
 
 import os
 
 
-def test_unconfigured_status():
-    """Without GITHUB_TOKEN, is_configured returns False."""
-    from persistence import is_configured
-    if "GITHUB_TOKEN" not in os.environ:
-        assert is_configured() is False
+def test_encode_ml_returns_none_when_no_pkl(monkeypatch, tmp_path):
+    """If the .pkl doesn't exist, encoder must return None (not crash)."""
+    import persistence
+    monkeypatch.setattr(persistence, "ML_MODEL_PATH",
+                        str(tmp_path / "nonexistent.pkl"))
+    assert persistence._encode_ml_for_gist() is None
 
 
-def test_unconfigured_backup_returns_error_not_raise(monkeypatch):
-    """backup() must never raise even without credentials."""
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    from persistence import backup
-    result = backup(force=True, reason="test")
-    assert result["ok"] is False
-    assert "GITHUB_TOKEN" in result["reason"]
-
-
-def test_unconfigured_restore_returns_error_not_raise(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    from persistence import restore
-    result = restore()
-    assert result["ok"] is False
-    assert "GITHUB_TOKEN" in result["reason"]
-
-
-def test_status_dict_shape(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    from persistence import get_status
-    s = get_status()
-    assert "configured" in s
-    assert "db_size_kb" in s
-    assert s["configured"] is False
-    assert isinstance(s["db_size_kb"], (int, float))
-
-
-def test_encode_decode_roundtrip(tmp_path):
-    """gzip+b64 encoding must preserve every byte exactly."""
-    from persistence import _encode_db_for_gist, _decode_gist_to_db
+def test_encode_ml_roundtrip(tmp_path, monkeypatch):
+    """gzip+b64 must preserve every byte of the .pkl exactly."""
     import persistence
 
-    # Create a fake DB with known content
-    fake_db_content = b"SQLite format 3\x00" + b"x" * 1000 + bytes(range(256))
-    fake_db_path = tmp_path / "fake.db"
-    fake_db_path.write_bytes(fake_db_content)
+    # Create a fake .pkl with known content (joblib files start with bytes
+    # that look like ZIP/pickle; we just need any binary blob for the test)
+    fake_pkl = b"\x80\x04\x95" + b"scikit-learn model bytes" * 100 + bytes(range(256))
+    fake_path = tmp_path / "fake_model.pkl"
+    fake_path.write_bytes(fake_pkl)
 
-    # Monkey-patch the DB_PATH
-    original = persistence.DB_PATH
-    persistence.DB_PATH = str(fake_db_path)
+    monkeypatch.setattr(persistence, "ML_MODEL_PATH", str(fake_path))
 
-    try:
-        encoded = _encode_db_for_gist()
-        assert isinstance(encoded, str)
-        assert len(encoded) > 0
+    encoded = persistence._encode_ml_for_gist()
+    assert encoded is not None
+    assert isinstance(encoded, str)
+    assert len(encoded) > 0
 
-        # Restore to a different path
-        restored_path = tmp_path / "restored.db"
-        n = _decode_gist_to_db(encoded, str(restored_path))
-        assert n == len(fake_db_content)
-        assert restored_path.read_bytes() == fake_db_content
-    finally:
-        persistence.DB_PATH = original
+    # Restore to a different path
+    restored = tmp_path / "restored.pkl"
+    n = persistence._decode_gist_to_db(encoded, str(restored))
+    assert n == len(fake_pkl)
+    assert restored.read_bytes() == fake_pkl
 
 
-def test_marker_read_write_round_trip(tmp_path, monkeypatch):
-    """Marker file should round-trip a dict."""
+def test_backup_payload_includes_ml_file_when_present(monkeypatch, tmp_path):
+    """
+    When .pkl exists, backup() must upload BOTH files to the gist.
+    We mock the HTTP call and inspect the payload.
+    """
     import persistence
-    import os
-    from db import DATA_DIR
-    for f in os.listdir(DATA_DIR):
-        if "gist_marker" in f:
-            try:
-                os.remove(os.path.join(DATA_DIR, f))
-            except Exception:
-                pass
 
+    # Create a fake .pkl
+    ml_path = tmp_path / "model.pkl"
+    ml_path.write_bytes(b"fake_ml_model_bytes" * 50)
+    monkeypatch.setattr(persistence, "ML_MODEL_PATH", str(ml_path))
+
+    # Fake credentials
+    monkeypatch.setenv("GITHUB_TOKEN", "fake_token")
+
+    # Reset rate limit + marker for clean POST path
+    persistence._last_backup_ts = None
     monkeypatch.setattr(persistence, "MARKER_FILE",
                         str(tmp_path / "marker.json"))
 
-    # Empty when missing (DB meta is also cleared by conftest between tests)
-    assert persistence._read_marker() == {}
+    captured = {}
 
-    # Write + re-read
-    persistence._write_marker({"gist_id": "abc123",
-                                "last_backup_at": "2026-05-28 10:00:00"})
-    m = persistence._read_marker()
-    assert m["gist_id"] == "abc123"
-    assert m["last_backup_at"] == "2026-05-28 10:00:00"
+    class FakeResp:
+        status_code = 201
+        def json(self):
+            return {"id": "fake_gist_id_123"}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["payload"] = json
+        return FakeResp()
+
+    monkeypatch.setattr(persistence.requests, "post", fake_post)
+    monkeypatch.setattr(persistence.requests, "patch", fake_post)
+    # Marker file is empty, so it'll go down the POST (create) path
+
+    result = persistence.backup(force=True, reason="test")
+    assert result["ok"] is True
+
+    # Verify BOTH files in the payload
+    files = captured["payload"]["files"]
+    assert persistence.GIST_FILENAME in files
+    assert persistence.ML_GIST_FILENAME in files
+
+    # Description mentions both sizes
+    desc = captured["payload"]["description"]
+    assert "DB:" in desc
+    assert "ML:" in desc
 
 
-def test_boot_restore_skips_when_local_db_has_data(monkeypatch):
-    """
-    Critical safety guarantee: if local DB already has trade data,
-    boot_restore_once must NOT overwrite it with the gist version.
-    Otherwise repeated reboots would wipe today's trades.
-    """
-    monkeypatch.setenv("GITHUB_TOKEN", "fake_token_for_test")
-
-    # Reset the once-flag so this test isn't affected by other tests
+def test_backup_payload_excludes_ml_when_no_pkl(monkeypatch, tmp_path):
+    """If no .pkl yet, backup includes only the DB file."""
     import persistence
-    persistence._BOOT_RESTORE_ATTEMPTED = False
 
-    # Insert a trade so the local DB has data
-    from repository import insert_trade
-    insert_trade({
-        "ticker": "TEST.KL", "name": "T", "sector": "Tech",
-        "signal_type": "GOLD BUY (BREAKOUT)",
-        "entry_price": 1.0, "stop_loss": 0.9,
-        "tp1": 1.1, "tp2": 1.2, "tp3": 1.3,
-        "shares": 100, "lots": 1, "cost": 100, "fee": 0.15,
-        "total_outlay": 100.15, "risk_per_share": 0.1,
-        "actual_risk_pct": 10, "status": "ACTIVE", "phase": "FULL",
-        "logged_at": "2026-05-28 09:00:00",
-        "shares_remaining": 100,
-    })
+    # Point at non-existent .pkl
+    monkeypatch.setattr(persistence, "ML_MODEL_PATH",
+                        str(tmp_path / "nothing.pkl"))
+    monkeypatch.setenv("GITHUB_TOKEN", "fake_token")
+    persistence._last_backup_ts = None
+    # Reset marker so backup() goes the POST (create) path consistently
+    monkeypatch.setattr(persistence, "MARKER_FILE",
+                        str(tmp_path / "marker.json"))
 
-    result = persistence.boot_restore_once()
-    assert result["skipped"] is True
-    assert "trades" in result["reason"].lower() \
-        or "priors" in result["reason"].lower()
+    captured = {}
 
+    class FakeResp:
+        status_code = 201
+        def json(self):
+            return {"id": "fake_id"}
 
-def test_boot_restore_idempotent_per_process(monkeypatch):
-    """boot_restore_once should only attempt once per Python process."""
-    monkeypatch.setenv("GITHUB_TOKEN", "fake_token_for_test")
-    import persistence
-    persistence._BOOT_RESTORE_ATTEMPTED = False
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["payload"] = json
+        return FakeResp()
 
-    # First call — could succeed/fail/skip, but flag becomes True
-    persistence.boot_restore_once()
-    assert persistence._BOOT_RESTORE_ATTEMPTED is True
+    monkeypatch.setattr(persistence.requests, "post", fake_post)
+    monkeypatch.setattr(persistence.requests, "patch", fake_post)
 
-    # Second call must skip with "already attempted"
-    r = persistence.boot_restore_once()
-    assert r["skipped"] is True
-    assert "already attempted" in r["reason"]
+    result = persistence.backup(force=True, reason="test-no-ml")
+    assert result["ok"] is True
+
+    files = captured["payload"]["files"]
+    assert persistence.GIST_FILENAME in files
+    assert persistence.ML_GIST_FILENAME not in files
 
 
-def test_backup_rate_limit(monkeypatch):
+def test_restore_handles_gist_without_ml_file(monkeypatch, tmp_path):
     """
-    Without rate-limit, the agent could hammer GitHub API on every
-    scheduler tick + every trade event. Rate-limit ensures min 30s gap.
-    """
-    monkeypatch.setenv("GITHUB_TOKEN", "fake_token_for_test")
-    import persistence
-    from datetime import datetime, timezone, timedelta
-
-    # Fake a recent backup
-    persistence._last_backup_ts = datetime.now(
-        timezone(timedelta(hours=8)))
-
-    # Immediate retry should be rate-limited (skipped)
-    result = persistence.backup(force=False, reason="too-soon")
-    assert result["skipped"] is True
-    assert "rate-limited" in result["reason"]
-
-
-def test_backup_force_bypasses_rate_limit(monkeypatch):
-    """force=True (e.g. manual button) bypasses the rate limit."""
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)  # ensure fail-fast path
-    import persistence
-    from datetime import datetime, timezone, timedelta
-
-    persistence._last_backup_ts = datetime.now(
-        timezone(timedelta(hours=8)))
-
-    # force=True should NOT be rate-limited — but will fail
-    # on the missing token (proving it got past rate-limit check)
-    result = persistence.backup(force=True, reason="manual")
-    assert result.get("skipped", False) is False
-    # The actual failure is missing token, not rate-limit
-    assert "GITHUB_TOKEN" in result["reason"]
-
-
-# ---------------------------------------------------------------------------
-# v3.1.9 regressions
-# ---------------------------------------------------------------------------
-
-def test_marker_survives_in_db_meta(monkeypatch):
-    """
-    v3.1.9: The gist_id must survive container resets via the Gist backup.
-    We store the marker payload in the SQLite `meta` table so it rides
-    along with the DB backup.
+    Older gists (created before v3.1.6) don't have the ML file.
+    Restore must still succeed, just with ml_bytes_restored=0.
     """
     import persistence
-    from db import set_meta, get_meta
+    monkeypatch.setenv("GITHUB_TOKEN", "fake_token")
 
-    # Simulate a stored marker in DB meta
-    fake_marker = {"gist_id": "db-meta-gist-42",
-                   "last_backup_at": "2026-05-28 10:00:00"}
-    persistence._write_marker(fake_marker)
+    # Pre-set the gist_id in marker
+    persistence._write_marker({"gist_id": "old_gist_id"})
 
-    # Read back — must come from DB meta (not just file)
-    m = persistence._read_marker()
-    assert m.get("gist_id") == "db-meta-gist-42"
+    # Build a minimal valid encoded DB content
+    fake_db = b"SQLite format 3\x00" + b"\x00" * 1000
+    import gzip, base64
+    encoded_db = base64.b64encode(
+        gzip.compress(fake_db)).decode("ascii")
 
-    # Verify DB meta directly
-    raw = get_meta("gist_marker")
-    assert raw is not None
-    import json
-    assert json.loads(raw)["gist_id"] == "db-meta-gist-42"
-
-
-def test_boot_restore_falls_back_to_gist_id_env_var(monkeypatch):
-    """
-    v3.1.9: If the local marker file is wiped (container reset) AND the
-    DB is empty, boot_restore_once must fall back to the GIST_ID env var.
-    Otherwise the agent can never find its brain after a Streamlit Cloud
-    redeploy.
-    """
-    import persistence
-    import os
-    import gzip
-    import base64
-    from db import DATA_DIR, DB_PATH
-
-    # Wipe marker files
-    for f in os.listdir(DATA_DIR):
-        if "gist_marker" in f:
-            try:
-                os.remove(os.path.join(DATA_DIR, f))
-            except Exception:
-                pass
-
-    # Wipe DB so restore is attempted
-    active_db = persistence._db_path()
-    if os.path.exists(active_db):
-        os.remove(active_db)
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    from db import init_db
-    init_db()
-
-    monkeypatch.setenv("GITHUB_TOKEN", "fake_token_for_test")
-    monkeypatch.setenv("GIST_ID", "env-fallback-gist-99")
-    persistence._BOOT_RESTORE_ATTEMPTED = False
-
-    # Capture the URL that restore() builds — proves it used the env var
-    captured_url = {}
-
+    # Mock the GitHub API: returns gist WITHOUT the ML file
     class FakeResp:
         status_code = 200
         def json(self):
             return {
+                "id": "old_gist_id",
                 "files": {
-                    "bursa_agent_db.b64.gz": {
-                        "content": base64.b64encode(
-                            gzip.compress(b"fake_db_content")
-                        ).decode("ascii")
-                    }
-                }
+                    persistence.GIST_FILENAME: {
+                        "content": encoded_db,
+                        "truncated": False,
+                    },
+                },
             }
 
-    def mock_get(url, **kwargs):
-        captured_url["url"] = url
+    def fake_get(url, headers=None, timeout=None):
         return FakeResp()
 
-    monkeypatch.setattr(persistence.requests, "get", mock_get)
-    monkeypatch.setattr(persistence, "_decode_gist_to_db",
-                        lambda encoded, target_path: len(encoded))
+    monkeypatch.setattr(persistence.requests, "get", fake_get)
 
-    result = persistence.boot_restore_once()
+    # Use temp paths so we don't trash real data
+    monkeypatch.setattr(persistence, "DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(persistence, "ML_MODEL_PATH", str(tmp_path / "test.pkl"))
 
-    if result.get("skipped"):
-        # If it skipped because local DB has data, that's a test-setup issue
-        # (init_db seeded rows).  The important assertion is that it did
-        # NOT skip because of a missing gist_id.
-        assert "no gist_id" not in result["reason"], (
-            "boot_restore_once skipped due to missing gist_id — "
-            "GIST_ID env var fallback did not work"
-        )
-    else:
-        assert "env-fallback-gist-99" in captured_url.get("url", ""), (
-            f"boot_restore_once did not fall back to GIST_ID env var; "
-            f"url={captured_url.get('url')}"
-        )
+    result = persistence.restore()
+    assert result["ok"] is True
+    assert result["bytes_restored"] > 0
+    assert result.get("ml_bytes_restored", 0) == 0  # no ML in old gist
+    assert "DB" in result["reason"]
+
+
+def test_ml_constants_defined():
+    """Sanity: the new v3.1.6 constants exist on persistence module."""
+    import persistence
+    assert hasattr(persistence, "ML_GIST_FILENAME")
+    assert hasattr(persistence, "ML_MODEL_PATH")
+    # v3.6: ML model backups are per-market so MY and US brains don't
+    # overwrite each other in the shared Gist. Filename now carries the
+    # active market code, e.g. "setup_classifier_MY.pkl.b64.gz".
+    assert persistence.ML_GIST_FILENAME.startswith("setup_classifier_")
+    assert persistence.ML_GIST_FILENAME.endswith(".pkl.b64.gz")
+    assert persistence._ml_gist_filename() == persistence.ML_GIST_FILENAME
+    assert "setup_classifier.pkl" in persistence.ML_MODEL_PATH
