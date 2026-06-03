@@ -567,7 +567,7 @@ def get_status() -> dict:
     marker = _read_marker()
     return {
         "configured": is_configured(),
-        "gist_id": marker.get("gist_id") or os.environ.get("GIST_ID"),
+        "gist_id": _resolve_gist_id(),
         "last_backup_at": marker.get("last_backup_at"),
         "last_backup_size_kb": marker.get("last_backup_size_kb"),
         "last_reason": marker.get("last_reason"),
