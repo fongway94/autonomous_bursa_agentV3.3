@@ -12,6 +12,16 @@ Complete changelog from v1 through the current release.
 Range Breakout (ORB) engine for US markets, running alongside the existing
 SWING daily engine. Branch: `feat/intraday`.
 
+### Hotfixes & Stability Tuning (Post-v3.7)
+
+**Focus:** File separation on Gist backup per (market, mode) + Streamlit UI nested button / restore toast fixes.
+
+- **Per-(Market, Mode) Gist Isolation:** Separated Gist backup filenames for DB and ML classifier files (e.g. `bursa_agent_US_SWING_db.b64.gz` and `bursa_agent_US_INTRADAY_db.b64.gz`). This prevents active US Swing (local PC SIMULATE) and US Intraday (local PC paper) from overwriting each other's backups in the shared Gist.
+- **Streamlit Nested Button Restore Bug Fix:** Refactored the manual restore confirmation UI in `app.py`. Streamlit's native nested-button anti-pattern was causing the confirmation block to be skipped on click (the restore never ran, and the toast/success never fired). Refactored to use a persistent `st.session_state["restore_confirm_active"]` flag with separate col-based "Yes" and "Cancel" buttons.
+- **Enhanced Restore Toasts:** Both manual and boot-time restore functions now fire beautiful, informative `st.toast()` notifications showing the exact Gist file name, Gist ID, and restored size.
+- **Skip & Failure Toasts:** Added informative toast warnings/infos when restore is skipped on boot (e.g., when local DB already has data) or manual restore is cancelled/fails.
+- **Rerun-Safe Toasts:** Manual restore toasts are preserved in `st.session_state["pending_toast"]` to survive the subsequent `st.rerun()`.
+
 ### Why
 
 The SWING engine can only observe Bursa and US on hourly candles, missing
