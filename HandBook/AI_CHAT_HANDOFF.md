@@ -379,7 +379,7 @@ intraday_backtest.py, intraday_backtest_v2.py, intraday_backtest_v3.py,
 validate_intraday_edge.py, intraday_screener.py, intraday_engine.py
 
 market_profiles/ (__init__.py, base.py, my_profile.py, us_profile.py)
-tests/ (41 test files, 611 tests, 0 failures)
+tests/ (41 test files, 621 tests, 0 failures)
 HandBook/ (PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md, REVISION_HISTORY.md,
            USER_GUIDE.md, LIVE_TRIGGER_GUIDE.md, SETUP_GUIDE.md,
            FINAL_EVALUATION.md, orb_backtest_results.md)
@@ -391,8 +391,8 @@ HandBook/ (PROJECT_HANDBOOK.md, AI_CHAT_HANDOFF.md, REVISION_HISTORY.md,
 
 [← Replace this with your specific request to the new AI]
 
-_Status at last handoff (2026-06-01): v3.7 complete + 2 hotfixes merged to `main`.
-611 tests, 0 failures. System is live and paper trading:_
+_Status at last handoff (2026-06-03): v3.7 complete + Gist isolation & UI nested-button/toast hotfixes applied and merged to `main`.
+621 tests, 0 failures. System is live and paper trading:_
 
 _- MY SWING: Streamlit Cloud, yfinance, NOOP (notify only)_
 _- US SWING: Local PC, yfinance data, SIMULATE mode → mirroring to Moomoo Book Trader_
