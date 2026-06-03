@@ -379,9 +379,27 @@ def restore(gist_id: str | None = None) -> dict:
 
         gist = r.json()
         files = gist.get("files", {})
-        if _gist_filename() not in files:
-            result["reason"] = f"gist {gist_id} has no file '{_gist_filename()}'"
-            return result
+
+        # v3.7 migration: look for new filename first, then fall back to
+        # old v3.6 filename (bursa_agent_<CODE>_db.b64.gz without mode).
+        # This allows recovery after the filename scheme changed mid-session.
+        target_file = _gist_filename()
+        if target_file not in files:
+            # Try legacy filename (v3.6 format without trading mode)
+            code = _active_market_code()
+            legacy_filename = f"bursa_agent_{code}_db.b64.gz"
+            if legacy_filename in files:
+                log.warning(
+                    f"New filename '{target_file}' not in Gist — "
+                    f"falling back to legacy '{legacy_filename}' for restore"
+                )
+                target_file = legacy_filename
+            else:
+                result["reason"] = (
+                    f"gist {gist_id} has no file '{_gist_filename()}' "
+                    f"or legacy '{legacy_filename}'"
+                )
+                return result
 
         def _fetch_file_content(file_meta):
             """Get file content, handling truncated gists via raw_url."""
@@ -393,7 +411,7 @@ def restore(gist_id: str | None = None) -> dict:
                 return r2.text
             return file_meta["content"]
 
-        encoded = _fetch_file_content(files[_gist_filename()])
+        encoded = _fetch_file_content(files[target_file])
         if encoded is None:
             result["reason"] = "DB file truncated with no raw_url"
             return result
@@ -449,8 +467,9 @@ def restore(gist_id: str | None = None) -> dict:
         result.update({"ok": True, "bytes_restored": bytes_restored,
                         "ml_bytes_restored": ml_bytes,
                         "gist_id": gist_id,
-                        "reason": (f"restored DB + ML"
-                                   if ml_bytes else "restored DB only")})
+                        "source_file": target_file,
+                        "reason": (f"restored DB + ML from {target_file}"
+                                   if ml_bytes else f"restored DB from {target_file}")})
         log.info(f"restore OK (DB={bytes_restored}, ML={ml_bytes}) "
                   f"← gist {gist_id}")
     except Exception as e:
