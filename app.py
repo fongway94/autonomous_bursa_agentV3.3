@@ -195,8 +195,14 @@ if "boot_restore_attempted" not in st.session_state:
         if is_configured():
             r = boot_restore_once()
             if r.get("ok"):
-                st.toast(f"♻️ Restored brain from backup "
-                         f"({r['bytes_restored']:,} bytes)", icon="✅")
+                gist_id = r.get("gist_id", "unknown")
+                gist_short = gist_id[:12] if gist_id and gist_id != "unknown" else "unknown"
+                st.toast(
+                    f"♻️ Restored brain from backup "
+                    f"({r['bytes_restored']:,} bytes) "
+                    f"← Gist {gist_short}…",
+                    icon="✅"
+                )
     except Exception as e:
         st.warning(f"Backup restore skipped: {e}")
     st.session_state["boot_restore_attempted"] = True
@@ -2253,7 +2259,18 @@ with tab_settings:
                 with st.spinner("Downloading from Gist…"):
                     res = _pers_restore()
                 if res["ok"]:
-                    st.success(f"✅ Restored {res['bytes_restored']:,} bytes")
+                    gist_id = res.get("gist_id", "unknown")
+                    gist_short = gist_id[:12] if gist_id and gist_id != "unknown" else "unknown"
+                    from persistence import _gist_filename as _pfn
+                    try:
+                        fname = _pfn()
+                    except Exception:
+                        fname = "unknown"
+                    st.success(
+                        f"✅ Restored {res['bytes_restored']:,} bytes "
+                        f"← Gist `{gist_short}…` "
+                        f"file: `{fname}`"
+                    )
                     st.rerun()
                 else:
                     st.error(f"❌ Restore failed: {res['reason']}")
