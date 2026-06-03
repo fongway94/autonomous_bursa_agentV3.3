@@ -2212,14 +2212,18 @@ with tab_settings:
               if bstatus.get("gist_id") else "—")
 
     # v3.1.9: Warn if GITHUB_TOKEN is set but GIST_ID env var is missing
-    if bstatus["configured"] and not os.environ.get("GIST_ID"):
+    from market_profiles import active_market_code as _amc
+    code = _amc()
+    has_specific = os.environ.get(f"GIST_ID_{code}")
+    has_global = os.environ.get("GIST_ID")
+    if bstatus["configured"] and not has_global and not has_specific:
         st.warning(
-            "⚠️ **GIST_ID env var not set.** If your local marker file is "
+            f"⚠️ **GIST_ID env var not set for {code}.** If your local marker file is "
             "wiped during a Streamlit Cloud container reset, the agent "
             "won't know which Gist to restore from.\n\n"
             "**Fix:** Go to Streamlit Cloud → Manage app → Secrets, add:\n"
-            "```\nGIST_ID = \"your-gist-id-here\"\n```\n"
-            "(Find your gist ID at https://gist.github.com/{your-username})"
+            f"```\nGIST_ID_{code} = \"your-gist-id-here\"\n```\n"
+            "*(Or set a global `GIST_ID` if using the same Gist for both MY and US)*"
         )
 
     if not bstatus["configured"]:
