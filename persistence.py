@@ -81,13 +81,38 @@ def _active_market_code() -> str:
         return "MY"
 
 
+def _active_trading_mode() -> str:
+    try:
+        from market_profiles import active_trading_mode
+        return active_trading_mode()
+    except Exception:
+        return "SWING"
+
+
 def _gist_filename() -> str:
-    """e.g. 'bursa_agent_MY_db.b64.gz' / 'bursa_agent_US_db.b64.gz'."""
-    return f"bursa_agent_{_active_market_code()}_db.b64.gz"
+    """Unique Gist filename per (market, mode).
+
+    v3.7 fix: include trading mode in filename so SWING and INTRADAY
+    backups are stored as separate Gist files and never overwrite each other.
+
+    Examples:
+      bursa_agent_MY_SWING_db.b64.gz     ← MY app on Streamlit Cloud
+      bursa_agent_US_SWING_db.b64.gz     ← US app on Streamlit Cloud
+      bursa_agent_US_INTRADAY_db.b64.gz  ← local PC only
+
+    Because each deployment (MY cloud, US cloud, local PC INTRADAY) uses
+    a different filename, there is zero Gist conflict between them.
+    No IS_STREAMLIT_CLOUD guard needed — filename isolation is sufficient.
+    """
+    code = _active_market_code()
+    mode = _active_trading_mode()
+    return f"bursa_agent_{code}_{mode}_db.b64.gz"
 
 
 def _ml_gist_filename() -> str:
-    return f"setup_classifier_{_active_market_code()}.pkl.b64.gz"
+    code = _active_market_code()
+    mode = _active_trading_mode()
+    return f"setup_classifier_{code}_{mode}.pkl.b64.gz"
 
 
 # Backwards-compat module aliases (legacy v3.3 names). Many call sites use
@@ -229,6 +254,10 @@ def backup(force: bool = False, reason: str = "") -> dict:
     Backup the DB to the configured Gist.
 
     Returns a status dict — never raises. Safe to call from anywhere.
+
+    v3.7: Each (market, mode) pair uses a unique Gist filename so there
+    is zero conflict between Streamlit Cloud SWING backups and local PC
+    INTRADAY backups. No IS_STREAMLIT_CLOUD guard needed.
     """
     global _last_backup_ts
     result = {"ok": False, "reason": "", "size_kb": 0,
