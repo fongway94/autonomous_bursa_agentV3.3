@@ -74,6 +74,7 @@ def test_backup_payload_includes_ml_file_when_present(monkeypatch, tmp_path):
         return FakeResp()
 
     monkeypatch.setattr(persistence.requests, "post", fake_post)
+    monkeypatch.setattr(persistence.requests, "patch", fake_post)
     # Marker file is empty, so it'll go down the POST (create) path
 
     result = persistence.backup(force=True, reason="test")
@@ -115,6 +116,7 @@ def test_backup_payload_excludes_ml_when_no_pkl(monkeypatch, tmp_path):
         return FakeResp()
 
     monkeypatch.setattr(persistence.requests, "post", fake_post)
+    monkeypatch.setattr(persistence.requests, "patch", fake_post)
 
     result = persistence.backup(force=True, reason="test-no-ml")
     assert result["ok"] is True
