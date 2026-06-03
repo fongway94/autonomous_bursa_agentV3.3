@@ -152,8 +152,37 @@ MIN_BACKUP_INTERVAL_SEC = 30
 # Credentials + marker
 # ---------------------------------------------------------------------------
 
+def _get_secret(key: str) -> str | None:
+    # 1. Try os.environ (Streamlit Cloud uses this)
+    val = _os_val = os.environ.get(key)
+    if val:
+        return val
+
+    # 2. Try streamlit.secrets if running inside Streamlit
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+
+    # 3. Try manual TOML parsing (for tests, background threads on local PC)
+    try:
+        secrets_path = os.path.join(".streamlit", "secrets.toml")
+        if os.path.exists(secrets_path):
+            import toml
+            with open(secrets_path) as f:
+                data = toml.load(f)
+                if key in data:
+                    return str(data[key])
+    except Exception:
+        pass
+
+    return None
+
+
 def _token() -> str | None:
-    return os.environ.get("GITHUB_TOKEN")
+    return _get_secret("GITHUB_TOKEN")
 
 
 def is_configured() -> bool:
@@ -225,9 +254,9 @@ def _resolve_gist_id() -> str | None:
     3. Cached gist_id in DB meta or local marker files
     """
     code = _active_market_code()
-    gist_id = os.environ.get(f"GIST_ID_{code}")
+    gist_id = _get_secret(f"GIST_ID_{code}")
     if not gist_id:
-        gist_id = os.environ.get("GIST_ID")
+        gist_id = _get_secret("GIST_ID")
     if gist_id:
         return gist_id
 
