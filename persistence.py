@@ -168,6 +168,12 @@ def _headers() -> dict:
     }
 
 
+def _marker_file_path() -> str:
+    code = _active_market_code()
+    mode = _active_trading_mode()
+    return os.path.join(DATA_DIR, f".gist_marker_{code}_{mode}.json")
+
+
 # v3.1.9: read marker from DB meta first (survives container reset + restore),
 # then fall back to local JSON file for backwards compatibility.
 def _read_marker() -> dict:
@@ -179,10 +185,18 @@ def _read_marker() -> dict:
     except Exception:
         pass
     # Fallback: local file
-    if not os.path.exists(MARKER_FILE):
+    marker_path = _marker_file_path()
+    if not os.path.exists(marker_path):
+        # Fall back to legacy shared marker file
+        if os.path.exists(MARKER_FILE):
+            try:
+                with open(MARKER_FILE) as f:
+                    return json.load(f)
+            except Exception:
+                pass
         return {}
     try:
-        with open(MARKER_FILE) as f:
+        with open(marker_path) as f:
             return json.load(f)
     except Exception:
         return {}
@@ -195,10 +209,30 @@ def _write_marker(data: dict) -> None:
     except Exception as e:
         log.warning(f"DB meta marker write failed: {e}")
     try:
-        with open(MARKER_FILE, "w") as f:
+        marker_path = _marker_file_path()
+        with open(marker_path, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
         log.warning(f"file marker write failed: {e}")
+
+
+def _resolve_gist_id() -> str | None:
+    """Resolve the Gist ID to use for backup or restore.
+
+    Priority order:
+    1. Market-specific GIST_ID env var / secrets (e.g. GIST_ID_US or GIST_ID_MY)
+    2. Global GIST_ID env var / secrets
+    3. Cached gist_id in DB meta or local marker files
+    """
+    code = _active_market_code()
+    gist_id = os.environ.get(f"GIST_ID_{code}")
+    if not gist_id:
+        gist_id = os.environ.get("GIST_ID")
+    if gist_id:
+        return gist_id
+
+    marker = _read_marker()
+    return marker.get("gist_id")
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +317,7 @@ def backup(force: bool = False, reason: str = "") -> dict:
             size_kb = len(encoded) / 1024
             result["size_kb"] = round(size_kb, 1)
 
-            marker = _read_marker()
-            gist_id = marker.get("gist_id")
+            gist_id = _resolve_gist_id()
 
             files = {_gist_filename(): {"content": encoded}}
 
@@ -360,11 +393,7 @@ def restore(gist_id: str | None = None) -> dict:
         return result
 
     if gist_id is None:
-        # v3.1.9: DB meta is primary (survives restore), then file, then env
-        marker = _read_marker()
-        gist_id = marker.get("gist_id")
-        if not gist_id:
-            gist_id = os.environ.get("GIST_ID")
+        gist_id = _resolve_gist_id()
 
     if not gist_id:
         result["reason"] = "no gist_id in meta, marker, or GIST_ID env (first run — nothing to restore)"
@@ -381,23 +410,31 @@ def restore(gist_id: str | None = None) -> dict:
         files = gist.get("files", {})
 
         # v3.7 migration: look for new filename first, then fall back to
-        # old v3.6 filename (bursa_agent_<CODE>_db.b64.gz without mode).
+        # old v3.6 filename (bursa_agent_<CODE>_db.b64.gz without mode),
+        # and finally fall back to ancient v3.3 filename (bursa_agent_db.b64.gz) for MY.
         # This allows recovery after the filename scheme changed mid-session.
         target_file = _gist_filename()
         if target_file not in files:
             # Try legacy filename (v3.6 format without trading mode)
             code = _active_market_code()
             legacy_filename = f"bursa_agent_{code}_db.b64.gz"
+            ancient_filename = "bursa_agent_db.b64.gz"
             if legacy_filename in files:
                 log.warning(
                     f"New filename '{target_file}' not in Gist — "
                     f"falling back to legacy '{legacy_filename}' for restore"
                 )
                 target_file = legacy_filename
+            elif code == "MY" and ancient_filename in files:
+                log.warning(
+                    f"New filename '{target_file}' not in Gist — "
+                    f"falling back to ancient '{ancient_filename}' for restore"
+                )
+                target_file = ancient_filename
             else:
                 result["reason"] = (
-                    f"gist {gist_id} has no file '{_gist_filename()}' "
-                    f"or legacy '{legacy_filename}'"
+                    f"gist {gist_id} has no file '{_gist_filename()}', "
+                    f"legacy '{legacy_filename}', or ancient '{ancient_filename}'"
                 )
                 return result
 
@@ -442,15 +479,28 @@ def restore(gist_id: str | None = None) -> dict:
             # the restore itself succeeded. Log and continue.
             log.error(f"post-restore init_db failed: {_mig_err}")
 
-        # v3.1.6: also restore the ML classifier .pkl if present
+        # v3.1.6: also restore the ML classifier .pkl if present (with fallbacks)
         ml_bytes = 0
-        if _ml_gist_filename() in files:
+        ml_target_file = _ml_gist_filename()
+        if ml_target_file not in files:
+            # Try legacy (v3.6)
+            code = _active_market_code()
+            legacy_ml = f"setup_classifier_{code}.pkl.b64.gz"
+            ancient_ml = "setup_classifier.pkl.b64.gz"
+            if legacy_ml in files:
+                ml_target_file = legacy_ml
+            elif code == "MY" and ancient_ml in files:
+                ml_target_file = ancient_ml
+            else:
+                ml_target_file = None
+
+        if ml_target_file and ml_target_file in files:
             try:
-                ml_encoded = _fetch_file_content(files[_ml_gist_filename()])
+                ml_encoded = _fetch_file_content(files[ml_target_file])
                 if ml_encoded:
                     ml_bytes = _decode_gist_to_db(ml_encoded.strip(),
                                                     ML_MODEL_PATH)
-                    log.info(f"ML classifier restored ({ml_bytes} bytes)")
+                    log.info(f"ML classifier restored ({ml_bytes} bytes) from {ml_target_file}")
             except Exception as e:
                 log.warning(f"ML classifier restore failed (non-fatal): {e}")
 
