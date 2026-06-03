@@ -271,3 +271,93 @@ class TestDrawdownEquityCalculation:
         drawdown = (initial_capital - total_equity) / initial_capital * 100
         assert drawdown == pytest.approx(1.0, abs=0.1), \
             "$50 real loss on $5k = 1% drawdown, not 17.6%"
+
+
+# ---------------------------------------------------------------------------
+# Regression: SWING and INTRADAY must use separate Gist filenames
+# ---------------------------------------------------------------------------
+
+class TestGistFilenameIsolation:
+    """Each (market, mode) pair must back up to a unique Gist filename.
+
+    This prevents any two deployments from overwriting each other:
+      MY cloud   → bursa_agent_MY_SWING_db.b64.gz
+      US cloud   → bursa_agent_US_SWING_db.b64.gz
+      Local PC   → bursa_agent_US_INTRADAY_db.b64.gz
+
+    No IS_STREAMLIT_CLOUD guard needed — filename isolation is sufficient.
+    """
+
+    def test_gist_filename_includes_mode(self, monkeypatch):
+        """Gist filename must include trading mode to prevent SWING/INTRADAY collision."""
+        monkeypatch.setenv("MARKET_MODE", "US")
+        monkeypatch.setenv("TRADING_MODE", "INTRADAY")
+
+        import market_profiles as _mp
+        _mp.reset_cache()
+        _mp.reset_trading_mode_cache()
+
+        import persistence
+        fname = persistence._gist_filename()
+        assert "INTRADAY" in fname, f"Gist filename must contain mode: {fname}"
+        assert "US" in fname, f"Gist filename must contain market: {fname}"
+
+    def test_gist_filename_swing_vs_intraday_different(self, monkeypatch):
+        """SWING and INTRADAY must produce different Gist filenames — zero conflict."""
+        monkeypatch.setenv("MARKET_MODE", "US")
+
+        import market_profiles as _mp
+        import persistence
+
+        monkeypatch.setenv("TRADING_MODE", "SWING")
+        _mp.reset_trading_mode_cache()
+        swing_file = persistence._gist_filename()
+
+        monkeypatch.setenv("TRADING_MODE", "INTRADAY")
+        _mp.reset_trading_mode_cache()
+        intraday_file = persistence._gist_filename()
+
+        assert swing_file != intraday_file, (
+            f"SWING and INTRADAY must use different Gist files.\n"
+            f"  SWING:    {swing_file}\n"
+            f"  INTRADAY: {intraday_file}"
+        )
+
+    def test_my_swing_vs_us_swing_different(self, monkeypatch):
+        """MY SWING and US SWING must produce different filenames — zero conflict."""
+        import market_profiles as _mp
+        import persistence
+
+        monkeypatch.setenv("TRADING_MODE", "SWING")
+
+        monkeypatch.setenv("MARKET_MODE", "MY")
+        _mp.reset_cache()
+        _mp.reset_trading_mode_cache()
+        my_file = persistence._gist_filename()
+
+        monkeypatch.setenv("MARKET_MODE", "US")
+        _mp.reset_cache()
+        _mp.reset_trading_mode_cache()
+        us_file = persistence._gist_filename()
+
+        assert my_file != us_file
+        assert "MY" in my_file and "US" in us_file
+
+    def test_four_deployments_four_unique_filenames(self, monkeypatch):
+        """All 4 (market, mode) pairs must produce 4 unique Gist filenames."""
+        import market_profiles as _mp
+        import persistence
+
+        filenames = set()
+        for market in ["MY", "US"]:
+            for mode in ["SWING", "INTRADAY"]:
+                monkeypatch.setenv("MARKET_MODE", market)
+                monkeypatch.setenv("TRADING_MODE", mode)
+                _mp.reset_cache()
+                _mp.reset_trading_mode_cache()
+                fname = persistence._gist_filename()
+                filenames.add(fname)
+
+        assert len(filenames) == 4, (
+            f"Expected 4 unique Gist filenames, got {len(filenames)}: {filenames}"
+        )
