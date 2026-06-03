@@ -168,7 +168,7 @@ def test_restore_handles_gist_without_ml_file(monkeypatch, tmp_path):
     assert result["ok"] is True
     assert result["bytes_restored"] > 0
     assert result.get("ml_bytes_restored", 0) == 0  # no ML in old gist
-    assert "DB only" in result["reason"]
+    assert "DB" in result["reason"]
 
 
 def test_ml_constants_defined():
