@@ -339,14 +339,16 @@ Each market has its OWN SQLite database file with the full schema (~22 tables):
 - **`scheduler_state`** (broker_mode, autotrade toggles, reconciliation status) → separate per DB
 - **`live_trigger_config`** (Telegram/Email filter) → separate per DB
 
-### Gist backup is per-market too
+### Gist backup is per-(market, mode) too
 
 Inside your single private Gist:
 ```
-bursa_agent_MY_db.b64.gz            ← MY DB (gzipped + base64)
-setup_classifier_MY.pkl.b64.gz      ← MY ML model
-bursa_agent_US_db.b64.gz            ← US DB
-setup_classifier_US.pkl.b64.gz      ← US ML model
+bursa_agent_MY_SWING_db.b64.gz            ← MY SWING DB (gzipped + base64)
+setup_classifier_MY_SWING.pkl.b64.gz      ← MY SWING ML model
+bursa_agent_US_SWING_db.b64.gz            ← US SWING DB
+setup_classifier_US_SWING.pkl.b64.gz      ← US SWING ML model
+bursa_agent_US_INTRADAY_db.b64.gz         ← US INTRADAY DB
+setup_classifier_US_INTRADAY.pkl.b64.gz    ← US INTRADAY ML model
 ```
 
 ---
