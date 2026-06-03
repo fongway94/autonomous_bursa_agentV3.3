@@ -976,9 +976,10 @@ trades, and the Bayesian brain can never cross-contaminate:
 └── .gist_marker.json             # Gist backup pointer
 ```
 
-Gist backup is **per-market** too: `bursa_agent_MY_db.b64.gz`,
-`bursa_agent_US_db.b64.gz`, `setup_classifier_MY.pkl.b64.gz`,
-`setup_classifier_US.pkl.b64.gz` inside the single private Gist.
+Gist backup is **per-(market, mode)**: `bursa_agent_MY_SWING_db.b64.gz`,
+`bursa_agent_US_SWING_db.b64.gz`, `bursa_agent_US_INTRADAY_db.b64.gz`,
+`setup_classifier_MY_SWING.pkl.b64.gz`, `setup_classifier_US_SWING.pkl.b64.gz`,
+`setup_classifier_US_INTRADAY.pkl.b64.gz` inside the single private Gist.
 
 `db._resolve_db_path()` dispatches on `active_market_code()`. **Override
 detection is by basename** (`bursa_agent_<CODE>.db` = auto; any other name =
@@ -1088,11 +1089,11 @@ never crashes with `no such table: account`.
 | `meta` | No (key/value) | Cross-container state (Gist marker, PAT rotation timestamp) — v3.1.9 |
 | `corporate_actions_processed` | No | Split/bonus/dividend idempotency guard — v3.5 |
 
-**v3.6:** the schema above exists **once per market** — in `bursa_agent_MY.db`
-AND `bursa_agent_US.db`. Each file is backed up to the Gist independently
-(`bursa_agent_MY_db.b64.gz` / `bursa_agent_US_db.b64.gz`). The active market is
+**v3.7:** the schema above exists **once per (market, mode)** — e.g. in `bursa_agent_MY_SWING.db`
+AND `bursa_agent_US_SWING.db` / `bursa_agent_US_INTRADAY.db`. Each file is backed up to the Gist independently
+(e.g., `bursa_agent_MY_SWING_db.b64.gz` / `bursa_agent_US_SWING_db.b64.gz` / `bursa_agent_US_INTRADAY_db.b64.gz`). The active market is
 chosen by `market_profiles.active_market_code()` (env `MARKET_MODE` → marker
-file → default MY). See §14.
+file → default MY) and active mode is chosen by `market_profiles.active_trading_mode()`. See §14 & §15.
 
 ---
 
