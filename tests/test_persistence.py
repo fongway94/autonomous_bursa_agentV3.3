@@ -84,6 +84,15 @@ def test_encode_decode_roundtrip(tmp_path):
 def test_marker_read_write_round_trip(tmp_path, monkeypatch):
     """Marker file should round-trip a dict."""
     import persistence
+    import os
+    from db import DATA_DIR
+    for f in os.listdir(DATA_DIR):
+        if "gist_marker" in f:
+            try:
+                os.remove(os.path.join(DATA_DIR, f))
+            except Exception:
+                pass
+
     monkeypatch.setattr(persistence, "MARKER_FILE",
                         str(tmp_path / "marker.json"))
 
@@ -224,12 +233,18 @@ def test_boot_restore_falls_back_to_gist_id_env_var(monkeypatch):
     import base64
     from db import DATA_DIR, DB_PATH
 
-    # Wipe marker file
-    marker_path = os.path.join(DATA_DIR, ".gist_marker.json")
-    if os.path.exists(marker_path):
-        os.remove(marker_path)
+    # Wipe marker files
+    for f in os.listdir(DATA_DIR):
+        if "gist_marker" in f:
+            try:
+                os.remove(os.path.join(DATA_DIR, f))
+            except Exception:
+                pass
 
     # Wipe DB so restore is attempted
+    active_db = persistence._db_path()
+    if os.path.exists(active_db):
+        os.remove(active_db)
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     from db import init_db
