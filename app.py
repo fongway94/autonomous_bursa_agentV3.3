@@ -173,6 +173,12 @@ hr { border-top: 1px solid var(--border) !important; }
 """
 st.markdown(LIGHT_CSS, unsafe_allow_html=True)
 
+# Show pending toast messages from previous runs (e.g. across st.rerun())
+if "pending_toast" in st.session_state:
+    p_toast = st.session_state.pop("pending_toast")
+    if p_toast and isinstance(p_toast, dict):
+        st.toast(p_toast.get("message", ""), icon=p_toast.get("icon", "✅"))
+
 PLOTLY_TEMPLATE = "plotly_white"
 PLOTLY_LAYOUT = dict(
     template=PLOTLY_TEMPLATE,
@@ -191,18 +197,29 @@ PLOTLY_LAYOUT = dict(
 # only when local DB is empty (won't overwrite live data on every rerun).
 if "boot_restore_attempted" not in st.session_state:
     try:
-        from persistence import boot_restore_once, is_configured
-        if is_configured():
-            r = boot_restore_once()
-            if r.get("ok"):
-                gist_id = r.get("gist_id", "unknown")
-                gist_short = gist_id[:12] if gist_id and gist_id != "unknown" else "unknown"
-                st.toast(
-                    f"♻️ Restored brain from backup "
-                    f"({r['bytes_restored']:,} bytes) "
-                    f"← Gist {gist_short}…",
-                    icon="✅"
-                )
+        from persistence import boot_restore_once
+        r = boot_restore_once()
+        if r.get("ok"):
+            gist_id = r.get("gist_id", "unknown")
+            gist_short = gist_id[:12] if gist_id and gist_id != "unknown" else "unknown"
+            source_file = r.get("source_file", "unknown")
+            st.toast(
+                f"♻️ Restored brain from backup "
+                f"({r['bytes_restored']:,} bytes) "
+                f"← Gist `{gist_short}` | File: `{source_file}`",
+                icon="✅"
+            )
+        elif r.get("skipped"):
+            st.toast(
+                f"ℹ️ Boot restore skipped: {r.get('reason')}",
+                icon="ℹ️"
+            )
+        else:
+            reason = r.get("reason", "unknown error")
+            st.toast(
+                f"❌ Boot restore failed: {reason}",
+                icon="❌"
+            )
     except Exception as e:
         st.warning(f"Backup restore skipped: {e}")
     st.session_state["boot_restore_attempted"] = True
@@ -2248,32 +2265,50 @@ with tab_settings:
                     "- Token expired: regenerate and update Streamlit Secrets.\n"
                     "- Network blip: try again."
                 )
+        if "restore_confirm_active" not in st.session_state:
+            st.session_state["restore_confirm_active"] = False
+
         if bc2.button("♻️ Restore from latest backup",
                        use_container_width=True):
+            st.session_state["restore_confirm_active"] = True
+
+        if st.session_state["restore_confirm_active"]:
             st.warning(
                 "⚠️ This will OVERWRITE your current local database "
                 "with the latest backup. Active positions, recent trades, "
                 "and brain learning since the last backup will be LOST."
             )
-            if st.button("✅ Yes, restore (cannot be undone)"):
+            col1, col2 = st.columns(2)
+            if col1.button("✅ Yes, restore (cannot be undone)", type="primary", use_container_width=True):
+                st.session_state["restore_confirm_active"] = False
                 with st.spinner("Downloading from Gist…"):
                     res = _pers_restore()
                 if res["ok"]:
                     gist_id = res.get("gist_id", "unknown")
                     gist_short = gist_id[:12] if gist_id and gist_id != "unknown" else "unknown"
-                    from persistence import _gist_filename as _pfn
-                    try:
-                        fname = _pfn()
-                    except Exception:
-                        fname = "unknown"
-                    st.success(
-                        f"✅ Restored {res['bytes_restored']:,} bytes "
-                        f"← Gist `{gist_short}…` "
-                        f"file: `{fname}`"
-                    )
+                    source_file = res.get("source_file", "unknown")
+                    st.session_state["pending_toast"] = {
+                        "message": (
+                            f"♻️ Restored brain from backup "
+                            f"({res['bytes_restored']:,} bytes) "
+                            f"← Gist `{gist_short}` | File: `{source_file}`"
+                        ),
+                        "icon": "✅"
+                    }
                     st.rerun()
                 else:
-                    st.error(f"❌ Restore failed: {res['reason']}")
+                    st.session_state["pending_toast"] = {
+                        "message": f"❌ Restore failed: {res['reason']}",
+                        "icon": "❌"
+                    }
+                    st.rerun()
+            if col2.button("❌ Cancel", use_container_width=True):
+                st.session_state["restore_confirm_active"] = False
+                st.session_state["pending_toast"] = {
+                    "message": "ℹ️ Restore cancelled",
+                    "icon": "ℹ️"
+                }
+                st.rerun()
 
     st.markdown("### Kill-Switch")
     ss = get_scheduler_state()
