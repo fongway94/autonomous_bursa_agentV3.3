@@ -1212,7 +1212,7 @@ def _loop(interval_sec: int, my_pid: int):
                     except Exception:
                         pass
 
-                    if wfo_due and closed_count >= 100:
+                    if wfo_due and closed_count >= 30:  # v3.7: was 100, lowered to 30 so WFO runs during 6-month noop
                         if try_claim_daily_task("walk_forward_optimize", my_pid):
                             log_scheduler_event(
                                 "WFO_START",
@@ -1617,8 +1617,13 @@ def _build_intraday_bar_data() -> dict:
 
     Used by auto_settle_intraday() and force_flat_all_intraday().
     Falls back to last known price from the DB if a live fetch fails.
+
+    v3.7: STALE BAR detection — bars >5 minutes old during market hours
+    are flagged as stale. Uses MY time (server timezone) for consistency.
+    Test data with old dates is accepted (overnight gap is expected).
     """
     bar_data: dict = {}
+    stale_tickers: list = []
     try:
         from intraday_engine import get_active_intraday_tickers
         tickers = get_active_intraday_tickers()
@@ -1629,35 +1634,88 @@ def _build_intraday_bar_data() -> dict:
 
     try:
         from data_provider import get_history
+        from datetime import datetime, timezone, time as dtime
+        # Use MY time (server timezone) for all date comparisons
+        now_myt = get_myt_now()
+        today_myt = now_myt.date()
+
         for tk in tickers:
+            age_min = None
             try:
                 df = get_history(tk, interval="5m", period="5d", timeout=30)
                 if df is None or df.empty:
                     continue
+                last_ts = df.index[-1]
                 last = df.iloc[-1]
+
+                # v3.7: STALE BAR CHECK
+                # Only check during market hours AND when bar is from today.
+                # Outside market hours: accept whatever data we have (overnight gap)
+                # Test data (old dates): accept it — not real market hours data
+                bar_date = last_ts.date() if hasattr(last_ts, 'date') else None
+                is_today = (bar_date == today_myt) if bar_date else False
+
+                if is_today:
+                    # Check if inside MY market hours (09:30-16:00 MYT)
+                    # Approximate: MY is UTC+8, market hours are 09:30-16:00 MYT
+                    myt_hour = now_myt.hour
+                    is_market_hours_myt = (9 <= myt_hour < 16)
+
+                    if is_market_hours_myt:
+                        # Market is open in MY time — check bar freshness
+                        now_utc = datetime.now(timezone.utc)
+                        bar_ts = last_ts.to_pydatetime()
+                        if bar_ts.tzinfo is None:
+                            bar_ts = bar_ts.replace(tzinfo=timezone.utc)
+                        age_min = (now_utc - bar_ts).total_seconds() / 60
+
+                        if age_min > 5.0:
+                            stale_tickers.append(tk)
+                            from repository import active_trades
+                            for t in active_trades():
+                                if t["ticker"] == tk and t.get("execution_type") == "AGENT_INTRADAY":
+                                    px = float(t.get("highest_price", t.get("entry_price", 0)))
+                                    bar_data[tk] = {
+                                        "price": px, "high": px,
+                                        "low": float(t.get("lowest_price", px)),
+                                        "_stale": True,
+                                        "_bar_age_min": round(age_min, 1),
+                                    }
+                            continue
+
+                # Normal path: use the live bar data
                 bar_data[tk] = {
                     "price": float(last["Close"]),
                     "high": float(last["High"]),
                     "low": float(last["Low"]),
                 }
+                if age_min is not None:
+                    bar_data[tk]["_bar_age_min"] = round(age_min, 1)
+
             except Exception:
-                # Fallback: use the trade's own highest/lowest tracking
+                # Fallback: use the trade's own tracking
                 try:
                     from repository import active_trades
                     for t in active_trades():
-                        if t["ticker"] == tk and t.get(
-                                "execution_type") == "AGENT_INTRADAY":
-                            px = float(t.get("highest_price",
-                                             t.get("entry_price", 0)))
+                        if t["ticker"] == tk and t.get("execution_type") == "AGENT_INTRADAY":
+                            px = float(t.get("highest_price", t.get("entry_price", 0)))
                             bar_data[tk] = {
-                                "price": px,
-                                "high": px,
+                                "price": px, "high": px,
                                 "low": float(t.get("lowest_price", px)),
                             }
                 except Exception:
                     pass
     except Exception:
         pass
+
+    if stale_tickers:
+        log_scheduler_event(
+            "STALE_BAR_DETECTED",
+            f"Intraday bar data stale for: {stale_tickers}. "
+            "Using DB fallback prices. Check Moomoo feed.",
+            "WARN",
+        )
+
     return bar_data
 
 
