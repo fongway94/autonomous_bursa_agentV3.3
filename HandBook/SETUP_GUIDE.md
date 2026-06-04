@@ -1,4 +1,4 @@
-# BursaAI Swing Agent — Setup Guide (v3.6)
+# BursaAI Swing Agent — Setup Guide (v3.7)
 
 **Multi-market · Autonomous · Self-learning · Light-themed · Audited**
 
@@ -7,14 +7,17 @@ Markets: 🇲🇾 Bursa Malaysia (KLSE) · 🇺🇸 NYSE/NASDAQ
 
 ---
 
-## What v3.6 added vs v3.5
+## What v3.7 added vs v3.6
 
-- **Multi-market support** — switch between MY (Bursa) and US (NYSE/NASDAQ) from the sidebar dropdown
-- **Per-market isolated databases** — `bursa_agent_MY.db` / `bursa_agent_US.db`, separate trade history, Bayesian brain, risk params
-- **Full Moomoo US execution adapter** — NOOP / SIMULATE / REAL broker modes
-- **Per-cycle reconciliation** — internal vs broker drift alerts via Telegram
-- **Symmetric data fallback** — Moomoo OpenD ↔ yfinance for both markets (MY gated to yfinance until Moomoo OpenAPI adds Bursa)
-- **Timezone-aware Settings** — because you trade from Malaysia, US session/cutoff times show as both native exchange time **and** the MYT equivalent (e.g. `09:30–16:00 ET (21:30–04:00 MYT)`)
+- **US Intraday Mode (5-min ORB Strategy)** — high-speed Opening Range Breakout engine for a curated-6 US universe, complete with VWAP confirmation and daily EMA-200 trend filters.
+- **True Intraday High/Low Exits Check** — scheduler fetches 3-month daily High/Low and 50-day EMA to check active swing exits on hourly ticks, preventing any missed intraday spikes or protection drops.
+- **MA50 > MA200 Trend Alignment Filter** — mandatory alignment check in `screener.py` to exclude false breakouts in structural bear markets.
+- **Volume Dry-Up (VDU) Pullback Filter** — pullback buys are now restricted to low-volume (dry volume) days, preventing the agent from buying during institutional selling.
+- **Climax Run Exits** — automatic profit-taking exit if an active swing trade stretches $\ge 20\%$ above its 50-day EMA.
+- **Progressive Exposure (The Minervini Rule)** — audits the last 5 closed trades and scales down next positions by 50% if in a consecutive losing streak or if the win rate drops $\le 40\%$.
+- **ATR Volatility-Adjusted Sizing** — scales share count based on Average True Range (`ATR * 1.5`) rather than tight support distance, ensuring completely uniform portfolio risk volatility.
+- **Per-(Market, Mode) Gist Isolation** — isolated database and ML model files side-by-side inside your private Gists, fully resolving file overwrites between different active profiles.
+- **Secrets TOML Fallback Engine** — added a robust parser that reads Gist ID overrides (`GIST_ID_MY` and `GIST_ID_US`) directly from `.streamlit/secrets.toml` for local and background runs.
 
 ---
 
@@ -62,9 +65,10 @@ streamlit run app.py
 
 Open http://localhost:8501. The Robo-Trader starts automatically.
 
-Per-market persistent SQLite DBs are created at:
-- `~/.bursa_agent_data/bursa_agent_MY.db`
-- `~/.bursa_agent_data/bursa_agent_US.db`
+Per-(market, mode) persistent SQLite DBs are created at:
+- `~/.bursa_agent_data/bursa_agent_MY_SWING.db`
+- `~/.bursa_agent_data/bursa_agent_US_SWING.db`
+- `~/.bursa_agent_data/bursa_agent_US_INTRADAY.db`
 
 Rotating text logs at `~/.bursa_agent_data/logs/bursa_agent.log`.
 
