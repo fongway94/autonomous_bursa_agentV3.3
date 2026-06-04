@@ -565,6 +565,20 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
 
         # ----- Exit conditions (priority order) -----
 
+        # Climax Run: price stretches too far above 50-day EMA (e.g., >= 20%)
+        ema50 = px.get("ema50")
+        if ema50 is not None:
+            stretch_pct = (current_price - ema50) / ema50 * 100
+            if stretch_pct >= 20.0:
+                ok, msg = execute_full_exit(
+                    t["id"], current_price,
+                    reason=f"Climax Run Exit: Price stretched {stretch_pct:.1f}% above 50-day EMA",
+                    outcome="WIN", actor=actor)
+                if ok:
+                    settled.append({"trade_id": t["id"], "type": "CLIMAX", "msg": msg,
+                                    "ticker": ticker, "outcome": "WIN"})
+                continue
+
         # 1. TP3
         if high_today >= tp3:
             ok, msg = execute_full_exit(t["id"], tp3,
