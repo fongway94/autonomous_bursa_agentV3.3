@@ -24,9 +24,9 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Shared value types
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class TickerSpec:
@@ -51,9 +51,9 @@ class TradingSession:
     end: dtime
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Callable contracts (for the slippage / calendar functions)
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 SlippageFn = Callable[
     [
@@ -70,9 +70,9 @@ IsHolidayFn = Callable[[datetime], bool]
 """Given a market-local datetime, return True if that calendar day is a public holiday."""
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # The MarketProfile Protocol
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 @runtime_checkable
 class MarketProfile(Protocol):
@@ -118,6 +118,11 @@ class MarketProfile(Protocol):
     # --- risk defaults (can be overridden in risk_params table) ---
     min_risk_per_trade: float          # min absolute risk in currency (e.g. RM 50, USD 20)
 
+    # --- exit sizing ---
+    climax_stretch_pct: float          # FIX 3: price stretch above 50-day EMA to trigger
+                                        # climax-run profit exit. Market-specific (US ETFs wider
+                                        # than MY stocks). Default 20.0%.
+
     # --- learner / scheduler tuning (rarely overridden) ---
     cycle_interval_sec: int            # 3600 (1h) default
     bull_max_positions: int
@@ -137,9 +142,9 @@ class MarketProfile(Protocol):
     intraday_rel_vol_threshold: float  # breakout-bar volume vs session-avg, e.g. 1.2
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Helper functions usable by every profile
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 def is_within_sessions(now_local: datetime, sessions: tuple[TradingSession, ...]) -> bool:
     """True if `now_local` time-of-day falls inside any session window."""
@@ -163,9 +168,9 @@ def next_session_start(now_local: datetime, sessions: tuple[TradingSession, ...]
     return datetime.combine(tomorrow, sessions[0].start, tzinfo=now_local.tzinfo)
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Display helpers (v3.6) — used by the Settings UI so it adapts per market
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 # The user runs the app from Malaysia, so for non-MY markets we ALSO render
 # the equivalent wall-clock time in MYT. This lets a Malaysia-based trader
