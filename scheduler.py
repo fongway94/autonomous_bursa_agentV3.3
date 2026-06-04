@@ -520,8 +520,19 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
             if row["ticker"] in active_tickers:
                 continue
             entry = row["entry"]; sl = row["stop_loss"]
-            risk_per_share = max(entry - sl, 0.001)
-            target_shares = int(risk_per_trade_rm / risk_per_share)
+            
+            # --- ATR-Based Position Sizing (Turtles & O'Neil Standard) ---
+            # Instead of raw entry - sl (which can become dangerously small on tight support),
+            # we use ATR * Multiplier to determine the natural volatility-based share count.
+            atr = float(row.get("atr", entry * 0.03))
+            try:
+                from risk_manager import load_risk_params
+                atr_mult = float(load_risk_params().get("atr_multiplier_stop", 1.5))
+            except Exception:
+                atr_mult = 1.5
+            vol_risk_per_share = max(atr * atr_mult, 0.001)
+            
+            target_shares = int(risk_per_trade_rm / vol_risk_per_share)
             target_shares = (target_shares // _lot) * _lot
             if target_shares < max(_lot, 1):
                 continue
@@ -530,7 +541,7 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
                 trades, {"ticker": row["ticker"], "sector": row["sector"],
                          "entry": entry, "stop_loss": sl,
                          "cost": actual_cost,
-                         "risk_amount": risk_per_share * target_shares},
+                         "risk_amount": vol_risk_per_share * target_shares},
                 total_equity, acc["initial_capital"])
             if not risk_check["pass"]:
                 summary["rejected"] += 1
