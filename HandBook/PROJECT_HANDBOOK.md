@@ -1307,8 +1307,15 @@ python validate_intraday_edge.py
 python intraday_backtest_v3.py | Tee-Object -FilePath v3_report.txt
 ```
 
-See `HandBook/orb_backtest_results.md` for the full round-1 through round-4
-results and the honest caveats about edge concentration.
+### 15.11 High-Performance Edge Tuning Upgrades (v3.7)
+
+To optimize the agent's edge, we integrated five professional trading enhancements:
+1. **MA50 > MA200 Trend Alignment Filter:** Added a 50-day EMA calculation to `screener.py` and made `EMA50 > EMA200` a mandatory bullish alignment requirement for long setups. This completely avoids false "dead-cat bounces" in long-term downtrends.
+2. **Volume Dry-Up (VDU) Pullback Filter:** Refactored the pullback trigger to require dry pullback volume (`is_dry_volume`), preventing the agent from entering during institutional distribution.
+3. **IBD RS Percentile Leader Booster:** Top 20% relative strength market leaders automatically get a `+7` boost to their breakout setup confidence score.
+4. **Climax Run Profit Exit:** Automatically exits an active swing position if the price stretches $\ge 20\%$ above its 50-day EMA, locking in profits during vertical bursts.
+5. **Progressive Exposure (The Minervini Rule):** Risk manager automatically halves next position sizes (`size_multiplier = 0.5`) if the agent is on a 3-consecutive-loss streak or if its recent win rate falls $\le 40\%$.
+6. **ATR Volatility-Adjusted Sizing:** Shares are sized dynamically using the Average True Range (`ATR * 1.5`) rather than tight support distance, ensuring uniform portfolio risk volatility.
 
 ---
 
