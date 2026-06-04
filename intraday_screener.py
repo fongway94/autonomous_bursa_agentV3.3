@@ -77,8 +77,12 @@ INTRADAY_DEFAULTS = ORBConfig(
     flat_by=dtime(15, 55),
 )
 
-DEFAULT_INTRADAY_WATCHLIST = [
-    "TNA", "GOOGL", "TQQQ", "MSTR", "SOXL", "PLTR",
+DEFAULT_INTRADAY_WATCHLIST = [  # v3.7: QQQ/SPY first (highest Sharpe), TQQQ demoted
+    "QQQ", "SPY",  # highest Sharpe — primary intraday signals
+    "SPXL", "UPRO",  # 3x bull, solid edge
+    "SOXL", "FNGU",  # sector plays with edge
+    "TNA", "GOOGL", "MSTR", "PLTR",  # secondary
+    "TQQQ",  # WEAK signal — only when QQQ momentum is very strong
 ]
 
 INTRADAY_EMA_LENGTH = 200
