@@ -72,6 +72,7 @@ def compute_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     df["EMA_Fast"] = df["Close"].ewm(span=params["ema_fast"], adjust=False).mean()
     df["EMA_Slow"] = df["Close"].ewm(span=params["ema_slow"], adjust=False).mean()
     df["EMA_Trend"] = df["Close"].ewm(span=params["ema_trend"], adjust=False).mean()
+    df["EMA_Mid"] = df["Close"].ewm(span=50, adjust=False).mean()
 
     df["RSI"] = calculate_rsi(df["Close"], period=14)
 
@@ -206,7 +207,9 @@ def analyze_stock_setup(ticker, df, params,
     max_price = params.get("max_price", 4.00)
     is_in_price_range = min_price <= close <= max_price
 
-    is_long_term_uptrend = close > ema_trend
+    ema_mid = float(last.get("EMA_Mid", close))
+    is_bullish_alignment = ema_mid > ema_trend
+    is_long_term_uptrend = (close > ema_trend) and is_bullish_alignment
     is_med_term_uptrend = close > ema_slow
     is_short_term_uptrend = close > ema_fast
 
@@ -230,7 +233,7 @@ def analyze_stock_setup(ticker, df, params,
                      (float(prev["EMA_Fast"]) >= float(prev["EMA_Slow"]))
     is_rsi_overbought_hook = (float(prev["RSI"]) >= params.get("rsi_overbought", 70)) \
                              and (rsi < float(prev["RSI"]))
-    is_below_trend = close < ema_trend
+    is_below_trend = (close < ema_trend) or (not is_bullish_alignment)
 
     regime = (market_regime or {}).get("regime_data", {}).get("regime", "NEUTRAL")
 
@@ -249,8 +252,11 @@ def analyze_stock_setup(ticker, df, params,
         base_confidence = 20.0
     elif is_below_trend:
         signal_type = "REDUCE / AVOID"
-        reasoning.append(f"Price below long-term EMA {params['ema_trend']}. "
-                         "Structural downtrend — avoid entry.")
+        if close < ema_trend:
+            reasoning.append(f"Price below long-term EMA {params['ema_trend']}. "
+                             "Structural downtrend — avoid entry.")
+        else:
+            reasoning.append(f"Bearish Trend Alignment: 50-day EMA ({ema_mid:.2f}) is below 200-day EMA ({ema_trend:.2f}).")
         base_confidence = 25.0
     elif is_death_cross or is_rsi_overbought_hook:
         signal_type = "SELL / TAKE PROFIT"
@@ -282,21 +288,28 @@ def analyze_stock_setup(ticker, df, params,
             elif rs_signal == "LAGGING":
                 base_confidence -= 5
                 reasoning.append("⚠️ Stock lagging market — weak RS.")
+            try:
+                if rs_data and ticker in rs_data:
+                    rs_pct = rs_data[ticker].get("rs_percentile", 0)
+                    if rs_pct >= 80.0:
+                        base_confidence += 7
+                        reasoning.append(f"Top 20% Market Leader (RS Percentile: {rs_pct}%).")
+            except Exception:
+                pass
             if q_override == "BUY":
                 base_confidence += 5 * q_modifier
                 reasoning.append(f"Brain: BUY (score {q_modifier:.2f}).")
             elif q_override == "AVOID":
                 base_confidence -= 12 * q_modifier
                 reasoning.append("⚠️ Brain: historical losses on this setup.")
-        elif is_pullback_ema or is_pullback_rsi:
+        elif (is_pullback_ema or is_pullback_rsi) and is_dry_volume:
             signal_type = "GOLD BUY (PULLBACK)"
             if is_pullback_ema:
                 reasoning.append(f"Price finding support at rising Slow EMA "
                                  f"({params['ema_slow']}).")
             if is_pullback_rsi:
                 reasoning.append(f"RSI pulled back to {rsi:.1f} — hook up.")
-            if is_dry_volume:
-                reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
+            reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
             if close > float(last["Open"]):
                 reasoning.append("Bullish candle at support.")
                 base_confidence += 5
