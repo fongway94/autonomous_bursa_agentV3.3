@@ -403,13 +403,22 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
         for t in active_trades():
             ticker = t["ticker"]
             try:
-                df_t = get_history(ticker, period="5d", timeout=15)
+                # Fetch 3 months of daily bars to compute the 50-day EMA
+                df_t = get_history(ticker, period="3mo", timeout=15)
                 if df_t is not None and not df_t.empty:
+                    # Calculate 50-day EMA
+                    ema50 = None
+                    if len(df_t) >= 50:
+                        try:
+                            ema50 = df_t["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
+                        except Exception:
+                            pass
                     last_row = df_t.iloc[-1]
                     price_lookup[ticker] = {
                         "price": float(last_row["Close"]),
                         "high": float(last_row["High"]),
                         "low": float(last_row["Low"]),
+                        "ema50": float(ema50) if ema50 is not None else None,
                     }
             except Exception as e:
                 log.warning(f"Failed to fetch live exit price for {ticker}: {e}")
