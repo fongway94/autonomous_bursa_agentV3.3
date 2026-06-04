@@ -41,6 +41,8 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import TimeSeriesSplit
 
 from db import connect, myt_iso, DATA_DIR
+# v3.7: exploration threshold — only start exploiting after N closed trades
+DEFAULT_EXPLORATION_TRADES = 75
 from repository import (
     load_parameters, save_parameters,
     load_bias_state, save_bias_state, closed_trades,
@@ -151,7 +153,7 @@ def _exploration_active() -> bool:
     state = get_scheduler_state()
     if not state.get("exploration_mode", 0):
         return False
-    target = state.get("exploration_trades_target", 50) or 50
+    target = state.get("exploration_trades_target", DEFAULT_EXPLORATION_TRADES)
     return len(closed_trades()) < target
 
 
@@ -342,15 +344,18 @@ def learn_from_trade_outcome(trade: dict) -> dict:
 
         _update_strategy_bias(trade)
 
+        # v3.7: capture exit_type for learning quality analysis
+        exit_type = trade.get("exit_type", "UNKNOWN")
         log_learning_event(
             "BAYES_UPDATE",
-            f"State#{state_id} {action} → {outcome} (R={r_mult:+.2f})",
+            f"State#{state_id} {action} → {outcome} [{exit_type}] (R={r_mult:+.2f})",
             changes={"state_id": state_id, "action": action,
                      "alpha": round(prior["alpha"], 2),
                      "beta": round(prior["beta"], 2)},
             metrics={"r_multiple": round(r_mult, 3),
                      "pnl_pct": round(pnl_pct, 2),
-                     "n_trades": prior["n"]},
+                     "n_trades": prior["n"],
+                     "exit_type": exit_type},
         )
         return {
             "state_id": state_id, "action": action,
@@ -470,9 +475,17 @@ def _simulate_trades(df: pd.DataFrame, params: dict) -> list[dict]:
 
 
 def _score_param_set(trades: list[dict]) -> dict:
+    """
+    Score a param set's trades. Returns win_rate, profit_factor,
+    combined score, n_trades, AND sharpe-like (annualised risk-adjusted R).
+    
+    Sharpe-like = mean(pnl_pct per trade) / std(pnl_pct) * sqrt(252)
+    A value < 0.3 means the strategy's edge is statistically questionable.
+    """
     if len(trades) < 5:
         return {"win_rate": 0, "profit_factor": 0,
-                "combined": 0, "n_trades": len(trades)}
+                "combined": 0, "n_trades": len(trades),
+                "sharpe_like": 0.0}
     wins = [t for t in trades if t["outcome"] == "WIN"]
     losses = [t for t in trades if t["outcome"] == "LOSS"]
     wr = len(wins) / len(trades)
@@ -480,8 +493,17 @@ def _score_param_set(trades: list[dict]) -> dict:
     tl = abs(sum(t["pnl_pct"] for t in losses))
     pf = tp / (tl + 1e-9)
     combined = wr * 0.4 + min(pf / 2.0, 1.0) * 0.6
+    
+    # v3.7: Sharpe-like (annualised risk-adjusted R)
+    pnl_vals = [t["pnl_pct"] for t in trades]
+    mean_pnl = sum(pnl_vals) / len(pnl_vals)
+    variance = sum((p - mean_pnl) ** 2 for p in pnl_vals) / max(len(pnl_vals) - 1, 1)
+    std_pnl = variance ** 0.5
+    sharpe_like = (mean_pnl / std_pnl) * (252 ** 0.5) if std_pnl > 0 else 0.0
+    
     return {"win_rate": wr, "profit_factor": pf,
-            "combined": combined, "n_trades": len(trades)}
+            "combined": combined, "n_trades": len(trades),
+            "sharpe_like": round(sharpe_like, 4)}
 
 
 def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, float]:
@@ -556,7 +578,9 @@ def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, 
                 all_trades.extend(test_trades)
             grid_scores[gi].append(_score_param_set(all_trades))
 
-    best_idx, best_score, best_pf, best_wr, best_n = None, -1, 0, 0, 0
+    # v3.7: Sharpe gate minimum
+    SHARPE_GATE = 0.3
+    best_idx, best_score, best_pf, best_wr, best_n, best_sharpe = None, -1, 0, 0, 0, 0.0
     aggregated = []
     for gi, scores in grid_scores.items():
         if not scores:
@@ -565,17 +589,21 @@ def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, 
         avg_combined = float(np.mean([s["combined"] for s in scores]))
         avg_wr = float(np.mean([s["win_rate"] for s in scores]))
         avg_pf = float(np.mean([s["profit_factor"] for s in scores]))
+        avg_sharpe = float(np.mean([s["sharpe_like"] for s in scores]))
         aggregated.append({"grid": gi, "params": search_grid[gi],
                            "avg_combined": avg_combined, "avg_wr": avg_wr,
-                           "avg_pf": avg_pf, "n_total": n_total})
-        if n_total >= 30 and avg_combined > best_score:
+                           "avg_pf": avg_pf, "n_total": n_total,
+                           "avg_sharpe": round(avg_sharpe, 4)})
+        # v3.7: Sharpe-like gate — reject lucky grids with high combined but no real edge
+        if n_total >= 30 and avg_combined > best_score and avg_sharpe >= SHARPE_GATE:
             best_score = avg_combined; best_idx = gi
             best_pf = avg_pf; best_wr = avg_wr; best_n = n_total
+            best_sharpe = avg_sharpe
 
     if best_idx is None:
         log_learning_event(
             "WALK_FORWARD_REJECTED",
-            "No parameter set produced ≥30 OOS trades; params unchanged.",
+            "No parameter set passed the Sharpe-like ≥0.3 gate; params unchanged.",
             metrics={"grids_tested": len(search_grid)},
         )
         return None, 0, 0
@@ -923,3 +951,61 @@ def decay_priors(decay_factor: float = 0.95):
         f"Applied decay factor of {decay_factor} to state_priors",
         changes={"decay_factor": decay_factor}
     )
+
+
+def decay_priors_if_warranted(decay_factor: float = 0.95) -> dict:
+    """
+    v3.7: Conditional decay — only runs when we have enough data to make
+    the decision meaningful. Prevents destroying the prior with insufficient
+    signal.
+
+    Conditions:
+      * ≥5 distinct states have ≥20 trades each.
+
+    This prevents the decay from accidentally flattening priors when the
+    brain only has 10 trades across 2 states.
+    """
+    with connect() as c:
+        cur = c.execute(
+            """SELECT COUNT(*) FROM state_priors
+               WHERE n_trades >= 20"""
+        )
+        rich_states = cur.fetchone()[0]
+
+        cur = c.execute("SELECT COUNT(DISTINCT state_id) FROM state_priors")
+        total_states = cur.fetchone()[0]
+
+    if rich_states < 5 or total_states < 5:
+        return {
+            "decayed": False,
+            "reason": f"Only {rich_states}/5 required rich states, "
+                      f"{total_states} total states",
+            "rich_states": rich_states,
+            "total_states": total_states,
+        }
+
+    if not (0.5 <= decay_factor < 1.0):
+        return {"decayed": False, "reason": "Invalid decay_factor"}
+
+    with connect() as c:
+        c.execute(
+            "UPDATE state_priors SET "
+            "alpha = MAX(1.0, alpha * ?), "
+            "beta = MAX(1.0, beta * ?)",
+            (decay_factor, decay_factor)
+        )
+
+    log_learning_event(
+        "PRIORS_DECAY_CONDITIONAL",
+        f"Conditional decay applied (factor={decay_factor}) "
+        f"because {rich_states} states had ≥20 trades.",
+        changes={"decay_factor": decay_factor,
+                 "rich_states": rich_states,
+                 "total_states": total_states},
+    )
+    return {
+        "decayed": True,
+        "decay_factor": decay_factor,
+        "rich_states": rich_states,
+        "total_states": total_states,
+    }
