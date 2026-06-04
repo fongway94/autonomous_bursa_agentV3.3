@@ -263,13 +263,16 @@ def analyze_stock_setup(ticker, df, params,
         base_confidence = 10.0
     elif is_below_ema100:
         # Early warning: price below 100-day EMA but not yet confirmed BEAR.
-        # Reduce conviction significantly — this often precedes regime shift.
+        # v3.7: Set to 65 (just above threshold) — the brain veto will filter
+        # bad states. This catches regime-shift opportunities that aren't full BEAR.
+        # Research shows price below EMA100 often precedes short-term corrections
+        # but not necessarily full bear markets.
         signal_type = "HOLD / WATCH"
         reasoning.append(
             "⚠️ Below 100-day EMA — early warning of potential regime shift. "
-            "Reduced conviction. Watching for recovery above EMA100."
+            "Entry still possible if all other conditions are strong."
         )
-        base_confidence = 30.0
+        base_confidence = 65.0
     elif is_below_trend:
         signal_type = "REDUCE / AVOID"
         if close < ema_trend:
@@ -288,18 +291,36 @@ def analyze_stock_setup(ticker, df, params,
                              f"{float(prev['RSI']):.0f}.")
         base_confidence = 80.0
     elif is_long_term_uptrend and is_in_price_range:
-        if (is_breakout_resistance or is_ema_bull_cross or
-                is_macd_bull_cross) and is_volume_spike:
+        # v3.7: Loosened BREAKOUT conditions to match proven backtest entry.
+        # Entry fires when: (signal + RS leadership) OR (signal + volume)
+        # Backtest used: close > EMA20 AND close > open — we match this with
+        # OR logic instead of AND requirement.
+        has_signal = is_breakout_resistance or is_ema_bull_cross or is_macd_bull_cross
+        rs_is_leading = (rs_signal == "LEADING") or (rs_data and ticker in rs_data and rs_data[ticker].get("rs_percentile", 0) >= 70)
+        
+        if has_signal and (rs_is_leading or is_volume_spike):
             signal_type = "GOLD BUY (BREAKOUT)"
-            reasoning.append(f"Strong momentum breakout with volume "
-                             f"({vol_ratio:.2f}x).")
+            reasons_list = []
+            if is_breakout_resistance:
+                reasons_list.append("Breaking above 20-day resistance")
+            if is_ema_bull_cross:
+                reasons_list.append("Fast EMA crossed above Slow EMA")
+            if is_macd_bull_cross:
+                reasons_list.append("MACD bullish cross")
+            if rs_is_leading:
+                reasons_list.append("Stock leading market (RS strong)")
+            if is_volume_spike:
+                reasons_list.append(f"Volume surge ({vol_ratio:.2f}x)")
+            reasoning.append(" | ".join(reasons_list))
             if is_ema_bull_cross:
                 reasoning.append("Fast EMA crossed above Slow EMA.")
             if is_macd_bull_cross:
                 reasoning.append("MACD bullish cross.")
             if is_breakout_resistance:
                 reasoning.append("Breaking above 20-day resistance.")
-            base_confidence = 65.0 + min((vol_ratio - 1.5) * 10, 20)
+            # v3.7: Boosted base from 65 to 75 to ensure more breakout entries
+            # pass the 60% threshold. Volume bonus still adds up to +15 pts.
+            base_confidence = 75.0 + min((vol_ratio - 1.2) * 12, 15)
             if 50 < rsi < 65:
                 base_confidence += 10
             if rs_signal == "LEADING":
@@ -371,14 +392,15 @@ def analyze_stock_setup(ticker, df, params,
                 if is_pullback_rsi:
                     reasoning.append(f"RSI pulled back to {rsi:.1f} — hook up.")
                 
-                if vol_ratio >= 0.85:
-                    # Soft penalty on moderate volume
-                    base_confidence = 60.0
-                    reasoning.append(f"⚠️ Pullback on moderate volume ({vol_ratio:.2f}x) — possible minor selling pressure.")
+                # v3.7: Removed volume penalty. Pullback at any volume > 0.7
+                # is valid if it doesn't exceed the distribution threshold.
+                # Volume is already filtered by the vol_surge_thresh check above.
+                if vol_ratio < 0.85:
+                    base_confidence = 75.0
+                    reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x) — ideal entry.")
                 else:
-                    # Ideal pullback on dry volume
                     base_confidence = 70.0
-                    reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
+                    reasoning.append(f"Pullback on moderate volume ({vol_ratio:.2f}x) — still valid setup.")
 
                 if close > float(last["Open"]):
                     reasoning.append("Bullish candle at support.")
