@@ -1406,6 +1406,108 @@ with tab_perf:
         st.dataframe(pd.DataFrame.from_dict(report["per_regime"], orient="index"),
                      use_container_width=True)
 
+    # v3.7: EXIT QUALITY ANALYSIS DASHBOARD
+    # Shows how trades are exiting — TP3 vs SL vs TIME vs MANUAL.
+    # This is the first actionable output from the exit_type tracking.
+    # The brain uses this to learn which states produce good exits vs bad exits.
+    try:
+        from db import connect
+        with connect() as c:
+            closed_trades = c.execute(
+                """SELECT ticker, signal_type, outcome, exit_type,
+                          closed_pnl, risk_per_share, shares,
+                          exit_price, entry_price
+                   FROM trades WHERE status='CLOSED' AND exit_type IS NOT NULL
+                   ORDER BY closed_at DESC LIMIT 500"""
+            ).fetchall()
+        
+        if closed_trades:
+            st.markdown("### Exit Quality Analysis")
+            st.caption(
+                "Tracks how trades exit: TP3/CLIMAX = ideal, SL = loss, "
+                "TIME = forced end-of-day, MANUAL = user closed."
+            )
+            
+            rows = []
+            for t in closed_trades:
+                ticker = t[0]; signal = t[1] or ""
+                outcome = t[2]; exit_type = t[3]
+                closed_pnl = t[4] or 0
+                rps = t[5] or 0; shares = t[6] or 1
+                exit_px = t[7] or 0; entry_px = t[8] or 0
+                
+                r_mult = (closed_pnl / (rps * shares)) if rps > 0 and shares > 0 else 0
+                rows.append({
+                    "ticker": ticker,
+                    "signal": signal[:30],
+                    "outcome": outcome,
+                    "exit_type": exit_type,
+                    "R-multiple": round(r_mult, 2),
+                    "P&L": round(closed_pnl, 2) if closed_pnl else 0,
+                })
+            
+            df_exit = pd.DataFrame(rows)
+            
+            if not df_exit.empty:
+                # Summary by exit_type
+                exit_summary = df_exit.groupby("exit_type").agg(
+                    count=("exit_type", "count"),
+                    avg_r=("R-multiple", "mean"),
+                    total_r=("R-multiple", "sum"),
+                    win_rate=("outcome", lambda x: (x=="WIN").mean()*100),
+                ).round(3)
+                exit_summary = exit_summary.sort_values("total_r", ascending=False)
+                exit_summary.columns = ["Trades", "Avg R", "Total R", "Win%"]
+                st.dataframe(exit_summary, use_container_width=True)
+                
+                # Per exit_type distribution
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**By exit_type count**")
+                    fig = go.Figure()
+                    counts = df_exit["exit_type"].value_counts()
+                    fig.add_trace(go.Pie(
+                        labels=counts.index, values=counts.values,
+                        hole=0.3, textinfo="label+value",
+                    ))
+                    fig.update_layout(height=280, **PLOTLY_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    st.markdown("**Avg R by exit_type**")
+                    fig = go.Figure(go.Bar(
+                        x=exit_summary.index, y=exit_summary["Avg R"],
+                        marker_color=["#16a34a" if r > 0 else "#dc2626" 
+                                     for r in exit_summary["Avg R"]],
+                    ))
+                    fig.update_layout(height=280, **PLOTLY_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Per ticker exit breakdown
+                if len(df_exit) >= 10:
+                    st.markdown("**Exit quality by ticker**")
+                    ticker_exit = df_exit.groupby(["ticker", "exit_type"]).agg(
+                        count=("exit_type", "count"),
+                        avg_r=("R-multiple", "mean"),
+                    ).round(3).reset_index()
+                    st.dataframe(ticker_exit, use_container_width=True)
+                
+                # Learning insight
+                best_exit = exit_summary["Avg R"].idxmax() if not exit_summary.empty else "?"
+                worst_exit = exit_summary["Avg R"].idxmin() if not exit_summary.empty else "?"
+                st.info(
+                    f"🧠 Brain learning insight: **{best_exit}** exits have "
+                    f"best avg R ({exit_summary.loc[best_exit, 'Avg R']:.2f}), "
+                    f"**{worst_exit}** have worst ({exit_summary.loc[worst_exit, 'Avg R']:.2f}). "
+                    "The brain uses this to prefer states that produce good exits."
+                )
+        else:
+            st.markdown("### Exit Quality Analysis")
+            st.info("⏳ No closed trades with exit_type yet. This section activates "
+                    "as trades close and the brain learns exit quality patterns.")
+    except Exception as _eq_err:
+        pass  # Non-critical — exit quality is a learning aid, not core system
+
 
 # =========================================================================
 # TAB 5 — Robo-Trader
