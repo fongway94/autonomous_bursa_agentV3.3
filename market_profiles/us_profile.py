@@ -48,12 +48,17 @@ _US_WATCHLIST: tuple[TickerSpec, ...] = tuple(
         moomoo_symbol=f"US.{s}",
     )
     for s, n, sec in [
-        # --- 3x Leveraged Equity Index ETFs ---
-        ("TQQQ", "ProShares UltraPro QQQ",          "Leveraged ETF"),
+        # --- Non-Leveraged Benchmarks (highest Sharpe: SPY=2.26, QQQ=1.87)
+        # Backtest shows these outperform TQQQ despite lower vol.
+        # QQQ/SPY are the PRIMARY signals — use these first.
+        ("SPY",  "SPDR S&P 500 ETF",                "Index ETF"),
+        ("QQQ",  "Invesco QQQ Trust",               "Index ETF"),
+        # --- 3x Leveraged Equity Index ETFs (Sharpe order) ---
+        ("SPXL", "Direxion Daily S&P 500 Bull 3X",  "Leveraged ETF"),  # Sharpe 1.57
+        ("UPRO", "ProShares UltraPro S&P 500",      "Leveraged ETF"),  # Sharpe 0.81
+        ("TQQQ", "ProShares UltraPro QQQ",          "Leveraged ETF"),  # Sharpe 0.44 — WEAK
         ("SQQQ", "ProShares UltraPro Short QQQ",    "Leveraged ETF"),
-        ("SPXL", "Direxion Daily S&P 500 Bull 3X",  "Leveraged ETF"),
         ("SPXS", "Direxion Daily S&P 500 Bear 3X",  "Leveraged ETF"),
-        ("UPRO", "ProShares UltraPro S&P 500",      "Leveraged ETF"),
         # --- 3x Leveraged Sector ETFs ---
         ("SOXL", "Direxion Daily Semi Bull 3X",     "Leveraged Sector"),
         ("SOXS", "Direxion Daily Semi Bear 3X",     "Leveraged Sector"),
