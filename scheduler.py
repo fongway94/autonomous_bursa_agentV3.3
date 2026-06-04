@@ -983,6 +983,16 @@ def _loop(interval_sec: int, my_pid: int):
                         record_daily_task_result(
                             "ml_retrain", f"error: {e}")
 
+                if try_claim_daily_task("decay_priors", my_pid):
+                    try:
+                        from learner import decay_priors
+                        decay_priors(0.95)
+                        log_scheduler_event("PRIORS_DECAY", f"Daily exponential decay of state priors applied (PID {my_pid})")
+                        record_daily_task_result("decay_priors", "ok")
+                    except Exception as e:
+                        log_scheduler_event("DECAY_PRIORS_ERROR", f"failed: {e}", "ERROR")
+                        record_daily_task_result("decay_priors", f"error: {e}")
+
             from repository import closed_trades, try_claim_daily_task, record_daily_task_result
             ss = get_scheduler_state()
             if ss.get("exploration_mode"):
