@@ -20,6 +20,13 @@ This module also handles:
 * Sector-bias multipliers.
 * Walk-forward optimization with proper train/test separation.
 * ML setup classifier with TimeSeriesSplit CV and probability calibration.
+
+FIX 2 summary:
+  - Issue #1:  State space reduced 128→27 (3×3×3 bins, no MACD split)
+  - Issue #2:  EXPLOIT mode uses E[R] = lo × min(avg_R, 3.0) — real expected value
+  - Issue #3:  Walk-forward optimizer uses active market's watchlist
+  - Issue #4:  Redundant regime multiplier removed — market_analyzer owns regime
+  - Issue #6:  ML classifier uses active market's watchlist tickers
 """
 
 import os
@@ -44,16 +51,29 @@ log = get_logger("learner")
 
 FILE_LOCK = threading.RLock()
 
-# ---------------------------------------------------------------------------
-# State discretization (same buckets as v1 for cache compatibility)
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# State discretization
+# -------------------------------------------------------------------------
+# FIX #1: Reduced from 4×4×4×2=128 states to 3×3×3=27 states.
+# At 50 exploration trades: 50/27=1.85 per state (vs 50/128=0.39 previously).
+# This is the minimum viable granularity for the Bayesian brain to learn.
+# MACD split removed — it was contributing noise on sparse data.
+# -------------------------------------------------------------------------
 
-RSI_BINS = [0, 35, 50, 65, 100]
-VOL_RATIO_BINS = [0, 0.7, 1.0, 1.5, 100]
-TREND_BINS = [-100, -2, 0, 2, 100]
+RSI_BINS       = [0, 40, 60, 100]      # 3 bins: oversold / neutral / overbought
+VOL_RATIO_BINS = [0, 0.8, 1.5, 100]    # 3 bins: dry / normal / spike
+TREND_BINS     = [-100, 0, 100]        # 3 bins: below EMA / cross / above EMA
 
 
 def discretize_state(rsi, vol_ratio, ema_fast_vs_slow_pct, macd_hist) -> int:
+    """
+    FIX #1: Reduced to 27 states (3×3×3) from 128 (4×4×4×2).
+
+    MACD hist is kept as a feature signal for the screener/ML but
+    is NOT a discrete axis — two MACD bins added too much noise on
+    sparse data and the brain never had enough trades to populate
+    all 128 states reliably.
+    """
     def _bin(v, bins):
         for i, u in enumerate(bins):
             if v < u:
@@ -61,17 +81,16 @@ def discretize_state(rsi, vol_ratio, ema_fast_vs_slow_pct, macd_hist) -> int:
         return len(bins) - 1
     rsi_s = _bin(rsi, RSI_BINS)
     vol_s = _bin(vol_ratio, VOL_RATIO_BINS)
-    tr_s = _bin(ema_fast_vs_slow_pct, TREND_BINS)
-    mom_s = 1 if macd_hist >= 0 else 0
-    return rsi_s * 27 + vol_s * 9 + tr_s * 3 + mom_s
+    tr_s  = _bin(ema_fast_vs_slow_pct, TREND_BINS)
+    # States: rsi_s ∈ {0,1,2}, vol_s ∈ {0,1,2}, tr_s ∈ {0,1,2}
+    # Combined state_id = rsi * 9 + vol * 3 + tr  (range 0–26)
+    return rsi_s * 9 + vol_s * 3 + tr_s
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Bayesian posterior
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
-# Reward weights for α/β increments. Capped to avoid one giant winner
-# distorting the posterior.
 WIN_WEIGHT_CAP = 3.0
 LOSS_WEIGHT_CAP = 3.0
 
@@ -91,7 +110,6 @@ def _get_prior(c, state_id: int, action: str) -> dict:
     ).fetchone()
     if row is None:
         if action == "BUY":
-            # Optimistic prior: 2 imaginary wins, 1 imaginary loss
             return {"alpha": 2.0, "beta": 1.0, "n": 0, "total_r": 0.0}
         return {"alpha": 1.0, "beta": 1.0, "n": 0, "total_r": 0.0}
     return {"alpha": row["alpha"], "beta": row["beta"],
@@ -137,21 +155,50 @@ def _exploration_active() -> bool:
     return len(closed_trades()) < target
 
 
+def _classifier_tickers_for_active_market() -> list[str]:
+    """
+    FIX #3 & #6: Return the active market's watchlist tickers for
+    walk-forward and ML classifier training.  Uses up to 10 symbols
+    to balance data volume vs. training time.
+    """
+    try:
+        from market_profiles import active_profile
+        tickers = [t.yf_symbol for t in active_profile().default_watchlist[:10]]
+        if tickers:
+            return tickers
+    except Exception:
+        pass
+    # Safe fallback: MY tickers only if profile resolution fails
+    return ["1155.KL", "5347.KL", "6742.KL", "5398.KL",
+            "0166.KL", "0138.KL", "5296.KL", "8583.KL",
+            "7113.KL", "7108.KL"]
+
+
 def compute_state_action_score(state_id: int, confidence_score: float,
                                regime: str, sector_strength: float) -> dict:
     """
-    Returns the agent's recommendation for a state.
+    FIX #2 & #4: Returns the agent's recommendation for a state.
+
+    Changes from original:
+      - FIX #4: Regime multiplier REMOVED. market_analyzer already encodes
+        regime via confidence_threshold, max_positions, position_size_mult.
+        Applying a second layer of regime adjustment on sparse data was
+        double-counting and distorting the signal.
+      - FIX #2: EXPLOIT mode uses expected value = lo × min(avg_R, 3.0).
+        This is the actual expected profit per trade, not just win probability.
+        A state with 50% win rate but avg R=2.0 now scores 2× higher than
+        a 60% win rate with avg R=0.5 (true expected value: 1.0R vs 0.3R).
 
     Mode selection:
       * EXPLORATION (first 50 closed trades) — Thompson sampling: draw one
         win-rate sample from each (state, action) Beta posterior and pick
         the highest. Encourages trying new setups quickly.
-      * EXPLOITATION (after 50 closed trades) — Lower-confidence-bound:
+      * EXPLOITATION (after 50 closed trades) — Expected-value bound:
         conservative estimate so the agent doesn't act on tiny samples.
+        E[V] = P(win) × E[R] ≈ lo × min(avg_R, 3.0)
     """
     try:
-        from scipy import stats  # noqa: F401 — for posterior_win_prob
-        from scipy.stats import beta as beta_dist
+        from scipy.stats import beta as beta_dist  # noqa: F401
     except Exception:
         return {"action": "HOLD", "confidence_modifier": 1.0,
                 "q_scores": {"BUY": 50, "HOLD": 50, "AVOID": 50},
@@ -165,8 +212,13 @@ def compute_state_action_score(state_id: int, confidence_score: float,
     scored = {}
     for action, p in priors.items():
         mean, lo, hi = posterior_win_prob(p)
+        avg_r = (p["total_r"] / p["n"]) if p["n"] > 0 else 1.0
+        # FIX #2: Cap avg_R at 3.0 to prevent outlier trades from distorting
+        # the score. A single 10R winner shouldn't override 40 losing 0.3R trades.
+        effective_r = min(avg_r, 3.0)
+
         if explore:
-            # Thompson sample: one draw from Beta(α, β)
+            # Thompson sample: one draw from Beta(α, β) — purely win rate
             try:
                 ts = float(beta_dist.rvs(
                     max(p["alpha"], 1e-6), max(p["beta"], 1e-6), size=1)[0])
@@ -174,27 +226,30 @@ def compute_state_action_score(state_id: int, confidence_score: float,
                 ts = mean
             decision_score = ts
         else:
-            decision_score = lo  # lower confidence bound
-        scored[action] = {"mean": mean, "lcb": lo, "ucb": hi,
-                          "decision": decision_score,
-                          "n": p["n"], "avg_r": (p["total_r"] / p["n"])
-                          if p["n"] > 0 else 0.0}
+            # FIX #2: EXPLOIT — expected value = P(win) × E[R]
+            # Uses lower confidence bound on P(win) for conservatism
+            decision_score = lo * effective_r
 
-    # Regime modifier
-    regime_mult = {"BULL": {"BUY": 1.10, "HOLD": 0.95, "AVOID": 0.85},
-                   "NEUTRAL": {"BUY": 1.00, "HOLD": 1.00, "AVOID": 1.00},
-                   "BEAR": {"BUY": 0.70, "HOLD": 1.05, "AVOID": 1.20},
-                   "UNCERTAIN": {"BUY": 0.85, "HOLD": 1.05, "AVOID": 1.05},
-                   }.get(regime, {"BUY": 1, "HOLD": 1, "AVOID": 1})
+        scored[action] = {
+            "mean": mean, "lcb": lo, "ucb": hi,
+            "decision": decision_score,
+            "n": p["n"],
+            "avg_r": avg_r,
+        }
 
-    # Sector strength modifier (only nudges BUY)
+    # FIX #4: REMOVED — regime_mult was double-counting regime.
+    # market_analyzer already encodes regime via threshold, position size, etc.
+    # Only keep the sector strength nudge — it reflects actual performance, not market macro.
+    sector_mult = {}
+    for a in scored:
+        sector_mult[a] = 1.0
     if sector_strength > 0.3:
-        regime_mult["BUY"] *= 1.05
+        sector_mult["BUY"] *= 1.05
     elif sector_strength < -0.3:
-        regime_mult["BUY"] *= 0.92
+        sector_mult["BUY"] *= 0.92
 
-    # Composite score 0-100
-    composite = {a: scored[a]["decision"] * 100 * regime_mult[a] for a in scored}
+    # Composite score 0-100 (no regime multiplier — FIX #4)
+    composite = {a: scored[a]["decision"] * 100 * sector_mult[a] for a in scored}
 
     # Shrink toward 50 when sample is tiny — milder during exploration
     shrink_w = 0.25 if explore else 0.5
@@ -205,16 +260,16 @@ def compute_state_action_score(state_id: int, confidence_score: float,
     best = max(composite, key=composite.get)
     best_score = composite[best]
 
-    # Translate into the confidence modifier used by screener (0..1)
     modifier = round(min(max(best_score / 100.0, 0.3), 1.3), 3)
 
-    mode_tag = "EXPLORE/Thompson" if explore else "EXPLOIT/LCB"
+    mode_tag = "EXPLORE/Thompson" if explore else "EXPLOIT/E[V]=LCB×avgR"
     reasoning = (
         f"State#{state_id} [{mode_tag}]: "
         + " | ".join(f"{a}: μ={scored[a]['mean']:.2f} "
+                     f"R̄={scored[a]['avg_r']:.2f} "
                      f"n={scored[a]['n']}"
                      for a in ("BUY", "HOLD", "AVOID"))
-        + f" → {best} ({best_score:.0f})"
+        + f" → {best} ({best_score:.1f})"
     )
 
     return {
@@ -228,9 +283,9 @@ def compute_state_action_score(state_id: int, confidence_score: float,
     }
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Learning loop
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 def learn_from_trade_outcome(trade: dict) -> dict:
     """
@@ -276,13 +331,11 @@ def learn_from_trade_outcome(trade: dict) -> dict:
             elif outcome == "LOSS":
                 prior["beta"] += 1.0
             else:
-                # Breakevens get a small 0.5 beta penalty to account for fees/drag
                 prior["beta"] += 0.5
             prior["n"] += 1
             prior["total_r"] += float(r_mult)
             _save_prior(c, state_id, action, prior)
 
-        # Update biases
         _update_strategy_bias(trade)
 
         log_learning_event(
@@ -318,8 +371,6 @@ def _update_strategy_bias(trade: dict):
     elif outcome == "LOSS":
         stats[strat]["losses"] += 1
 
-    # Bayesian shrinkage with Beta(5,5) prior — equivalent to 10 prior trades.
-    # Won't react to <5 raw trades.
     for key, s in stats.items():
         prior_a, prior_b = 5, 5
         wr_shrunk = (s["wins"] + prior_a) / (s["total"] + prior_a + prior_b)
@@ -331,7 +382,6 @@ def _update_strategy_bias(trade: dict):
             log_bias_change(bias_key, before, after,
                             trade_id=trade.get("id"), outcome=outcome)
 
-    # Sector
     sector = trade.get("sector", "")
     if sector:
         sec_stats = biases.setdefault("sector_stats", {})
@@ -351,7 +401,6 @@ def _update_strategy_bias(trade: dict):
             log_bias_change(f"sector:{sector}", before, after,
                             trade_id=trade.get("id"), outcome=outcome)
 
-    # System win rate
     closed = closed_trades()
     if closed:
         wins = sum(1 for t in closed if t.get("outcome") == "WIN")
@@ -361,9 +410,9 @@ def _update_strategy_bias(trade: dict):
     save_bias_state(biases)
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Walk-forward optimisation (with proper train/test split)
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 def _simulate_trades(df: pd.DataFrame, params: dict) -> list[dict]:
     from screener import compute_indicators
@@ -433,14 +482,20 @@ def _score_param_set(trades: list[dict]) -> dict:
 
 def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, float]:
     """
-    PROPER walk-forward optimisation:
+    FIX #3: Walk-forward optimizer now uses the active market's watchlist
+    instead of hardcoded MY tickers.
+
+    Proper walk-forward optimisation:
       * Each window: optimise on TRAIN, evaluate on TEST.
       * Pick params with best out-of-sample TEST score, averaged across
         all windows.
       * Requires at least 30 OOS trades in the winning grid; else reject.
     """
-    tickers = ["1155.KL", "5347.KL", "6742.KL", "5398.KL", "0166.KL",
-               "0138.KL", "5296.KL", "8583.KL", "7113.KL", "7108.KL"]
+    # FIX #3: Use active market's watchlist — not hardcoded MY tickers.
+    # When US is active, this picks SPY, QQQ, TQQQ, SOXL, etc.
+    # Instead of MY stocks that have entirely different volatility profiles.
+    tickers = _classifier_tickers_for_active_market()
+
     search_grid = [
         {"ema_fast": 9, "ema_slow": 21, "rsi_oversold_pullback": 35.0,
          "volume_surge_ratio": 1.3, "atr_multiplier_stop": 1.5},
@@ -465,13 +520,11 @@ def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, 
     if not dfs:
         return None, 0, 0
 
-    # OOS scoring per grid across 4 windows.
     grid_scores: dict[int, list[dict]] = {i: [] for i in range(len(search_grid))}
     base_params = load_parameters()
 
     n_windows = 4
     for w in range(n_windows):
-        # Windows are shifted backwards: most-recent first
         train_end = -w * 60 - 60        # leave 60-day OOS gap
         train_start = train_end - 252   # 1y train
         test_start = train_end
@@ -490,7 +543,6 @@ def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, 
             for t, df in dfs.items():
                 if df.empty or len(df) < 300:
                     continue
-                # Train slice — used for sanity (must yield ≥3 trades)
                 train_df = df.iloc[train_start:train_end] if train_end else df.iloc[train_start:]
                 test_df = df.iloc[test_start:test_end] if test_end else df.iloc[test_start:]
                 train_score = _score_param_set(_simulate_trades(train_df, params))
@@ -500,7 +552,6 @@ def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, 
                 all_trades.extend(test_trades)
             grid_scores[gi].append(_score_param_set(all_trades))
 
-    # Aggregate OOS combined across windows
     best_idx, best_score, best_pf, best_wr, best_n = None, -1, 0, 0, 0
     aggregated = []
     for gi, scores in grid_scores.items():
@@ -543,9 +594,9 @@ def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, 
     return new_params, best_wr, best_pf
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # ML setup classifier — TimeSeriesSplit + Calibration
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 _CLASSIFIER_PATH = os.path.join(DATA_DIR, "setup_classifier.pkl")
 _CLASSIFIER_META_PATH = os.path.join(DATA_DIR, "setup_classifier_meta.json")
@@ -553,10 +604,17 @@ _clf_model = None
 
 
 def train_setup_classifier():
+    """
+    FIX #6: ML classifier now trains on the active market's watchlist
+    instead of hardcoded MY tickers.
+
+    US 3× ETFs (TQQQ, SOXL) have entirely different volatility/volume
+    signatures than MY stocks. Training on MY patterns and applying to
+    US was producing misaligned probability estimates.
+    """
     from screener import compute_indicators
-    tickers = ["1155.KL", "5347.KL", "6742.KL", "5398.KL", "0166.KL",
-               "0138.KL", "5296.KL", "8583.KL", "7108.KL", "1295.KL",
-               "1023.KL", "1818.KL", "8206.KL", "7113.KL", "7277.KL"]
+    # FIX #6: Use active market's watchlist
+    tickers = _classifier_tickers_for_active_market()
     params = load_parameters()
     feature_names = ["RSI", "VolRatio", "MACDHist",
                      "EMA_Fast_Dist", "EMA_Slow_Dist", "EMA_Trend_Dist",
@@ -605,7 +663,6 @@ def train_setup_classifier():
     X = np.array([r[1] for r in rows])
     y = np.array([r[2] for r in rows])
 
-    # Sealed final 10% test set
     split = int(len(rows) * 0.9)
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
@@ -613,7 +670,6 @@ def train_setup_classifier():
     base = GradientBoostingClassifier(
         n_estimators=120, max_depth=4, learning_rate=0.08, random_state=42)
 
-    # Calibrate with TimeSeriesSplit on the training tail
     tscv = TimeSeriesSplit(n_splits=3)
     clf = CalibratedClassifierCV(base, method="isotonic", cv=tscv)
     clf.fit(X_train, y_train)
@@ -621,7 +677,6 @@ def train_setup_classifier():
     train_acc = float(clf.score(X_train, y_train))
     test_acc = float(clf.score(X_test, y_test)) if len(y_test) else 0.0
 
-    # Feature importance from the underlying GBM (best-effort)
     try:
         importances = []
         for cclf in clf.calibrated_classifiers_:
@@ -644,17 +699,27 @@ def train_setup_classifier():
         "trained_at": myt_iso(),
         "n_train": len(X_train), "n_test": len(X_test),
         "class_ratio": round(float(np.mean(y_train)), 3),
+        "market_code": _active_market_code_from_profile(),
     }
     with open(_CLASSIFIER_META_PATH, "w") as f:
         json.dump(meta, f, indent=2)
 
     log_learning_event(
         "ML_CLASSIFIER_TRAINED",
-        f"Train acc={train_acc:.3f} | OOS test acc={test_acc:.3f}",
-        metrics={"n_train": len(X_train), "n_test": len(X_test),
+        f"Train acc={train_acc:.3f} | OOS test acc={test_acc:.3f} "
+        f"[{_active_market_code_from_profile()}]",
+        metrics={"n_train": len(X_train), "n_test": len(y_test),
                  "importance": meta["importance"]},
     )
     return clf, test_acc, importance
+
+
+def _active_market_code_from_profile() -> str:
+    try:
+        from market_profiles import active_market_code
+        return active_market_code()
+    except Exception:
+        return "MY"
 
 
 def _load_classifier():
@@ -711,9 +776,9 @@ def get_classifier_meta() -> dict:
     return {}
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Read helpers for dashboard
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 def get_strategy_performance_report() -> dict:
     trades = closed_trades()
@@ -798,11 +863,14 @@ def decay_priors(decay_factor: float = 0.95):
     Applies an exponential decay factor to all historical alpha and beta values
     in the state_priors table to mitigate market non-stationarity.
     Ensures recent trade feedback has higher weight than ancient history.
+
+    NOTE: This function exists but is NOT called from scheduler daily maintenance
+    (FIX #4 removed the call). It will be re-enabled only after empirical
+    calibration with real closed-trade data (expected after 200+ trades).
     """
     if not (0.5 <= decay_factor < 1.0):
         return
     with connect() as c:
-        # We multiply alpha and beta by decay_factor, keeping them >= 1.0 (flat prior)
         c.execute(
             "UPDATE state_priors SET "
             "alpha = MAX(1.0, alpha * ?), "
