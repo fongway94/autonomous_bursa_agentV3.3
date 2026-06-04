@@ -779,14 +779,18 @@ Each bug has a regression test guarding against its return.
 1. **Moomoo OpenAPI integration** — ✅ *data layer done in v3.4; US execution done in v3.6 (`MoomooUSAdapter`, NOOP/SIMULATE/REAL + `reconciliation.py`)*. Remaining: HK market profile; MY execution blocked until OpenAPI adds Bursa.
 2. **Live capital tracking** — separate `live_account` table that records real-broker mirror trades (reconciliation foundation landed in v3.6)
 3. **Stooq as 2nd free data fallback** — full redundancy beyond yfinance for both markets
-3. **Calibration-driven auto-mode-switch** — only enable EXECUTE mode if calibration chart shows <5% deviation
-4. **GitHub Actions CI** — auto-run pytest on every push
-5. **Telegram interactive buttons** — APPROVE/REJECT inline keyboard for each alert
-6. **Multi-account support** — track multiple paper accounts with different parameter sets
-7. **Rolling-window learning** — fade brain priors older than N months so it adapts to market regime shifts
-8. **ML classifier in backup** — include .pkl in Gist so it persists across resets
-9. **Multi-revision restore UI** — let user pick which historical backup to restore (currently always latest)
-10. **Subprocess-isolated market scan** — run `screen_all_stocks()` in a subprocess with hard `timeout=` so a Yahoo hang can be `SIGKILL`ed (currently we recover within 10 min via watchdog, but the cycle itself still wastes that time)
+4. **Calibration-driven auto-mode-switch** — only enable EXECUTE mode if calibration chart shows <5% deviation
+5. **GitHub Actions CI** — auto-run pytest on every push
+6. **Telegram interactive buttons** — APPROVE/REJECT inline keyboard for each alert
+7. **Multi-account support** — track multiple paper accounts with different parameter sets
+8. **Rolling-window learning** — fade brain priors older than N months so it adapts to market regime shifts
+9. **ML classifier in backup** — include .pkl in Gist so it persists across resets
+10. **Multi-revision restore UI** — let user pick which historical backup to restore (currently always latest)
+11. **Subprocess-isolated market scan** — run `screen_all_stocks()` in a subprocess with hard `timeout=` so a Yahoo hang can be `SIGKILL`ed (currently we recover within 10 min via watchdog, but the cycle itself still wastes that time)
+12. **Risk-Aware Contextual Gaussian Thompson Sampling (GTS) [Quantum Leap Milestone]:**
+    - **What:** Upgrade the US Swing & US Intraday brains to model continuous R-multiple returns using a Normal-Inverse-Gamma (NIG) prior and a linear contextual utility model ($U(a) = \mu_a - \lambda \sigma_a$) to optimize directly for Sharpe/Sortino Ratios. 
+    - **Note:** Keep the simple Beta-Bernoulli MAB active for Malaysia to prevent overfitting under sparse Bursa volume.
+    - **When to transition to v4:** Only after completing **Block 8 (US Intraday Broker Mirroring)** and collecting **200+ live closed paper trades on the US markets** to provide the baseline data required to warm-start the continuous linear weight vectors.
 
 ### Intentional "v4 scaffolding" (kept on purpose, not dead code)
 
