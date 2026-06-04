@@ -1163,6 +1163,21 @@ def _loop(interval_sec: int, my_pid: int):
                             "BRAIN_HEALTH_ERROR", f"brain health check failed: {e}", "ERROR")
                         record_daily_task_result("brain_health_check", f"error: {e}")
 
+                # FIX #3-16: One-time cleanup of orphaned state IDs from pre-fix_2
+                # formula (128 states → 27 states). Idempotent, safe to run daily.
+                if try_claim_daily_task("state_priors_cleanup", my_pid):
+                    try:
+                        from learner import cleanup_orphaned_state_priors
+                        result = cleanup_orphaned_state_priors()
+                        record_daily_task_result(
+                            "state_priors_cleanup",
+                            f"removed={result.get('orphaned_removed', 0)}")
+                    except Exception as e:
+                        log_scheduler_event(
+                            "STATE_CLEANUP_ERROR",
+                            f"cleanup_orphaned_state_priors failed: {e}", "ERROR")
+                        record_daily_task_result("state_priors_cleanup", f"error: {e}")
+
                 # FIX #4 (fix_1): REMOVED — decay_priors(0.95) was an unvalidated hyperparameter.
                 # The Bayesian model already handles non-stationarity through direct
                 # alpha/beta updates on each new trade. A 0.95 daily decay halves the
@@ -1732,7 +1747,7 @@ def _run_intraday_cycle(autotrade: bool, autoexit: bool,
     # 4. Auto-entry (only during ACTIVE_TRADING, not OR_WINDOW)
     if autotrade and status["can_enter"] and moomoo_ok:
         try:
-            from intraday_engine import execute_intraday_entry
+            from intraday_engine import execute_intraday_entry, intraday_position_size
             from repository import load_account, load_trades
             from risk_manager import run_full_risk_check
 
@@ -1755,13 +1770,22 @@ def _run_intraday_cycle(autotrade: bool, autoexit: bool,
                 _intraday_mv = 0.0
             intraday_total_equity = cash + _intraday_mv
 
+            # FIX #3-7: Use same risk_pct as execute_intraday_entry for position sizing.
+            risk_pct = 1.0  # INTRADAY_DEFAULT_RISK_PCT from intraday_engine
+
             for sig in signals:
                 ticker = sig["ticker"]
                 if ticker in active_set:
                     # Already have an open intraday position — skip
                     continue
 
-                # Run risk checks
+                # FIX #3-7: Use actual position size in risk check, not hardcoded 10 shares.
+                # intraday_position_size() uses risk_pct of capital — same formula as execute_intraday_entry.
+                actual_shares = intraday_position_size(
+                    sig["entry"], sig["stop_loss"],
+                    capital=intraday_total_equity,
+                    risk_pct=risk_pct,
+                )
                 risk_result = run_full_risk_check(
                     trades,
                     {
@@ -1769,9 +1793,8 @@ def _run_intraday_cycle(autotrade: bool, autoexit: bool,
                         "sector": sig.get("sector", ""),
                         "entry": sig["entry"],
                         "stop_loss": sig["stop_loss"],
-                        "cost": sig["entry"] * 10,
-                        "risk_amount": (
-                            sig["entry"] - sig["stop_loss"]) * 10,
+                        "cost": sig["entry"] * actual_shares,
+                        "risk_amount": (sig["entry"] - sig["stop_loss"]) * actual_shares,
                     },
                     intraday_total_equity,
                     initial_capital,
