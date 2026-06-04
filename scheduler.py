@@ -1188,7 +1188,7 @@ def _loop(interval_sec: int, my_pid: int):
             from repository import closed_trades, try_claim_daily_task, record_daily_task_result
             ss = get_scheduler_state()
             if ss.get("exploration_mode"):
-                tgt = ss.get("exploration_trades_target", 50) or 50
+                tgt = ss.get("exploration_trades_target", 75) or 75
                 done = len(closed_trades())
                 if done >= tgt:
                     if try_claim_daily_task("exploration_end", my_pid):
