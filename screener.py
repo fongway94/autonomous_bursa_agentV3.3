@@ -73,6 +73,7 @@ def compute_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     df["EMA_Slow"] = df["Close"].ewm(span=params["ema_slow"], adjust=False).mean()
     df["EMA_Trend"] = df["Close"].ewm(span=params["ema_trend"], adjust=False).mean()
     df["EMA_Mid"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA100"] = df["Close"].ewm(span=100, adjust=False).mean()  # v3.7: fast EMA for early warning
 
     df["RSI"] = calculate_rsi(df["Close"], period=14)
 
@@ -246,10 +247,29 @@ def analyze_stock_setup(ticker, df, params,
     q_override = (q_action or {}).get("action", "HOLD")
     q_modifier = (q_action or {}).get("confidence_modifier", 1.0)
 
-    if regime == "BEAR" and not is_long_term_uptrend:
+    # v3.7 CRITICAL FIX: Block ALL long entries when market_analyzer says BEAR.
+    # Bear market validation showed: Avg R=-0.067 in BEAR regime (vs +0.078 in BULL).
+    # 2022 QQQ was above EMA200 for some months but still lost -0.417 avg R.
+    # The EMA-based "below trend" check is too slow. Full regime block is correct.
+    # We ALSO check a fast EMA100 as early warning before a full bear develops.
+    is_below_ema100 = close < float(last.get("EMA100", close * 0.99)) if "EMA100" in last.index else False
+    
+    if regime == "BEAR":
         signal_type = "REDUCE / AVOID"
-        reasoning.append("Bear market regime — no new long positions.")
-        base_confidence = 20.0
+        reasoning.append(
+            "🚨 BEAR REGIME — all long entries blocked. "
+            "Bear market validation: Avg R=-0.067 in BEAR vs +0.078 in BULL."
+        )
+        base_confidence = 10.0
+    elif is_below_ema100:
+        # Early warning: price below 100-day EMA but not yet confirmed BEAR.
+        # Reduce conviction significantly — this often precedes regime shift.
+        signal_type = "HOLD / WATCH"
+        reasoning.append(
+            "⚠️ Below 100-day EMA — early warning of potential regime shift. "
+            "Reduced conviction. Watching for recovery above EMA100."
+        )
+        base_confidence = 30.0
     elif is_below_trend:
         signal_type = "REDUCE / AVOID"
         if close < ema_trend:
