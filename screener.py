@@ -208,8 +208,13 @@ def analyze_stock_setup(ticker, df, params,
     is_in_price_range = min_price <= close <= max_price
 
     ema_mid = float(last.get("EMA_Mid", close))
+    # FIX 5: EMA50 > EMA200 (is_bullish_alignment) used to be a HARD gate.
+    # The handbook states "EMA-50 and EMA-100 produce identical results to no filter"
+    # — only EMA200 proved meaningful. Now used as a soft +5 confidence BOOST
+    # instead of a hard blocker. This prevents the funnel from closing in choppy
+    # markets where EMA50 temporarily dips below EMA200.
     is_bullish_alignment = ema_mid > ema_trend
-    is_long_term_uptrend = (close > ema_trend) and is_bullish_alignment
+    is_long_term_uptrend = (close > ema_trend)  # EMA200 only — the one that proved useful
     is_med_term_uptrend = close > ema_slow
     is_short_term_uptrend = close > ema_fast
 
@@ -303,10 +308,19 @@ def analyze_stock_setup(ticker, df, params,
                 base_confidence -= 12 * q_modifier
                 reasoning.append("⚠️ Brain: historical losses on this setup.")
         elif is_pullback_ema or is_pullback_rsi:
-            if vol_ratio >= 1.1:
-                # Distribution pullback — ignore and fall through
+            # FIX 5: Binary gate for pullback volume — not a soft penalty.
+            # is_dry_volume is vol_ratio < 0.8. A pullback on heavier volume
+            # (0.8-1.1x) is not a "soft penalty pullback" — it's a distribution
+            # pullback that should be rejected. Either the volume is dry (pass),
+            # or it's not a valid ORB pullback (reject and fall through to HOLD).
+            if not is_dry_volume:
+                # Moderate/heavy volume on a pullback = institutional distribution.
+                # Not a valid setup — fall through to HOLD/WATCH, don't force a signal.
                 signal_type = "HOLD / WATCH"
-                reasoning.append(f"⚠️ Pullback aborted — heavy distribution volume ({vol_ratio:.2f}x).")
+                reasoning.append(
+                    f"⚠️ Pullback on non-dry volume ({vol_ratio:.2f}x) — "
+                    "institutional distribution risk. No signal."
+                )
             else:
                 signal_type = "GOLD BUY (PULLBACK)"
                 if is_pullback_ema:
@@ -314,20 +328,17 @@ def analyze_stock_setup(ticker, df, params,
                                      f"({params['ema_slow']}).")
                 if is_pullback_rsi:
                     reasoning.append(f"RSI pulled back to {rsi:.1f} — hook up.")
-                
-                if vol_ratio >= 0.85:
-                    # Soft penalty on moderate volume
-                    base_confidence = 60.0
-                    reasoning.append(f"⚠️ Pullback on moderate volume ({vol_ratio:.2f}x) — possible minor selling pressure.")
-                else:
-                    # Ideal pullback on dry volume
-                    base_confidence = 70.0
-                    reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
+                reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
 
+                base_confidence = 70.0
+                if is_bullish_alignment:
+                    # Soft bonus: EMA50 above EMA200 confirms structural uptrend
+                    base_confidence += 5
+                    reasoning.append("EMA alignment confirmed (50-day > 200-day).")
                 if close > float(last["Open"]):
                     reasoning.append("Bullish candle at support.")
                     base_confidence += 5
-                
+
                 if q_override == "BUY":
                     base_confidence += 5 * q_modifier
                 elif q_override == "AVOID":
