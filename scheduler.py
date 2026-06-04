@@ -309,38 +309,81 @@ def _explain_cycle_outcome(summary: dict, df, regime: dict,
     return "Unknown reason for zero entries."
 
 
+def _fetch_ticker_price_data(ticker: str) -> tuple[str, dict | None]:
+    """
+    Fetch price data for one ticker. Returns (ticker, data_or_None).
+
+    FIX 1: Designed to run in a ThreadPoolExecutor for parallel fetching.
+    FIX 2: Uses the LAST COMPLETED DAILY BAR (yesterday) for exit high/low.
+           Today's incomplete bar is used only for current price (P&L tracking).
+           This prevents false exit triggers when the daily High/Low includes
+           pre-entry price action (e.g. a crash at 09:35 AM, trade entered at
+           10:00 AM → daily Low still contains the 09:35 crash, would trigger
+           a false SL exit on the same-day check).
+    """
+    try:
+        from data_provider import get_history
+        df_t = get_history(ticker, period="3mo", timeout=20)
+        if df_t is None or df_t.empty or len(df_t) < 2:
+            return ticker, None
+
+        # Last completed bar = second-to-last row (yesterday's fully closed bar)
+        last_closed = df_t.iloc[-2]
+        # Current bar = last row (may be incomplete / intraday)
+        current_row = df_t.iloc[-1]
+
+        # Calculate 50-day EMA from all closed bars (not today's incomplete bar)
+        ema50 = None
+        if len(df_t) >= 51:
+            closed_bars = df_t.iloc[:-1]  # exclude today
+            try:
+                ema50 = closed_bars["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            except Exception:
+                pass
+
+        return ticker, {
+            # Current price for unrealized P&L tracking
+            "price": float(current_row["Close"]),
+            # Yesterday's completed bar for exit triggers (no pre-entry contamination)
+            "high": float(last_closed["High"]),
+            "low": float(last_closed["Low"]),
+            # 50-day EMA from all closed bars
+            "ema50": float(ema50) if ema50 is not None else None,
+        }
+    except Exception as e:
+        log.warning(f"Failed to fetch live exit price for {ticker}: {e}")
+        return ticker, None
+
+
 def _run_fast_settle_only() -> dict:
-    """Check and settle active trades only (no scanning or entry, extremely lightweight)."""
+    """Check and settle active trades only (no scanning or entry, extremely lightweight).
+
+    FIX 1: Price fetching is now parallel (ThreadPoolExecutor), not sequential.
+           6 active positions fetch in ~1-2 seconds total instead of up to 90s.
+    FIX 2: Exit checks use yesterday's closed bar high/low, not today's incomplete
+           cumulative high/low. Prevents false SL exits from pre-entry price action.
+    """
     from trading_engine import auto_settle_trades
     from repository import active_trades, get_trade
-    from data_provider import get_history
     from learner import learn_from_trade_outcome
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     log_scheduler_event("SETTLE_START", "Fast-settling active trades (10-minute check)")
     price_lookup = {}
     summary = {"settled": 0, "partials": 0}
 
-    # Fetch true live daily High/Low for active trades
-    for t in active_trades():
-        ticker = t["ticker"]
-        try:
-            df_t = get_history(ticker, period="3mo", timeout=15)
-            if df_t is not None and not df_t.empty:
-                ema50 = None
-                if len(df_t) >= 50:
-                    try:
-                        ema50 = df_t["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
-                    except Exception:
-                        pass
-                last_row = df_t.iloc[-1]
-                price_lookup[ticker] = {
-                    "price": float(last_row["Close"]),
-                    "high": float(last_row["High"]),
-                    "low": float(last_row["Low"]),
-                    "ema50": float(ema50) if ema50 is not None else None,
-                }
-        except Exception as e:
-            log.warning(f"Failed to fetch live exit price for {ticker}: {e}")
+    active = active_trades()
+    if not active:
+        return summary
+
+    # FIX 1: Parallel price fetch — all active positions fetched simultaneously
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_fetch_ticker_price_data, t["ticker"]): t
+                   for t in active}
+        for fut in as_completed(futures):
+            ticker, data = fut.result()
+            if data is not None:
+                price_lookup[ticker] = data
 
     if price_lookup:
         try:
@@ -461,31 +504,19 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
                     "low": float(row["price"]),
                 }
                 
-        # Fetch true live daily High/Low for active trades to prevent missing intraday moves
+        # FIX 1+2: Parallel price fetch + last-closed-bar exit logic.
+        # Same pattern as _run_fast_settle_only() — keeps both paths consistent.
         from repository import active_trades
-        from data_provider import get_history
-        for t in active_trades():
-            ticker = t["ticker"]
-            try:
-                # Fetch 3 months of daily bars to compute the 50-day EMA
-                df_t = get_history(ticker, period="3mo", timeout=15)
-                if df_t is not None and not df_t.empty:
-                    # Calculate 50-day EMA
-                    ema50 = None
-                    if len(df_t) >= 50:
-                        try:
-                            ema50 = df_t["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
-                        except Exception:
-                            pass
-                    last_row = df_t.iloc[-1]
-                    price_lookup[ticker] = {
-                        "price": float(last_row["Close"]),
-                        "high": float(last_row["High"]),
-                        "low": float(last_row["Low"]),
-                        "ema50": float(ema50) if ema50 is not None else None,
-                    }
-            except Exception as e:
-                log.warning(f"Failed to fetch live exit price for {ticker}: {e}")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        active_pos = active_trades()
+        if active_pos:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(_fetch_ticker_price_data, t["ticker"]): t
+                           for t in active_pos}
+                for fut in as_completed(futures):
+                    ticker, data = fut.result()
+                    if data is not None:
+                        price_lookup[ticker] = data
 
         try:
             settle_res = auto_settle_trades(price_lookup, regime, actor="AGENT")
@@ -1080,15 +1111,12 @@ def _loop(interval_sec: int, my_pid: int):
                         record_daily_task_result(
                             "ml_retrain", f"error: {e}")
 
-                if try_claim_daily_task("decay_priors", my_pid):
-                    try:
-                        from learner import decay_priors
-                        decay_priors(0.95)
-                        log_scheduler_event("PRIORS_DECAY", f"Daily exponential decay of state priors applied (PID {my_pid})")
-                        record_daily_task_result("decay_priors", "ok")
-                    except Exception as e:
-                        log_scheduler_event("DECAY_PRIORS_ERROR", f"failed: {e}", "ERROR")
-                        record_daily_task_result("decay_priors", f"error: {e}")
+                # FIX 4: REMOVED — decay_priors(0.95) was an unvalidated hyperparameter.
+                # The Bayesian model already handles non-stationarity through direct
+                # alpha/beta updates on each new trade. A 0.95 daily decay halves the
+                # brain's knowledge in 14 days of no trading, which is destructive.
+                # Decay will be re-introduced only after empirical calibration with
+                # real closed-trade data (expected after 200+ trades).
 
             from repository import closed_trades, try_claim_daily_task, record_daily_task_result
             ss = get_scheduler_state()
