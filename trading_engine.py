@@ -458,14 +458,32 @@ def execute_full_exit(trade_id: int, current_price: float,
         else:
             outcome = "BREAKEVEN"
 
+    # v3.7: determine exit_type from reason string for learning quality analysis
+    reason_upper = (reason or "").upper()
+    if "STOP LOSS" in reason_upper or "SL HIT" in reason_upper:
+        exit_type = "SL"
+    elif "TARGET 3" in reason_upper or " TP3" in reason_upper:
+        exit_type = "TP3"
+    elif "TARGET 2" in reason_upper or " TP2" in reason_upper:
+        exit_type = "TP2"
+    elif "TARGET 1" in reason_upper or " TP1" in reason_upper:
+        exit_type = "TP1"
+    elif "CLIMAX" in reason_upper:
+        exit_type = "CLIMAX"
+    elif "FORCE-FLAT" in reason_upper or "FLAT BY" in reason_upper:
+        exit_type = "TIME"
+    else:
+        exit_type = "MANUAL"
+
     update_trade(trade_id, {
         "shares_remaining": 0, "phase": "CLOSED",
         "status": "CLOSED", "outcome": outcome,
         "realized_pnl": round(new_realized, 2),
         "closed_pnl": round(new_realized, 2),
         "exit_price": round(fill_price, 3),
+        "exit_type": exit_type,           # v3.7: exit quality tracking
         "closed_at": myt_iso(),
-        "notes": (t.get("notes", "") or "") + f" | Exit: {reason}",
+        "notes": (t.get("notes", "") or "") + f" | Exit: {reason} [{exit_type}]",
     })
 
     acc = load_account()
