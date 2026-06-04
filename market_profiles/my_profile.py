@@ -31,13 +31,13 @@ from market_profiles.base import (
 )
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Watchlist — mirrors watchlist.BURSA_TICKERS in v3.3.
 # Kept compact here (~30 representative names). The full ~74-ticker list
 # continues to live in watchlist.py for backward compatibility; that module
 # will be migrated to delegate to active_profile().default_watchlist in
 # a later block.
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 _MY_WATCHLIST: tuple[TickerSpec, ...] = tuple(
     TickerSpec(
@@ -91,9 +91,9 @@ _MY_WATCHLIST: tuple[TickerSpec, ...] = tuple(
 )
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Bursa-specific calendar helpers
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 def _is_my_holiday(local_dt: datetime) -> bool:
     """Delegate to market_calendar.MY_PUBLIC_HOLIDAYS (single source of truth).
@@ -110,9 +110,9 @@ def _is_my_holiday(local_dt: datetime) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Bursa-specific slippage (mirrors trading_engine.py volume-aware model)
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 def _bursa_slippage(price: float, qty: int, adv_value: float, side: str) -> float:
     """5 bps base + size-linear + liquidity penalty, capped 80 bps.
@@ -139,9 +139,9 @@ def _bursa_slippage(price: float, qty: int, adv_value: float, side: str) -> floa
     return slip if side == "BUY" else -slip
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # The profile singleton
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class _MYProfile:
@@ -184,6 +184,12 @@ class _MYProfile:
 
     # risk defaults
     min_risk_per_trade: float = 50.0  # RM
+
+    # --- FIX 3: Exit sizing ---
+    # Bursa stocks move more slowly than US ETFs. A 25% stretch above the
+    # 50-day EMA captures genuine climax runs without exiting positions
+    # that are simply in a healthy long-term uptrend.
+    climax_stretch_pct: float = 25.0
 
     # learner / scheduler tuning
     cycle_interval_sec: int = 3600
