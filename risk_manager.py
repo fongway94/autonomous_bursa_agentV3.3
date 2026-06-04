@@ -178,6 +178,14 @@ def check_position_limits(trades: list, new_trade_cost: float,
                 "reason": f"Max {max_pos} concurrent positions reached.",
                 "size_reduction_pct": 0}
 
+    # Correlation Shield: limit maximum active positions in a single sector to 2
+    sector_active_count = sum(1 for t in active if t.get("sector") == sector)
+    if sector_active_count >= 2:
+        return {"allowed": False,
+                "reason": f"Correlation Shield: Sector '{sector}' already has "
+                          f"{sector_active_count} active positions (max 2 allowed).",
+                "size_reduction_pct": 100}
+
     max_cost = capital * (max_cost_pct / 100)
     if new_trade_cost > max_cost:
         reduce_pct = min((new_trade_cost - max_cost) / new_trade_cost * 100, 80)
