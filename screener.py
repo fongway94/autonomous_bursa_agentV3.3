@@ -302,22 +302,36 @@ def analyze_stock_setup(ticker, df, params,
             elif q_override == "AVOID":
                 base_confidence -= 12 * q_modifier
                 reasoning.append("⚠️ Brain: historical losses on this setup.")
-        elif (is_pullback_ema or is_pullback_rsi) and is_dry_volume:
-            signal_type = "GOLD BUY (PULLBACK)"
-            if is_pullback_ema:
-                reasoning.append(f"Price finding support at rising Slow EMA "
-                                 f"({params['ema_slow']}).")
-            if is_pullback_rsi:
-                reasoning.append(f"RSI pulled back to {rsi:.1f} — hook up.")
-            reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
-            if close > float(last["Open"]):
-                reasoning.append("Bullish candle at support.")
-                base_confidence += 5
-            base_confidence = 70.0
-            if q_override == "BUY":
-                base_confidence += 5 * q_modifier
-            elif q_override == "AVOID":
-                base_confidence -= 12 * q_modifier
+        elif is_pullback_ema or is_pullback_rsi:
+            if vol_ratio >= 1.1:
+                # Distribution pullback — ignore and fall through
+                signal_type = "HOLD / WATCH"
+                reasoning.append(f"⚠️ Pullback aborted — heavy distribution volume ({vol_ratio:.2f}x).")
+            else:
+                signal_type = "GOLD BUY (PULLBACK)"
+                if is_pullback_ema:
+                    reasoning.append(f"Price finding support at rising Slow EMA "
+                                     f"({params['ema_slow']}).")
+                if is_pullback_rsi:
+                    reasoning.append(f"RSI pulled back to {rsi:.1f} — hook up.")
+                
+                if vol_ratio >= 0.85:
+                    # Soft penalty on moderate volume
+                    base_confidence = 60.0
+                    reasoning.append(f"⚠️ Pullback on moderate volume ({vol_ratio:.2f}x) — possible minor selling pressure.")
+                else:
+                    # Ideal pullback on dry volume
+                    base_confidence = 70.0
+                    reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
+
+                if close > float(last["Open"]):
+                    reasoning.append("Bullish candle at support.")
+                    base_confidence += 5
+                
+                if q_override == "BUY":
+                    base_confidence += 5 * q_modifier
+                elif q_override == "AVOID":
+                    base_confidence -= 12 * q_modifier
         else:
             signal_type = "HOLD / WATCH"
             if not is_in_price_range:
