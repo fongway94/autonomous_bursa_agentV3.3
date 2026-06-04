@@ -440,8 +440,17 @@ def get_full_market_analysis(force_refresh: bool = False) -> dict:
     except Exception:
         bull_max, neut_max, bear_max = 8, 5, 3
 
+    # v3.7: Lowered thresholds to increase trade frequency.
+    # BULL: 0.60 (was 0.65) — strong market = more entries for brain learning
+    # NEUTRAL: 0.65 — keep moderate threshold in uncertain markets
+    # BEAR: 0.65 — strict protection (but screener already blocks most BEAR trades)
+    # Conviction modulates threshold: in strong BULL with high conviction,
+    # effective threshold = 0.60 * (1 - conv/200) = down to ~0.50
     if regime == "BULL":
-        pos_mult, risk_adj, max_pos, thr = 1.0, 1.0, bull_max, 0.65
+        pos_mult, risk_adj, max_pos, thr = 1.0, 1.0, bull_max, 0.60
+        # In strong BULL with conviction > 60, lower threshold further
+        if conv > 60:
+            thr = 0.55  # more entries in clearly trending market
     elif regime == "NEUTRAL":
         pos_mult, risk_adj, max_pos, thr = 0.75, 0.8, neut_max, 0.65
     else:
