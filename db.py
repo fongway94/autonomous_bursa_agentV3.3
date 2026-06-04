@@ -310,6 +310,7 @@ CREATE TABLE IF NOT EXISTS trades (
     realized_pnl    REAL DEFAULT 0,
     closed_pnl      REAL,
     exit_price      REAL,
+    exit_type       TEXT,              -- v3.7: TP3/CLIMAX/SL/TP2/TP1/TIME/MANUAL
     shares_remaining INTEGER NOT NULL,
     slippage_pct    REAL DEFAULT 0,
     notes           TEXT DEFAULT '',
@@ -327,6 +328,7 @@ CREATE TABLE IF NOT EXISTS partial_exits (
     tp_level        TEXT,
     shares_closed   INTEGER,
     exit_price      REAL,
+    exit_type       TEXT,              -- v3.7: TP3/CLIMAX/SL/TP2/TP1/TIME/MANUAL
     pnl_rm          REAL,
     net_pnl_after_fees REAL,
     exit_at         TEXT,
@@ -589,6 +591,7 @@ def init_db():
             "ALTER TABLE trades ADD COLUMN executed_in_window TEXT",
             # v3.5: corporate-action audit trail. Default 1.0 means "never split".
             "ALTER TABLE trades ADD COLUMN cumulative_split_factor REAL DEFAULT 1.0",
+            "ALTER TABLE trades ADD COLUMN exit_type TEXT",  # v3.7: TP3/CLIMAX/SL/TP2/TP1/TIME/MANUAL
             # v3.5: toggle for auto-adjustment behaviour. Default ON.
             "ALTER TABLE scheduler_state ADD COLUMN corp_action_autoadjust INTEGER NOT NULL DEFAULT 1",
             # v3.5: last time we scanned for corporate actions (ISO timestamp).
