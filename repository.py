@@ -452,11 +452,19 @@ def get_regime_trend(lookback_hours: int = 24) -> dict:
     """
     Returns a summary of how the regime has evolved over the last N hours.
 
+    FIX #3-8: Detects regime switches and labels them as REGIME_SHIFT.
+    Previously, a BULL→NEUTRAL switch (conviction 45%→40%) was labeled
+    "WEAKENING" — which is wrong for BULL markets where falling conviction
+    in the same regime is normal. REGIME_SHIFT tells the scheduler to treat
+    this as a genuinely different market state, not just conviction fading.
+
     {
       "current_conviction": float,
       "avg_recent_conviction": float,
       "change": float,                # current - avg_recent
-      "direction": "STRENGTHENING" | "WEAKENING" | "STABLE",
+      "direction": "STRENGTHENING" | "WEAKENING" | "STABLE" | "REGIME_SHIFT",
+      "current_regime": str,          # NEW: the actual current regime
+      "prior_regime": str | None,     # NEW: regime of the prior snapshot
       "ema_200_distance_pct": float | None,
       "samples": int
     }
@@ -476,10 +484,20 @@ def get_regime_trend(lookback_hours: int = 24) -> dict:
     if not rows:
         return {"current_conviction": None, "avg_recent_conviction": None,
                 "change": None, "direction": "UNKNOWN",
+                "current_regime": None, "prior_regime": None,
                 "ema_200_distance_pct": None, "samples": 0}
 
     current = rows[-1]
     current_conv = float(current["conviction"])
+    current_regime = str(current["regime"])
+
+    # FIX #3-8: Check if regime changed from prior snapshot
+    prior_regime = None
+    regime_shift = False
+    if len(rows) >= 2:
+        prior_regime = str(rows[-2]["regime"])
+        if prior_regime != current_regime:
+            regime_shift = True
 
     # Skip the very latest row when computing the "recent" average,
     # so the comparison is current vs prior trend.
@@ -487,11 +505,12 @@ def get_regime_trend(lookback_hours: int = 24) -> dict:
     avg_prior = float(sum(r["conviction"] for r in prior) / len(prior))
 
     change = current_conv - avg_prior
-    if abs(change) < 3:
+
+    if regime_shift:
+        direction = "REGIME_SHIFT"
+    elif abs(change) < 3:
         direction = "STABLE"
     elif change > 0:
-        # In BEAR, rising conviction = BEAR getting stronger (bad)
-        # In BULL, rising conviction = BULL getting stronger (good)
         direction = "STRENGTHENING"
     else:
         direction = "WEAKENING"
@@ -501,6 +520,8 @@ def get_regime_trend(lookback_hours: int = 24) -> dict:
         "avg_recent_conviction": round(avg_prior, 1),
         "change": round(change, 1),
         "direction": direction,
+        "current_regime": current_regime,
+        "prior_regime": prior_regime,
         "ema_200_distance_pct": (round(float(current["ema_200_vs_price"]), 2)
                                   if current["ema_200_vs_price"] is not None
                                   else None),
