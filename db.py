@@ -556,6 +556,49 @@ CREATE TABLE IF NOT EXISTS risk_params (
     payload     TEXT,
     updated_at  TEXT
 );
+
+-- NOOP phase: structured decision journal. One row per evaluated setup per
+-- cycle, across ALL tiers (A/B/C/D), whether or not it would be executed.
+-- This is the measurement layer that lets the agent learn from setups it does
+-- NOT take (Tier B/C shadow outcomes). Per-(market,mode) DB, backed up via Gist
+-- automatically (whole DB is backed up). Resolver fills the outcome_* columns.
+CREATE TABLE IF NOT EXISTS decision_journal (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id               TEXT,
+    decided_at             TEXT NOT NULL,
+    review_at              TEXT,
+    market                 TEXT,
+    mode                   TEXT,
+    ticker                 TEXT,
+    name                   TEXT,
+    sector                 TEXT,
+    tier                   TEXT NOT NULL,           -- A / B / C / D
+    would_execute          INTEGER NOT NULL DEFAULT 0,
+    signal                 TEXT,
+    confidence             REAL,
+    regime                 TEXT,
+    regime_threshold       REAL,
+    state_id               INTEGER,
+    entry                  REAL,
+    stop_loss              REAL,
+    tp1                    REAL,
+    tp2                    REAL,
+    tp3                    REAL,
+    rsi                    REAL,
+    vol_ratio              REAL,
+    atr                    REAL,
+    reasoning              TEXT,
+    expected_scenario      TEXT,
+    invalidation_condition TEXT,
+    what_proves_wrong      TEXT,
+    status                 TEXT NOT NULL DEFAULT 'OPEN',   -- OPEN / RESOLVED / SKIPPED
+    outcome                TEXT,                            -- WIN / LOSS / FLAT / UNKNOWN
+    outcome_r              REAL,
+    max_favorable_pct      REAL,
+    max_adverse_pct        REAL,
+    resolved_at            TEXT,
+    resolver_notes         TEXT
+);
 """
 
 
@@ -610,6 +653,21 @@ def init_db():
                 c.execute(sql)
             except Exception:
                 pass  # column already exists
+        # ---- NOOP decision_journal indexes (idempotent) ----
+        for idx_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_journal_status "
+            "ON decision_journal (status)",
+            "CREATE INDEX IF NOT EXISTS idx_journal_review "
+            "ON decision_journal (status, review_at)",
+            "CREATE INDEX IF NOT EXISTS idx_journal_decided "
+            "ON decision_journal (decided_at)",
+            "CREATE INDEX IF NOT EXISTS idx_journal_tier "
+            "ON decision_journal (tier)",
+        ):
+            try:
+                c.execute(idx_sql)
+            except Exception:
+                pass
         # Seed scheduler_state
         c.execute(
             "INSERT OR IGNORE INTO scheduler_state "
