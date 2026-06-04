@@ -1,3 +1,8 @@
+
+saHSHAHASDHAKSHDKASHDASDASDAS
+
+
+
 # AI Chat Handoff — Copy this into a fresh chat to continue work
 
 Paste everything below the line into a new AI conversation when you want to continue developing this project. It gives the new assistant enough context to be immediately useful without you re-explaining.
