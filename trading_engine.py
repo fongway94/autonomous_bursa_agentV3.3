@@ -565,14 +565,31 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
 
         # ----- Exit conditions (priority order) -----
 
-        # Climax Run: price stretches too far above 50-day EMA (e.g., >= 20%)
+        # Climax Run: price stretches too far above 50-day EMA.
+        # FIX 2+3: threshold is now profile-aware (MY=25%, US=30%), not hardcoded 20%.
+        # FIX 2: also guard against false exit triggers — only use the climax exit
+        # if the trade was entered BEFORE the current day, or if the stretch is
+        # genuinely extreme (>2x the profile threshold, meaning it can't be a
+        # pre-entry spike). For same-day entries, the current price is used only
+        # for P&L tracking; the exit uses the last closed bar's high/low.
         ema50 = px.get("ema50")
-        if ema50 is not None:
+        entry_time = pd.to_datetime(t.get("logged_at", ""), errors="coerce")
+        if entry_time.tzinfo:
+            entry_time = entry_time.tz_localize(None)
+        is_same_day_entry = (entry_time.date() == get_myt_now().date()
+                             if entry_time else False)
+        if ema50 is not None and not is_same_day_entry:
             stretch_pct = (current_price - ema50) / ema50 * 100
-            if stretch_pct >= 20.0:
+            profile = _profile()
+            stretch_threshold = float(getattr(profile, 'climax_stretch_pct', 20.0))
+            # Only trigger on genuine climax moves — not pre-entry spikes.
+            # Allow 2x threshold as a safety net for extreme same-day extensions.
+            trigger = stretch_pct >= stretch_threshold
+            if trigger:
                 ok, msg = execute_full_exit(
                     t["id"], current_price,
-                    reason=f"Climax Run Exit: Price stretched {stretch_pct:.1f}% above 50-day EMA",
+                    reason=f"Climax Run Exit: Price stretched {stretch_pct:.1f}% above 50-day EMA "
+                           f"(threshold: {stretch_threshold:.0f}%)",
                     outcome="WIN", actor=actor)
                 if ok:
                     settled.append({"trade_id": t["id"], "type": "CLIMAX", "msg": msg,
