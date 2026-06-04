@@ -1111,7 +1111,59 @@ def _loop(interval_sec: int, my_pid: int):
                         record_daily_task_result(
                             "ml_retrain", f"error: {e}")
 
-                # FIX 4: REMOVED — decay_priors(0.95) was an unvalidated hyperparameter.
+                # FIX #7: Brain health check — detect when high-confidence signals
+                # consistently underperform.  calibration_buckets() tells us if the
+                # brain's predicted win rate matches realized win rate.
+                # If the top bucket (highest confidence) has realized win rate < 50%,
+                # the brain is systematically overconfident — log BRAIN_DIVERGENCE
+                # and record the result so the user can investigate.
+                if try_claim_daily_task("brain_health_check", my_pid):
+                    try:
+                        from evaluation import calibration_buckets
+                        from repository import closed_trades
+                        trades = closed_trades()
+                        if len(trades) >= 20:
+                            buckets = calibration_buckets(trades, n_buckets=5)
+                            if buckets:
+                                top_bucket = buckets[-1]  # highest confidence bucket
+                                realized_wr = top_bucket.get("realized_win_rate_pct", 0)
+                                predicted_wr = top_bucket.get("predicted_pct", 0)
+                                n_in_bucket = top_bucket.get("n_trades", 0)
+                                if n_in_bucket >= 3 and realized_wr < 50:
+                                    log_scheduler_event(
+                                        "BRAIN_DIVERGENCE",
+                                        (f"Top-confidence bucket ({predicted_wr:.0f}± conf) "
+                                         f"win rate {realized_wr:.1f}% ({n_in_bucket} trades) "
+                                         f"— below 50%. Brain overconfident in this range. "
+                                         f"Consider reviewing state-prior data or "
+                                         f"raising signal threshold."),
+                                        "WARN",
+                                        payload={
+                                            "bucket": top_bucket.get("bucket"),
+                                            "predicted_wr": predicted_wr,
+                                            "realized_wr": realized_wr,
+                                            "n_trades": n_in_bucket,
+                                        },
+                                    )
+                                    record_daily_task_result(
+                                        "brain_health_check",
+                                        f"top_bucket_wr={realized_wr:.1f}%_below_50")
+                                else:
+                                    record_daily_task_result(
+                                        "brain_health_check",
+                                        f"top_bucket_wr={realized_wr:.1f}%_ok")
+                            else:
+                                record_daily_task_result("brain_health_check", "no_buckets")
+                        else:
+                            record_daily_task_result(
+                                "brain_health_check",
+                                f"only_{len(trades)}_trades_need_20")
+                    except Exception as e:
+                        log_scheduler_event(
+                            "BRAIN_HEALTH_ERROR", f"brain health check failed: {e}", "ERROR")
+                        record_daily_task_result("brain_health_check", f"error: {e}")
+
+                # FIX #4 (fix_1): REMOVED — decay_priors(0.95) was an unvalidated hyperparameter.
                 # The Bayesian model already handles non-stationarity through direct
                 # alpha/beta updates on each new trade. A 0.95 daily decay halves the
                 # brain's knowledge in 14 days of no trading, which is destructive.
