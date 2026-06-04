@@ -296,12 +296,42 @@ def analyze_stock_setup(ticker, df, params,
                         reasoning.append(f"Top 20% Market Leader (RS Percentile: {rs_pct}%).")
             except Exception:
                 pass
-            if q_override == "BUY":
-                base_confidence += 5 * q_modifier
-                reasoning.append(f"Brain: BUY (score {q_modifier:.2f}).")
-            elif q_override == "AVOID":
-                base_confidence -= 12 * q_modifier
-                reasoning.append("⚠️ Brain: historical losses on this setup.")
+            # v3.7: Brain hard veto — if the Bayesian brain says AVOID with
+            # conviction (q_scores['BUY'] < 30), skip the trade entirely.
+            # This makes the brain a gatekeeper, not just a confidence adjuster.
+            # Only relevant for BUY signals (SELL signals are already blocked by rules).
+            q_scores = (q_action or {}).get("q_scores", {})
+            buy_score = q_scores.get("BUY", 50)
+            avoid_score = q_scores.get("AVOID", 50)
+            brain_reasoning = (q_action or {}).get("reasoning", "")
+
+            if q_override == "AVOID":
+                # Hard veto: brain has seen losses in this state
+                if avoid_score > buy_score + 15:
+                    signal_type = "REDUCE / AVOID"
+                    reasoning.append(
+                        f"🚫 Brain VETO: BUY score {buy_score:.0f} vs "
+                        f"AVOID {avoid_score:.0f} — historical losses in this "
+                        f"market state. Entry blocked."
+                    )
+                    base_confidence = 10.0
+                else:
+                    base_confidence -= 8 * q_modifier
+                    reasoning.append(
+                        f"⚠️ Brain caution: AVOID signal, "
+                        f"confidence reduced by {8 * q_modifier:.0f} pts."
+                    )
+            elif q_override == "BUY":
+                # Hard trigger: brain strongly endorses this state
+                if buy_score > 65:
+                    # Boost conviction AND add to reasoning
+                    base_confidence += 8 * q_modifier
+                    reasoning.append(
+                        f"🧠 Brain ENDORSED: BUY score {buy_score:.0f} — "
+                        f"positive history in this state."
+                    )
+                else:
+                    base_confidence += 4 * q_modifier
         elif is_pullback_ema or is_pullback_rsi:
             # FIX #3-11: Use volume_surge_ratio param instead of hardcoded 1.1.
             # For US 3x ETFs, vol_ratio 1.1-1.5 on a pullback is NORMAL in strong
@@ -334,10 +364,27 @@ def analyze_stock_setup(ticker, df, params,
                     reasoning.append("Bullish candle at support.")
                     base_confidence += 5
                 
-                if q_override == "BUY":
-                    base_confidence += 5 * q_modifier
-                elif q_override == "AVOID":
-                    base_confidence -= 12 * q_modifier
+                # v3.7: Brain hard veto for pullback entries too
+                if q_override == "AVOID":
+                    if avoid_score > buy_score + 15:
+                        signal_type = "HOLD / WATCH"
+                        reasoning.append(
+                            f"🚫 Brain VETO on pullback: BUY score {buy_score:.0f} "
+                            f"vs AVOID {avoid_score:.0f} — state historically "
+                            f"unprofitable. Watching for better entry."
+                        )
+                        base_confidence = 25.0
+                    else:
+                        base_confidence -= 8 * q_modifier
+                        reasoning.append("⚠️ Brain caution on pullback setup.")
+                elif q_override == "BUY":
+                    if buy_score > 65:
+                        base_confidence += 8 * q_modifier
+                        reasoning.append(
+                            f"🧠 Brain ENDORSED pullback: BUY score {buy_score:.0f}."
+                        )
+                    else:
+                        base_confidence += 4 * q_modifier
         else:
             signal_type = "HOLD / WATCH"
             if not is_in_price_range:
