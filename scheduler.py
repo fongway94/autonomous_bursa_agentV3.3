@@ -309,6 +309,70 @@ def _explain_cycle_outcome(summary: dict, df, regime: dict,
     return "Unknown reason for zero entries."
 
 
+def _run_fast_settle_only() -> dict:
+    """Check and settle active trades only (no scanning or entry, extremely lightweight)."""
+    from trading_engine import auto_settle_trades
+    from repository import active_trades, get_trade
+    from data_provider import get_history
+    from learner import learn_from_trade_outcome
+
+    log_scheduler_event("SETTLE_START", "Fast-settling active trades (10-minute check)")
+    price_lookup = {}
+    summary = {"settled": 0, "partials": 0}
+
+    # Fetch true live daily High/Low for active trades
+    for t in active_trades():
+        ticker = t["ticker"]
+        try:
+            df_t = get_history(ticker, period="3mo", timeout=15)
+            if df_t is not None and not df_t.empty:
+                ema50 = None
+                if len(df_t) >= 50:
+                    try:
+                        ema50 = df_t["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
+                    except Exception:
+                        pass
+                last_row = df_t.iloc[-1]
+                price_lookup[ticker] = {
+                    "price": float(last_row["Close"]),
+                    "high": float(last_row["High"]),
+                    "low": float(last_row["Low"]),
+                    "ema50": float(ema50) if ema50 is not None else None,
+                }
+        except Exception as e:
+            log.warning(f"Failed to fetch live exit price for {ticker}: {e}")
+
+    if price_lookup:
+        try:
+            regime = {"regime_data": {"regime": "NEUTRAL"}}
+            settle_res = auto_settle_trades(price_lookup, regime, actor="AGENT")
+            summary["settled"] = len(settle_res.get("settled", []))
+            summary["partials"] = len(settle_res.get("partials", []))
+            log_scheduler_event(
+                "SETTLE_END",
+                f"Fast settle: {summary['settled']} settled, {summary['partials']} partials",
+                payload=settle_res,
+            )
+            for ev in settle_res.get("settled", []):
+                t = get_trade(ev["trade_id"])
+                if t and t.get("status") == "CLOSED":
+                    try:
+                        learn_from_trade_outcome(t)
+                    except Exception as e:
+                        log.error(f"learning failed for trade {t['id']}: {e}")
+            if settle_res.get("settled"):
+                try:
+                    from persistence import backup as _pers_backup, is_configured
+                    if is_configured():
+                        _pers_backup(reason=f"Fast-settle closed {len(settle_res['settled'])} trade(s)")
+                except Exception:
+                    pass
+        except Exception as e:
+            log_scheduler_event("ERROR", f"Fast auto-settle failed: {e}", "ERROR")
+
+    return summary
+
+
 # -------------------------------------------------------------------------
 # One cycle
 # -------------------------------------------------------------------------
@@ -772,7 +836,10 @@ def _loop(interval_sec: int, my_pid: int):
     if delay > 0:
         _STOP_EVENT.wait(timeout=delay)
 
+    last_full_scan_time = 0.0
+
     while not _STOP_EVENT.is_set():
+        summary = {}
         state = get_scheduler_state()
         if state.get("kill_switch", 0):
             log_scheduler_event("KILLED", "kill_switch=1 — exiting loop", "WARN")
@@ -890,7 +957,7 @@ def _loop(interval_sec: int, my_pid: int):
             _STOP_EVENT.wait(timeout=INTRADAY_CYCLE_SEC)
 
         else:
-            # SWING PATH (hourly, byte-identical to v3.6)
+            # SWING PATH (hourly scan + 10-minute fast settle)
             # Check market hours
             if not _is_market_hours():
                 from risk_manager import check_trading_time_window
@@ -900,51 +967,81 @@ def _loop(interval_sec: int, my_pid: int):
                     f"Outside market hours — {tw.get('reason','closed')}. "
                     f"Sleeping until {next_at}",
                 )
+                _STOP_EVENT.wait(timeout=max(60, (_next_run_at(interval_sec) - get_myt_now()).total_seconds()))
             else:
-                try:
-                    autotrade = bool(state.get("autotrade_enabled", 1))
-                    autoexit = bool(state.get("autoexit_enabled", 1))
-                    t0 = time.time()
-                    update_scheduler_state(cycle_started_at=myt_iso())
+                now_ts = time.time()
+                # Run full scan if interval_sec has elapsed or first run
+                if now_ts - last_full_scan_time >= interval_sec:
                     try:
-                        summary = _run_one_cycle(autotrade=autotrade,
-                                                  autoexit=autoexit,
-                                                  my_pid=my_pid)
-                        duration = time.time() - t0
-                        update_scheduler_state(
-                            last_run_at=myt_iso(),
-                            next_run_at=myt_iso(_next_run_at(interval_sec)),
-                            consecutive_failures=0,
-                            last_error="",
-                            cycle_started_at=None,
-                        )
-                        if duration > CYCLE_DURATION_WARN_SEC:
-                            log_scheduler_event(
-                                "CYCLE_SLOW",
-                                f"Cycle completed in {duration:.0f}s "
-                                f"(> {CYCLE_DURATION_WARN_SEC}s warn threshold).",
-                                "WARN",
-                                duration_sec=duration,
-                            )
-                        log_scheduler_event(
-                            "CYCLE_OK",
-                            f"scan={summary['scan_count']} settled={summary['settled']} "
-                            f"partials={summary['partials']} entries={summary['auto_entries']}",
-                            duration_sec=duration, payload=summary,
-                        )
-                    finally:
+                        autotrade = bool(state.get("autotrade_enabled", 1))
+                        autoexit = bool(state.get("autoexit_enabled", 1))
+                        t0 = time.time()
+                        update_scheduler_state(cycle_started_at=myt_iso())
                         try:
-                            update_scheduler_state(cycle_started_at=None)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    tb = traceback.format_exc()
-                    fails = (state.get("consecutive_failures") or 0) + 1
-                    update_scheduler_state(consecutive_failures=fails,
-                                           last_error=f"{e}\n{tb}",
-                                           cycle_started_at=None)
-                    log_scheduler_event("CYCLE_ERROR", str(e), "ERROR",
-                                        payload={"trace": tb})
+                            summary = _run_one_cycle(autotrade=autotrade,
+                                                      autoexit=autoexit,
+                                                      my_pid=my_pid)
+                            last_full_scan_time = now_ts
+                            duration = time.time() - t0
+                            update_scheduler_state(
+                                last_run_at=myt_iso(),
+                                next_run_at=myt_iso(_next_run_at(interval_sec)),
+                                consecutive_failures=0,
+                                last_error="",
+                                cycle_started_at=None,
+                            )
+                            if duration > CYCLE_DURATION_WARN_SEC:
+                                log_scheduler_event(
+                                    "CYCLE_SLOW",
+                                    f"Cycle completed in {duration:.0f}s "
+                                    f"(> {CYCLE_DURATION_WARN_SEC}s warn threshold).",
+                                    "WARN",
+                                    duration_sec=duration,
+                                )
+                            log_scheduler_event(
+                                "CYCLE_OK",
+                                f"scan={summary['scan_count']} settled={summary['settled']} "
+                                f"partials={summary['partials']} entries={summary['auto_entries']}",
+                                duration_sec=duration, payload=summary,
+                            )
+                        finally:
+                            try:
+                                update_scheduler_state(cycle_started_at=None)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        tb = traceback.format_exc()
+                        fails = (state.get("consecutive_failures") or 0) + 1
+                        update_scheduler_state(consecutive_failures=fails,
+                                               last_error=f"{e}\n{tb}",
+                                               cycle_started_at=None)
+                        log_scheduler_event("CYCLE_ERROR", str(e), "ERROR",
+                                            payload={"trace": tb})
+                else:
+                    # Run lightweight 10-minute fast exit check
+                    try:
+                        t0 = time.time()
+                        update_scheduler_state(cycle_started_at=myt_iso())
+                        try:
+                            summary = _run_fast_settle_only()
+                            duration = time.time() - t0
+                            update_scheduler_state(
+                                last_run_at=myt_iso(),
+                                consecutive_failures=0,
+                                last_error="",
+                                cycle_started_at=None,
+                            )
+                        finally:
+                            try:
+                                update_scheduler_state(cycle_started_at=None)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        log_scheduler_event("FAST_SETTLE_ERROR", str(e), "ERROR")
+
+                # Sleep 10 minutes (600s) for the next fast settle
+                summary["_intraday_did_sleep"] = True
+                _STOP_EVENT.wait(timeout=600)
 
         # ---- Daily maintenance window (idempotent) ----
         try:
