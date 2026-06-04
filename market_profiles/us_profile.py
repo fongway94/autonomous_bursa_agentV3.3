@@ -34,10 +34,10 @@ from market_profiles.base import (
 )
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Default US watchlist — leveraged ETFs + momentum mega-caps
 # ~25 names; user can edit via Settings → Custom Watchlist
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 _US_WATCHLIST: tuple[TickerSpec, ...] = tuple(
     TickerSpec(
@@ -83,9 +83,9 @@ _US_WATCHLIST: tuple[TickerSpec, ...] = tuple(
 )
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # US holiday detection
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 # Cache the calendar object since pandas_market_calendars is somewhat heavy.
 _NYSE_CAL = None
@@ -132,9 +132,9 @@ def _is_us_holiday(local_dt: datetime) -> bool:
     return local_dt.date() in _get_nyse_holidays_for_year(local_dt.year)
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # US-specific slippage (much tighter than MY)
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 def _us_etf_slippage(price: float, qty: int, adv_value: float, side: str) -> float:
     """2 bps base + size penalty for orders consuming significant ADV.
@@ -159,9 +159,9 @@ def _us_etf_slippage(price: float, qty: int, adv_value: float, side: str) -> flo
     return slip if side == "BUY" else -slip
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # The profile singleton
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class _USProfile:
@@ -206,6 +206,14 @@ class _USProfile:
 
     # risk defaults
     min_risk_per_trade: float = 20.0   # USD
+
+    # --- FIX 3: Exit sizing ---
+    # 3x leveraged ETFs (TQQQ, SOXL, TNA, etc.) routinely stretch 25-40%
+    # above their 50-day EMA during momentum bursts. A 30% threshold lets
+    # the agent hold winners through healthy uptrends without exiting too
+    # early. 20% (the old hardcoded value) fires far too often on ETFs,
+    # leaving massive profits on the table.
+    climax_stretch_pct: float = 30.0
 
     # learner / scheduler tuning
     # US daily ranges on leveraged ETFs are wider; keep concurrent caps
