@@ -333,7 +333,11 @@ def learn_from_trade_outcome(trade: dict) -> dict:
             else:
                 prior["beta"] += 0.5
             prior["n"] += 1
-            prior["total_r"] += float(r_mult)
+            # FIX #3-10: Only update total_r when initial_risk > 0.
+            # Zero r_mult (e.g., missing risk_per_share at manual entry)
+            # would drag avg_R toward 0, corrupting exploit-mode scoring.
+            if initial_risk > 0:
+                prior["total_r"] += float(r_mult)
             _save_prior(c, state_id, action, prior)
 
         _update_strategy_bias(trade)
@@ -857,6 +861,43 @@ def get_learning_history() -> list[dict]:
     from logger import get_learning_events
     return get_learning_events(limit=200)
 
+
+
+def cleanup_orphaned_state_priors() -> dict:
+    """
+    FIX #3-16: One-time cleanup of orphaned state IDs.
+
+    Before fix_2, the state formula produced IDs 0-127 (128 states).
+    Fix_2 reduced it to 0-26 (27 states). Any state_ids >= 27 in
+    state_priors are from the old formula and will never be queried
+    again. This function removes them so the brain only tracks valid states.
+
+    Idempotent: safe to run multiple times. Returns count of orphaned rows.
+    Called once during daily maintenance after fix_2 deployment.
+    """
+    try:
+        from market_profiles import active_market_code
+        max_valid = 26
+    except Exception:
+        max_valid = 26
+
+    with connect() as c:
+        cur = c.execute(
+            "SELECT COUNT(*) FROM state_priors WHERE state_id > ?",
+            (max_valid,),
+        )
+        orphaned = cur.fetchone()[0]
+        if orphaned > 0:
+            c.execute(
+                "DELETE FROM state_priors WHERE state_id > ?",
+                (max_valid,),
+            )
+            log_learning_event(
+                "STATE_PRIORS_CLEANUP",
+                f"Removed {orphaned} orphaned state IDs (formula changed 128->27).",
+                changes={"orphaned_count": orphaned, "max_valid_state_id": max_valid},
+            )
+        return {"orphaned_removed": orphaned, "max_valid_state_id": max_valid}
 
 def decay_priors(decay_factor: float = 0.95):
     """
