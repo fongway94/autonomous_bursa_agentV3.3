@@ -1315,11 +1315,13 @@ python intraday_backtest_v3.py | Tee-Object -FilePath v3_report.txt
 
 To optimize the agent's edge, we integrated five professional trading enhancements:
 1. **MA50 > MA200 Trend Alignment Filter:** Added a 50-day EMA calculation to `screener.py` and made `EMA50 > EMA200` a mandatory bullish alignment requirement for long setups. This completely avoids false "dead-cat bounces" in long-term downtrends.
-2. **Volume Dry-Up (VDU) Pullback Filter:** Refactored the pullback trigger to require dry pullback volume (`is_dry_volume`), preventing the agent from entering during institutional distribution.
+2. **Soft Pullback Volume Penalty (VDU Upgrade):** Pullbacks are fully allowed up to `1.1x` volume ratio, but if volume is moderate ($\ge 0.85$), the system applies a soft -10% confidence penalty and logs a warning to keep the funnel open while penalizing non-dry volume.
 3. **IBD RS Percentile Leader Booster:** Top 20% relative strength market leaders automatically get a `+7` boost to their breakout setup confidence score.
 4. **Climax Run Profit Exit:** Automatically exits an active swing position if the price stretches $\ge 20\%$ above its 50-day EMA, locking in profits during vertical bursts.
 5. **Progressive Exposure (The Minervini Rule):** Risk manager automatically halves next position sizes (`size_multiplier = 0.5`) if the agent is on a 3-consecutive-loss streak or if its recent win rate falls $\le 40\%$.
 6. **ATR Volatility-Adjusted Sizing:** Shares are sized dynamically using the Average True Range (`ATR * 1.5`) rather than tight support distance, ensuring uniform portfolio risk volatility.
+7. **10-Minute Split-Cadence Exits:** Main thread wakes up every 10 minutes to run lightweight `_run_fast_settle_only()` exit checks on active positions (slashing slippage from 60 to 10 minutes), while running the heavy 80-stock market scan on the hour.
+8. **Nightly Priors Decay (Market Non-Stationarity):** Nightly maintenance loop automatically applies a `0.95` exponential decay factor to all $\alpha$ and $\beta$ state priors, ensuring the brain "forgets" ancient market states and automatically adapts to current regimes.
 
 ---
 
