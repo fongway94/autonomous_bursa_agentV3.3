@@ -269,17 +269,15 @@ def learn_from_trade_outcome(trade: dict) -> dict:
         else:
             action = "HOLD"
 
-        win_inc = min(max(abs(pnl_pct) / 5.0, 0.5), WIN_WEIGHT_CAP)
-        loss_inc = min(max(abs(pnl_pct) / 5.0, 0.5), LOSS_WEIGHT_CAP)
-
         with connect() as c:
             prior = _get_prior(c, state_id, action)
             if outcome == "WIN":
-                prior["alpha"] += win_inc
+                prior["alpha"] += 1.0
             elif outcome == "LOSS":
-                prior["beta"] += loss_inc
+                prior["beta"] += 1.0
             else:
-                prior["beta"] += 0.25
+                # Breakevens get a small 0.5 beta penalty to account for fees/drag
+                prior["beta"] += 0.5
             prior["n"] += 1
             prior["total_r"] += float(r_mult)
             _save_prior(c, state_id, action, prior)
@@ -793,3 +791,26 @@ def _group_month(trades):
 def get_learning_history() -> list[dict]:
     from logger import get_learning_events
     return get_learning_events(limit=200)
+
+
+def decay_priors(decay_factor: float = 0.95):
+    """
+    Applies an exponential decay factor to all historical alpha and beta values
+    in the state_priors table to mitigate market non-stationarity.
+    Ensures recent trade feedback has higher weight than ancient history.
+    """
+    if not (0.5 <= decay_factor < 1.0):
+        return
+    with connect() as c:
+        # We multiply alpha and beta by decay_factor, keeping them >= 1.0 (flat prior)
+        c.execute(
+            "UPDATE state_priors SET "
+            "alpha = MAX(1.0, alpha * ?), "
+            "beta = MAX(1.0, beta * ?)",
+            (decay_factor, decay_factor)
+        )
+    log_learning_event(
+        "PRIORS_DECAY",
+        f"Applied decay factor of {decay_factor} to state_priors",
+        changes={"decay_factor": decay_factor}
+    )
