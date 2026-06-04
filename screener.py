@@ -208,13 +208,8 @@ def analyze_stock_setup(ticker, df, params,
     is_in_price_range = min_price <= close <= max_price
 
     ema_mid = float(last.get("EMA_Mid", close))
-    # FIX 5: EMA50 > EMA200 (is_bullish_alignment) used to be a HARD gate.
-    # The handbook states "EMA-50 and EMA-100 produce identical results to no filter"
-    # — only EMA200 proved meaningful. Now used as a soft +5 confidence BOOST
-    # instead of a hard blocker. This prevents the funnel from closing in choppy
-    # markets where EMA50 temporarily dips below EMA200.
     is_bullish_alignment = ema_mid > ema_trend
-    is_long_term_uptrend = (close > ema_trend)  # EMA200 only — the one that proved useful
+    is_long_term_uptrend = (close > ema_trend) and is_bullish_alignment
     is_med_term_uptrend = close > ema_slow
     is_short_term_uptrend = close > ema_fast
 
@@ -308,19 +303,16 @@ def analyze_stock_setup(ticker, df, params,
                 base_confidence -= 12 * q_modifier
                 reasoning.append("⚠️ Brain: historical losses on this setup.")
         elif is_pullback_ema or is_pullback_rsi:
-            # FIX 5: Binary gate for pullback volume — not a soft penalty.
-            # is_dry_volume is vol_ratio < 0.8. A pullback on heavier volume
-            # (0.8-1.1x) is not a "soft penalty pullback" — it's a distribution
-            # pullback that should be rejected. Either the volume is dry (pass),
-            # or it's not a valid ORB pullback (reject and fall through to HOLD).
-            if not is_dry_volume:
-                # Moderate/heavy volume on a pullback = institutional distribution.
-                # Not a valid setup — fall through to HOLD/WATCH, don't force a signal.
+            # FIX #3-11: Use volume_surge_ratio param instead of hardcoded 1.1.
+            # For US 3x ETFs, vol_ratio 1.1-1.5 on a pullback is NORMAL in strong
+            # trends — rejecting all pullbacks above 1.1x means the agent only
+            # enters on extremely dry volume (<1.1x), which rarely happens on
+            # TQQQ/SOXL during trending markets. Use the configured surge threshold.
+            vol_surge_thresh = params.get("volume_surge_ratio", 1.5)
+            if vol_ratio >= vol_surge_thresh:
+                # Distribution pullback — ignore and fall through
                 signal_type = "HOLD / WATCH"
-                reasoning.append(
-                    f"⚠️ Pullback on non-dry volume ({vol_ratio:.2f}x) — "
-                    "institutional distribution risk. No signal."
-                )
+                reasoning.append(f"⚠️ Pullback aborted — heavy distribution volume ({vol_ratio:.2f}x vs threshold {vol_surge_thresh:.1f}x).")
             else:
                 signal_type = "GOLD BUY (PULLBACK)"
                 if is_pullback_ema:
@@ -328,17 +320,20 @@ def analyze_stock_setup(ticker, df, params,
                                      f"({params['ema_slow']}).")
                 if is_pullback_rsi:
                     reasoning.append(f"RSI pulled back to {rsi:.1f} — hook up.")
-                reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
+                
+                if vol_ratio >= 0.85:
+                    # Soft penalty on moderate volume
+                    base_confidence = 60.0
+                    reasoning.append(f"⚠️ Pullback on moderate volume ({vol_ratio:.2f}x) — possible minor selling pressure.")
+                else:
+                    # Ideal pullback on dry volume
+                    base_confidence = 70.0
+                    reasoning.append(f"Pullback on dry volume ({vol_ratio:.2f}x).")
 
-                base_confidence = 70.0
-                if is_bullish_alignment:
-                    # Soft bonus: EMA50 above EMA200 confirms structural uptrend
-                    base_confidence += 5
-                    reasoning.append("EMA alignment confirmed (50-day > 200-day).")
                 if close > float(last["Open"]):
                     reasoning.append("Bullish candle at support.")
                     base_confidence += 5
-
+                
                 if q_override == "BUY":
                     base_confidence += 5 * q_modifier
                 elif q_override == "AVOID":
@@ -375,10 +370,19 @@ def analyze_stock_setup(ticker, df, params,
     support_sl = support * 0.99
     stop_loss = max(raw_sl, support_sl)
     risk_pct = (entry_price - stop_loss) / entry_price * 100
-    if risk_pct < 1.5:
-        stop_loss = entry_price * 0.985
-    elif risk_pct > 10.0:
-        stop_loss = entry_price * 0.90
+    # FIX #3-14: Use profile min/max stop loss pct instead of hardcoded 1.5%/10%.
+    # This ensures the fallback is appropriate for the active market.
+    try:
+        from market_profiles import active_profile
+        min_sl_pct = active_profile().get("min_stop_loss_pct", 1.5)
+        max_sl_pct = active_profile().get("max_stop_loss_pct", 10.0)
+    except Exception:
+        min_sl_pct = 1.5
+        max_sl_pct = 10.0
+    if risk_pct < min_sl_pct:
+        stop_loss = entry_price * (1 - min_sl_pct / 100)
+    elif risk_pct > max_sl_pct:
+        stop_loss = entry_price * (1 - max_sl_pct / 100)
     risk_per_share = max(entry_price - stop_loss, 0.001)
     tp1 = entry_price + 1.5 * risk_per_share
     tp2 = entry_price + 2.0 * risk_per_share
