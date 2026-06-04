@@ -370,30 +370,29 @@ def run_full_risk_check(trades: list, new_trade_info: dict,
         rejecting.append(f"time: {checks['time_window_check']['reason']}")
 
     # Progressive Exposure (The Minervini Rule)
-    closed_trades = sorted([t for t in trades if t.get("status") == "CLOSED"], 
-                           key=lambda x: x.get("id", 0), reverse=True)[:5]
+    # FIX #3-1: Simplified — only checks consecutive recent losses.
+    # The secondary win_rate check was removed — it used a buggy denominator
+    # (always 5 = slice size) and could fire incorrectly after a broken streak.
+    closed_trades_pe_list = sorted([t for t in trades if t.get("status") == "CLOSED"],
+                              key=lambda x: x.get("id", 0), reverse=True)[:5]
     pe_multiplier = 1.0
     pe_reason = ""
-    
-    if len(closed_trades) >= 3:
+
+    if len(closed_trades_pe_list) >= 1:
         losses = 0
-        for ct in closed_trades:
+        for ct in closed_trades_pe_list:
             pnl = ct.get("realized_pnl", 0)
             if pnl < 0:
                 losses += 1
             else:
-                break
+                break  # streak broken by a win or breakeven
         if losses >= 3:
             pe_multiplier = 0.5
-            pe_reason = f"Progressive Exposure: {losses} consecutive losses. Scaling down size to 50%."
-        else:
-            wins = sum(1 for ct in closed_trades if ct.get("realized_pnl", 0) > 0)
-            win_rate = wins / len(closed_trades)
-            if win_rate <= 0.40:
-                pe_multiplier = 0.5
-                pe_reason = f"Progressive Exposure: Poor recent win rate ({win_rate*100:.0f}%). Scaling down size to 50%."
-            elif win_rate >= 0.80:
-                pe_reason = f"Progressive Exposure: Strong recent win rate ({win_rate*100:.0f}%). Trading at full size."
+            pe_reason = (f"Progressive Exposure: {losses} consecutive recent "
+                         f"losses. Scaling down size to 50%.")
+        elif losses >= 1:
+            pe_reason = (f"Progressive Exposure: {losses} recent loss(es). "
+                         f"Monitoring — full size if streak < 3.")
 
     if pe_multiplier < 1.0:
         size_mult = min(size_mult, pe_multiplier)
@@ -443,15 +442,11 @@ def get_risk_dashboard_stats(trades: list, capital: float,
                 break
         if losses >= 3:
             pe_multiplier = 0.5
-            pe_reason = f"ALERT: {losses} consecutive losses. Scaling down next trade sizes to 50%."
-        else:
-            wins = sum(1 for ct in closed_trades if ct.get("realized_pnl", 0) > 0)
-            win_rate = wins / len(closed_trades)
-            if win_rate <= 0.40:
-                pe_multiplier = 0.5
-                pe_reason = f"ALERT: Poor recent win rate ({win_rate*100:.0f}% over last {len(closed_trades)} trades). Scaling down to 50%."
-            elif win_rate >= 0.80:
-                pe_reason = f"EXCELLENT: Strong recent win rate ({win_rate*100:.0f}%). Trading at full size."
+            pe_reason = (f"ALERT: {losses} consecutive recent losses. "
+                         f"Scaling down next trade sizes to 50%.")
+        elif losses >= 1:
+            pe_reason = (f"CAUTION: {losses} recent loss(es). "
+                         f"Monitoring — PE triggers at 3 consecutive.")
 
     return {
         "drawdown_pct": dd["pct_drop"],
