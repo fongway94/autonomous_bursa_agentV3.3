@@ -565,31 +565,17 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
 
         # ----- Exit conditions (priority order) -----
 
-        # Climax Run: price stretches too far above 50-day EMA.
-        # FIX 2+3: threshold is now profile-aware (MY=25%, US=30%), not hardcoded 20%.
-        # FIX 2: also guard against false exit triggers — only use the climax exit
-        # if the trade was entered BEFORE the current day, or if the stretch is
-        # genuinely extreme (>2x the profile threshold, meaning it can't be a
-        # pre-entry spike). For same-day entries, the current price is used only
-        # for P&L tracking; the exit uses the last closed bar's high/low.
+        # Climax Run: price stretches too far above 50-day EMA
+        # FIX #3-2: Threshold now comes from active profile (US=30%, MY=20%).
+        # US 3x ETFs regularly stretch 25-40% in strong trends — 20% was too tight.
         ema50 = px.get("ema50")
-        entry_time = pd.to_datetime(t.get("logged_at", ""), errors="coerce")
-        if entry_time.tzinfo:
-            entry_time = entry_time.tz_localize(None)
-        is_same_day_entry = (entry_time.date() == get_myt_now().date()
-                             if entry_time else False)
-        if ema50 is not None and not is_same_day_entry:
+        if ema50 is not None:
             stretch_pct = (current_price - ema50) / ema50 * 100
-            profile = _profile()
-            stretch_threshold = float(getattr(profile, 'climax_stretch_pct', 20.0))
-            # Only trigger on genuine climax moves — not pre-entry spikes.
-            # Allow 2x threshold as a safety net for extreme same-day extensions.
-            trigger = stretch_pct >= stretch_threshold
-            if trigger:
+            climax_thresh = float(_profile().climax_stretch_pct)
+            if stretch_pct >= climax_thresh:
                 ok, msg = execute_full_exit(
                     t["id"], current_price,
-                    reason=f"Climax Run Exit: Price stretched {stretch_pct:.1f}% above 50-day EMA "
-                           f"(threshold: {stretch_threshold:.0f}%)",
+                    reason=f"Climax Run Exit: Price stretched {stretch_pct:.1f}% above 50-day EMA",
                     outcome="WIN", actor=actor)
                 if ok:
                     settled.append({"trade_id": t["id"], "type": "CLIMAX", "msg": msg,
