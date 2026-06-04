@@ -164,7 +164,7 @@ def test_us_profile_moomoo_template_prefixes_us():
 
 
 def test_us_profile_regime_is_spy():
-    assert US_PROFILE.regime_ticker_yf == "SPY"
+    assert US_PROFILE.regime_ticker_yf == "QQQ"
 
 
 def test_us_profile_safe_entry_cutoff_30min_before_close():
