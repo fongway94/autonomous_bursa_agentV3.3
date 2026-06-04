@@ -600,6 +600,7 @@ def init_db():
             # 'NOOP' (default — notify only) / 'SIMULATE' / 'REAL'.
             # MY ignores anything other than NOOP today; US respects all three.
             "ALTER TABLE scheduler_state ADD COLUMN broker_mode TEXT NOT NULL DEFAULT 'NOOP'",
+            "ALTER TABLE scheduler_state ADD COLUMN last_wfo_run_at TEXT",  # v3.7: WFO tracker
             # v3.6: last reconciliation drift (broker vs internal) in absolute currency,
             # plus the timestamp it was last computed. Surfaces in Settings tab.
             "ALTER TABLE scheduler_state ADD COLUMN last_reconcile_at TEXT",
