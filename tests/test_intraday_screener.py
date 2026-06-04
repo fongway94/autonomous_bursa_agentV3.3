@@ -426,14 +426,19 @@ class TestScreenIntraday:
         results = self._run_screen(_raise, ["TNA"], datetime.now())
         assert results == []
 
-    def test_default_watchlist_is_curated_6(self):
-        assert len(DEFAULT_INTRADAY_WATCHLIST) == 6
-        assert "TNA" in DEFAULT_INTRADAY_WATCHLIST
-        assert "GOOGL" in DEFAULT_INTRADAY_WATCHLIST
-        assert "TQQQ" in DEFAULT_INTRADAY_WATCHLIST
-        assert "MSTR" in DEFAULT_INTRADAY_WATCHLIST
-        assert "SOXL" in DEFAULT_INTRADAY_WATCHLIST
-        assert "PLTR" in DEFAULT_INTRADAY_WATCHLIST
+    def test_default_watchlist_prioritizes_high_sharpe_tickers(self):
+        """v3.7: Watchlist reordered. QQQ/SPY first (Sharpe 1.9-2.3),
+        leveraged ETFs by Sharpe, TQQQ demoted to last (Sharpe 0.44)."""
+        assert len(DEFAULT_INTRADAY_WATCHLIST) == 11
+        # Primary signals — highest Sharpe
+        assert DEFAULT_INTRADAY_WATCHLIST[0] == "QQQ"
+        assert DEFAULT_INTRADAY_WATCHLIST[1] == "SPY"
+        # TQQQ should be last (weakest Sharpe)
+        assert DEFAULT_INTRADAY_WATCHLIST[-1] == "TQQQ"
+        # All expected tickers present
+        for tk in ["QQQ", "SPY", "SPXL", "UPRO", "SOXL", "FNGU",
+                   "TNA", "GOOGL", "MSTR", "PLTR", "TQQQ"]:
+            assert tk in DEFAULT_INTRADAY_WATCHLIST
 
 
 # ---------------------------------------------------------------------------
