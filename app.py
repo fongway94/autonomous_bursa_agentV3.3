@@ -567,10 +567,11 @@ _scanner_tab_label = "⚡ Intraday Scanner" if _current_mode == "INTRADAY" else 
 _robo_tab_label = "⚡ Intraday Robo-Trader" if _current_mode == "INTRADAY" else "🤖 Robo-Trader"
 _settings_tab_label = "⚙️ Settings"
 
-tab_scanner, tab_portfolio, tab_learning, tab_perf, tab_robo, tab_logs, tab_alerts, tab_settings = st.tabs(
+(tab_scanner, tab_portfolio, tab_learning, tab_perf, tab_robo, tab_logs,
+ tab_alerts, tab_noop, tab_settings) = st.tabs(
     [_scanner_tab_label, "💼 Portfolio", "🧠 AI Learning",
      "📊 Performance", _robo_tab_label, "📜 Logs",
-     "🔔 Live Alerts", _settings_tab_label]
+     "🔔 Live Alerts", "🧪 NOOP Learning", _settings_tab_label]
 )
 
 # ---------------------------------------------------------------------------
@@ -2075,6 +2076,94 @@ with tab_alerts:
 # =========================================================================
 # TAB 7 — Settings
 # =========================================================================
+with tab_noop:
+    st.subheader("🧪 NOOP Learning Mode")
+    st.caption(
+        "Observe → classify → decide → explain → record → track outcome. "
+        "No real or paper orders are placed. Lessons are generated for human "
+        "review, never auto-applied.")
+    try:
+        import noop_safety
+        import noop_journal
+        import noop_report
+
+        # ---- Safety posture ----
+        s = noop_safety.safety_status()
+        cols = st.columns(4)
+        cols[0].metric("NOOP mode", "ON ✅" if s["noop_mode_active"] else "OFF ⚠️")
+        cols[1].metric("Paper trading", "OFF 🔒" if not s["paper_trading_enabled"] else "ON ⚠️")
+        cols[2].metric("Live trading", "OFF 🔒" if not s["live_trading_enabled"] else "ON ⚠️")
+        cols[3].metric("Auto rule changes", "OFF 🔒" if not s["auto_rule_changes_allowed"] else "ON ⚠️")
+        if s["any_execution_allowed"]:
+            st.error("⚠️ Execution is ALLOWED — this is no longer pure NOOP. "
+                     "Verify this was intentional.")
+        else:
+            st.success("🔒 Safe: no real or paper orders can be placed. "
+                       "No automatic rule changes.")
+
+        st.divider()
+
+        # ---- Tier counts ----
+        try:
+            tc = noop_journal.tier_counts()
+            total = noop_journal.count_all()
+        except Exception:
+            tc, total = {"A": 0, "B": 0, "C": 0, "D": 0}, 0
+        st.markdown(f"**Decision journal — {total} recorded "
+                    f"(this market & mode)**")
+        c = st.columns(4)
+        c[0].metric("Tier A (would-execute)", tc.get("A", 0))
+        c[1].metric("Tier B (watchlist)", tc.get("B", 0))
+        c[2].metric("Tier C (rejected-tracked)", tc.get("C", 0))
+        c[3].metric("Tier D (no setup)", tc.get("D", 0))
+
+        st.divider()
+
+        # ---- Weekly learning summary (descriptive only) ----
+        st.markdown("**Weekly learning summary** _(descriptive — no rules changed)_")
+        try:
+            rep = noop_report.weekly_summary()
+            a = rep["tier_A"]
+            colr = st.columns(3)
+            colr[0].metric("Tier A resolved", a.get("n", 0))
+            colr[1].metric("Tier A win rate",
+                           f"{a['win_rate']}%" if a.get("win_rate") is not None else "—")
+            colr[2].metric("Tier A expectancy",
+                           f"{a['expectancy_r']}R" if a.get("expectancy_r") is not None else "—")
+            colr2 = st.columns(2)
+            fp = rep.get("false_positive_rate_pct")
+            mo = rep.get("missed_opportunity_rate_pct")
+            colr2[0].metric("False-positive rate (A/B)",
+                            f"{fp}%" if fp is not None else "—")
+            colr2[1].metric("Missed-opportunity rate (B/C)",
+                            f"{mo}%" if mo is not None else "—")
+            with st.expander("Calibration buckets (predicted vs actual win rate)"):
+                st.dataframe(rep.get("calibration", []), width="stretch")
+            st.markdown("**Lessons (for human review):**")
+            for lesson in rep.get("lessons", []):
+                st.info(lesson)
+        except Exception as e:
+            st.caption(f"Report unavailable yet: {e}")
+
+        st.divider()
+
+        # ---- Recent decisions ----
+        with st.expander("Recent decision records (latest 50)"):
+            try:
+                recent = noop_journal.get_recent_decisions(50)
+                if recent:
+                    show_cols = ["decided_at", "ticker", "tier", "signal",
+                                 "confidence", "status", "outcome", "outcome_r",
+                                 "expected_scenario"]
+                    rows = [{k: r.get(k) for k in show_cols} for r in recent]
+                    st.dataframe(rows, width="stretch")
+                else:
+                    st.caption("No decisions recorded yet — run a cycle.")
+            except Exception as e:
+                st.caption(f"Could not load journal: {e}")
+    except Exception as e:
+        st.warning(f"NOOP panel unavailable: {e}")
+
 with tab_settings:
     st.markdown("## ⚙️ Settings")
     st.caption(
