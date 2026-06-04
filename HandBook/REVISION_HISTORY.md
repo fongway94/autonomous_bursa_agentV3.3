@@ -24,11 +24,14 @@ SWING daily engine. Branch: `feat/intraday`.
 - **Robust `_get_secret` Helper:** Created a helper that reads secrets from `os.environ`, `st.secrets`, or parses `.streamlit/secrets.toml` directly on disk, resolving the issue where background threads on your local PC failed to read updated secrets.
 - **True Intraday High/Low Exits Check:** Modified `scheduler.py` to fetch cumulative Daily High/Low prices on hourly ticks for active positions. This ensures that intraday target hits (TP) or protection drops (SL) are never missed or forgotten, even if the price pullbacks by the end of the hour.
 - **MA50 > MA200 Trend Alignment Filter:** Upgraded `screener.py` to add a 50-day EMA calculation and make `EMA50 > EMA200` a mandatory alignment filter for long setups, completely excluding false "dead-cat bounce" spikes in structural bear markets.
-- **Volume Dry-Up (VDU) Pullback Filter:** Refactored the "GOLD BUY (PULLBACK)" trigger to mandate dry pullback volume (`is_dry_volume`), preventing the agent from buying pullbacks during high-volume institutional selling (distribution).
+- **Soft Pullback Volume Penalty (VDU Upgrade):** Refactored the pullback trigger to fully allow pullbacks up to `1.1x` volume ratio, but if volume is moderate ($\ge 0.85$), the system applies a soft -10% confidence penalty and logs a warning to keep the funnel open while penalizing non-dry volume.
 - **IBD RS Percentile Leader Booster:** Top 20% market leaders (RS Percentile $\ge 80\%$) now automatically receive a `+7` boost to their confidence score inside the screener.
 - **Climax Run Profit Exit:** Upgraded `trading_engine.py` to add an automatic profit-locking exit if the price of an active swing trade stretches $\ge 20\%$ above its 50-day EMA, capturing vertical momentum bursts before they collapse.
 - **Progressive Exposure (The Minervini Rule):** Refactored `risk_manager.py` to audit your last 5 closed trades. It automatically halves your next trade sizes (`size_multiplier = 0.5`) if you are in a 3-consecutive-loss streak or if your recent win-rate falls $\le 40\%$.
 - **ATR-Based Volatility Position Sizing:** Upgraded `scheduler.py` to calculate target shares using the Average True Range (`ATR * 1.5`) rather than support distance, ensuring every stock contributes the exact same natural volatility risk and preventing "Support Squeezing" overexposure.
+- **10-Minute Split-Cadence Exits:** Main thread wakes up every 10 minutes to run lightweight `_run_fast_settle_only()` exit checks on active positions (slashing slippage from 60 to 10 minutes), while running the heavy 80-stock market scan on the hour.
+- **Nightly Priors Decay (Market Non-Stationarity):** Nightly maintenance loop automatically applies a `0.95` exponential decay factor to all $\alpha$ and $\beta$ state priors, ensuring the brain "forgets" ancient market states and automatically adapts to current regimes.
+- **Correlation Shield (Multi-Collinearity Protection):** Risk manager automatically restricts the portfolio to a maximum of 2 concurrent active positions per sector, preventing sector-wide clustering overexposure.
 
 ### Why
 
