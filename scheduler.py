@@ -595,6 +595,39 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
         total_equity = cash + _active_mv
         threshold = regime.get("position_rules", {}).get("new_signal_threshold", 0.70) * 100
 
+        # ---- NOOP measurement hook (record-only; places NO orders) ----
+        # Journal EVERY screened setup (Tier A/B/C), not just the executed ones,
+        # so the agent can learn from setups it does not take. Fully defensive:
+        # never crashes the cycle. See HandBook/NOOP_TRUE_STATE.md.
+        try:
+            from noop_safety import noop_mode_active
+            if noop_mode_active() and not df.empty:
+                import noop_record
+                from market_profiles import active_market_code
+                _regime_label = regime.get("regime_data", {}).get("regime", "UNKNOWN")
+                _noop_sum = noop_record.record_cycle_decisions(
+                    df,
+                    market=active_market_code(),
+                    mode="SWING",
+                    regime=_regime_label,
+                    regime_threshold=float(threshold),
+                    cycle_id=myt_iso(),
+                )
+                log_scheduler_event(
+                    "NOOP_JOURNAL",
+                    f"Recorded decisions — A:{_noop_sum.get('A',0)} "
+                    f"B:{_noop_sum.get('B',0)} C:{_noop_sum.get('C',0)} "
+                    f"D:{_noop_sum.get('D',0)} (written={_noop_sum.get('written',0)})",
+                    "INFO",
+                    payload=_noop_sum,
+                )
+        except Exception as _noop_e:
+            try:
+                log_scheduler_event("NOOP_JOURNAL_ERROR",
+                                    f"NOOP journal hook failed: {_noop_e}", "WARN")
+            except Exception:
+                pass
+
         gold_buys = df[df["signal"].astype(str).str.contains("GOLD BUY", regex=False)]
         gold_buys = gold_buys[gold_buys["confidence"] >= threshold]
         gold_buys = gold_buys.head(regime.get("position_rules", {})
@@ -1090,6 +1123,30 @@ def _loop(interval_sec: int, my_pid: int):
                 if try_claim_daily_task("prune_logs", my_pid):
                     prune_logs(5000)
                     record_daily_task_result("prune_logs", "ok")
+
+                # ---- NOOP: resolve due decision-journal rows (shadow outcomes) ----
+                # Labels every OPEN decision (all tiers) whose review_at has
+                # passed by replaying frozen SL/TP/timeout on real price data.
+                # Places NO orders. Defensive — never aborts maintenance.
+                if try_claim_daily_task("noop_resolve", my_pid):
+                    try:
+                        import noop_resolver
+                        _interval = "5m" if _is_intraday_mode() else "1d"
+                        _rsum = noop_resolver.resolve_due(interval=_interval)
+                        log_scheduler_event(
+                            "NOOP_RESOLVE",
+                            f"Resolved {_rsum.get('resolved',0)} "
+                            f"(W:{_rsum.get('wins',0)}/L:{_rsum.get('losses',0)}/"
+                            f"F:{_rsum.get('flats',0)}), "
+                            f"skipped {_rsum.get('skipped',0)}", "INFO",
+                            payload=_rsum)
+                        record_daily_task_result(
+                            "noop_resolve",
+                            f"resolved={_rsum.get('resolved',0)}")
+                    except Exception as e:
+                        log_scheduler_event("NOOP_RESOLVE",
+                                            f"failed: {e}", "WARN")
+                        record_daily_task_result("noop_resolve", f"error: {e}")
 
                 if try_claim_daily_task("ml_retrain", my_pid):
                     try:
@@ -1845,6 +1902,36 @@ def _run_intraday_cycle(autotrade: bool, autoexit: bool,
 
     # 2. Build live bar data for settlement
     bar_data = _build_intraday_bar_data()
+
+    # ---- NOOP measurement hook (record-only; places NO orders) ----
+    # Journal every intraday signal regardless of whether it gets executed.
+    try:
+        from noop_safety import noop_mode_active
+        if noop_mode_active() and signals:
+            import noop_record
+            from market_profiles import active_market_code
+            _ir_threshold = 0.0  # intraday signals are pre-filtered ORB breakouts
+            _ir_sum = noop_record.record_cycle_decisions(
+                signals,
+                market=active_market_code(),
+                mode="INTRADAY",
+                regime=str(state_name),
+                regime_threshold=_ir_threshold,
+                cycle_id=myt_iso(),
+            )
+            log_scheduler_event(
+                "NOOP_JOURNAL",
+                f"Intraday decisions — A:{_ir_sum.get('A',0)} "
+                f"B:{_ir_sum.get('B',0)} C:{_ir_sum.get('C',0)} "
+                f"(written={_ir_sum.get('written',0)})",
+                "INFO", payload=_ir_sum,
+            )
+    except Exception as _noop_e:
+        try:
+            log_scheduler_event("NOOP_JOURNAL_ERROR",
+                                f"Intraday NOOP hook failed: {_noop_e}", "WARN")
+        except Exception:
+            pass
 
     # 3. Auto-settle (only if autoexit is on)
     if autoexit and bar_data:
