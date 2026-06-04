@@ -1185,6 +1185,83 @@ def _loop(interval_sec: int, my_pid: int):
                 # Decay will be re-introduced only after empirical calibration with
                 # real closed-trade data (expected after 200+ trades).
 
+                # v3.7: Walk-forward optimization — runs monthly to self-tune parameters
+                # This is the ONLY autonomous self-improvement mechanism in the system.
+                # Runs only when: (a) ≥100 closed trades exist, (b) ≥28 days since last run
+                try:
+                    ss = get_scheduler_state()
+                    last_wfo = ss.get("last_wfo_run_at")
+                    
+                    # Check if WFO should run
+                    from datetime import datetime, timedelta
+                    wfo_due = False
+                    if last_wfo is None:
+                        wfo_due = True  # never run
+                    else:
+                        try:
+                            last_wfo_dt = datetime.fromisoformat(last_wfo)
+                            days_since = (datetime.now() - last_wfo_dt).days
+                            wfo_due = days_since >= 28
+                        except Exception:
+                            wfo_due = True  # corrupted date
+
+                    closed_count = 0
+                    try:
+                        from repository import closed_trades
+                        closed_count = len(closed_trades())
+                    except Exception:
+                        pass
+
+                    if wfo_due and closed_count >= 100:
+                        if try_claim_daily_task("walk_forward_optimize", my_pid):
+                            log_scheduler_event(
+                                "WFO_START",
+                                f"Starting WFO (day {days_since} since last, "
+                                f"{closed_count} trades)",
+                                "INFO"
+                            )
+                            try:
+                                from learner import run_walk_forward_optimization
+                                best_params, best_combined, best_sharpe = (
+                                    run_walk_forward_optimization()
+                                )
+                                if best_params is not None:
+                                    from screener import save_parameters
+                                    save_parameters(best_params)
+                                    update_scheduler_state(last_wfo_run_at=myt_iso())
+                                    log_scheduler_event(
+                                        "WFO_SUCCESS",
+                                        f"WFO updated params: combined={best_combined:.3f}, "
+                                        f"sharpe={best_sharpe:.3f}",
+                                        "INFO"
+                                    )
+                                    record_daily_task_result(
+                                        "walk_forward_optimize",
+                                        f"updated: combined={best_combined:.3f}, "
+                                        f"sharpe={best_sharpe:.3f}"
+                                    )
+                                else:
+                                    update_scheduler_state(last_wfo_run_at=myt_iso())
+                                    log_scheduler_event(
+                                        "WFO_REJECTED",
+                                        "No param set passed Sharpe gate; params unchanged.",
+                                        "WARN"
+                                    )
+                                    record_daily_task_result(
+                                        "walk_forward_optimize",
+                                        "rejected: no Sharpe-passing grid"
+                                    )
+                            except Exception as e:
+                                update_scheduler_state(last_wfo_run_at=myt_iso())
+                                log_scheduler_event(
+                                    "WFO_ERROR",
+                                    f"WFO failed: {e}", "ERROR"
+                                )
+                                record_daily_task_result("walk_forward_optimize", f"error: {e}")
+                except Exception as e:
+                    log_scheduler_event("WFO_SCHED_ERROR", f"{e}", "ERROR")
+                    pass
+
             from repository import closed_trades, try_claim_daily_task, record_daily_task_result
             ss = get_scheduler_state()
             if ss.get("exploration_mode"):
