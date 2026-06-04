@@ -163,7 +163,8 @@ def test_us_profile_moomoo_template_prefixes_us():
     assert US_PROFILE.ticker_moomoo_template.format(symbol="AAPL") == "US.AAPL"
 
 
-def test_us_profile_regime_is_spy():
+def test_us_profile_regime_is_qqq():
+    # FIX #3-6: QQQ is the regime proxy for this QQQ-heavy watchlist
     assert US_PROFILE.regime_ticker_yf == "QQQ"
 
 
