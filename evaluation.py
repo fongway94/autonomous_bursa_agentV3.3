@@ -2,16 +2,11 @@
 """
 Evaluation harness — honest performance metrics.
 
-Surfaced metrics
-----------------
-* Equity curve (daily) + drawdown curve
-* CAGR, Sharpe, Sortino (252 trading days)
-* Max drawdown depth + duration
-* Profit factor, expectancy (RM and R)
-* Avg MAE / MFE per trade
-* Calibration buckets (confidence decile → realized win rate)
-* Per-regime hit rate
-* Benchmark comparison vs KLCI buy-and-hold and equal-weight watchlist
+FIX 2 changes:
+  - Issue #8: klci_buy_hold() now uses active_profile().regime_ticker_yf
+    instead of hardcoded ^KLSE.  Benchmark must match the active market
+    — comparing US strategy performance against the Malaysian index makes
+    the comparison meaningless.
 """
 
 from __future__ import annotations
@@ -108,7 +103,6 @@ def expectancy(trades: list[dict]) -> dict:
     gross_l = sum(abs(min(t.get("realized_pnl") or 0, 0)) for t in trades)
     pf = (gross_w / gross_l) if gross_l > 1e-9 else float("inf") if gross_w > 0 else 0
 
-    # R-multiples per trade
     r_vals = []
     for t in trades:
         rps = t.get("risk_per_share") or 0
@@ -197,14 +191,34 @@ def per_regime_stats(trades: list[dict]) -> dict:
 # Benchmarks
 # -------------------------------------------------------------------------
 
+def _active_regime_ticker() -> str:
+    """
+    FIX #8: Return the active market's regime/benchmark ticker.
+    Used by both klci_buy_hold() and full_evaluation_report().
+    """
+    try:
+        from market_profiles import active_profile
+        return active_profile().regime_ticker_yf
+    except Exception:
+        return "^KLSE"  # safe fallback for MY
+
+
 def klci_buy_hold(equity_dates: pd.DatetimeIndex, initial_capital: float) -> pd.Series:
+    """
+    FIX #8: Now uses active_profile().regime_ticker_yf instead of hardcoded ^KLSE.
+
+    MY  → ^KLSE (FTSE Malaysia KLCI)
+    US  → SPY  (S&P 500 ETF — the broad market benchmark for US equity strategies)
+
+    Benchmark comparison is only meaningful when comparing apples to apples.
+    A US swing strategy beating SPY is impressive; beating ^KLSE tells us nothing.
+    """
     if equity_dates is None or len(equity_dates) == 0:
         return pd.Series(dtype=float)
     try:
+        ticker = _active_regime_ticker()
         start = equity_dates.min()
-        # v3.1.10: explicit timeout — was missing, could hang the Performance
-        # tab indefinitely on a slow yfinance day.
-        df = yf.Ticker("^KLSE").history(
+        df = yf.Ticker(ticker).history(
             start=start - pd.Timedelta(days=10),
             end=equity_dates.max() + pd.Timedelta(days=1),
             timeout=30)
@@ -231,8 +245,6 @@ def equal_weight_watchlist(equity_dates: pd.DatetimeIndex,
         eq = None
         for t in tickers:
             try:
-                # v3.1.10: explicit timeout — was missing, could hang the
-                # Performance tab indefinitely on a slow yfinance day.
                 df = yf.Ticker(t).history(start=start - pd.Timedelta(days=10),
                                           end=end + pd.Timedelta(days=1),
                                           timeout=15)
@@ -281,6 +293,7 @@ def full_evaluation_report() -> dict:
             "initial_capital": acc["initial_capital"],
             "total_return_pct": round(
                 (equity_series.iloc[-1] / acc["initial_capital"] - 1) * 100, 2),
+            "benchmark_ticker": _active_regime_ticker(),
         },
         "risk": {**sharpe_sortino(daily_ret), **max_drawdown(equity_series)},
         "expectancy": expectancy(trades),
