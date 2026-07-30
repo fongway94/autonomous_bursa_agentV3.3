@@ -314,40 +314,40 @@ def _fetch_ticker_price_data(ticker: str) -> tuple[str, dict | None]:
     Fetch price data for one ticker. Returns (ticker, data_or_None).
 
     FIX 1: Designed to run in a ThreadPoolExecutor for parallel fetching.
-    FIX 2: Uses the LAST COMPLETED DAILY BAR (yesterday) for exit high/low.
-           Today's incomplete bar is used only for current price (P&L tracking).
-           This prevents false exit triggers when the daily High/Low includes
-           pre-entry price action (e.g. a crash at 09:35 AM, trade entered at
-           10:00 AM → daily Low still contains the 09:35 crash, would trigger
-           a false SL exit on the same-day check).
+    FIX 2026-07: Uses TODAY's bar high/low for exit checks so that a live
+           price already below SL triggers immediately. The old logic used
+           yesterday's bar (df.iloc[-2]) which caused a 1-day delay — user
+           saw price below SL but trade stayed open until next day.
+           Same-day false-trigger protection is handled in
+           trading_engine.auto_settle_trades() by checking logged_at date:
+           if a trade was opened today, SL uses current_price, not day-low.
     """
     try:
         from data_provider import get_history
         df_t = get_history(ticker, period="3mo", timeout=20)
-        if df_t is None or df_t.empty or len(df_t) < 2:
+        if df_t is None or df_t.empty or len(df_t) < 1:
             return ticker, None
 
-        # Last completed bar = second-to-last row (yesterday's fully closed bar)
-        last_closed = df_t.iloc[-2]
-        # Current bar = last row (may be incomplete / intraday)
         current_row = df_t.iloc[-1]
 
-        # Calculate 50-day EMA from all closed bars (not today's incomplete bar)
+        # Calculate 50-day EMA from closed bars excluding today's incomplete bar
         ema50 = None
         if len(df_t) >= 51:
-            closed_bars = df_t.iloc[:-1]  # exclude today
+            closed_bars = df_t.iloc[:-1] if len(df_t) > 1 else df_t
             try:
                 ema50 = closed_bars["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
             except Exception:
                 pass
+        elif len(df_t) >= 50:
+            try:
+                ema50 = df_t["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            except Exception:
+                pass
 
         return ticker, {
-            # Current price for unrealized P&L tracking
             "price": float(current_row["Close"]),
-            # Yesterday's completed bar for exit triggers (no pre-entry contamination)
-            "high": float(last_closed["High"]),
-            "low": float(last_closed["Low"]),
-            # 50-day EMA from all closed bars
+            "high": float(current_row["High"]),
+            "low": float(current_row["Low"]),
             "ema50": float(ema50) if ema50 is not None else None,
         }
     except Exception as e:
@@ -1319,6 +1319,26 @@ def _loop(interval_sec: int, my_pid: int):
                     log_scheduler_event("WFO_SCHED_ERROR", f"{e}", "ERROR")
                     pass
 
+                # Professional: Daily brain summary for swing trader (Telegram)
+                # Runs once per day in maintenance window (01:00-01:05 MYT)
+                # Only sends if we have at least 1 closed trade and Telegram is configured
+                try:
+                    if try_claim_daily_task("daily_brain_summary", my_pid):
+                        from brain_summary import send_daily_brain_summary
+                        res = send_daily_brain_summary()
+                        if res and not res.get("error"):
+                            log_scheduler_event("DAILY_BRAIN_SENT", "Daily brain summary sent", "INFO")
+                            record_daily_task_result("daily_brain_summary", "sent")
+                        else:
+                            err = res.get("error") if isinstance(res, dict) else str(res)
+                            record_daily_task_result("daily_brain_summary", f"skip/error: {err}")
+                except Exception as e:
+                    log_scheduler_event("DAILY_BRAIN_ERROR", f"{e}", "WARN")
+                    try:
+                        record_daily_task_result("daily_brain_summary", f"error: {e}")
+                    except Exception:
+                        pass
+
             from repository import closed_trades, try_claim_daily_task, record_daily_task_result
             ss = get_scheduler_state()
             if ss.get("exploration_mode"):
@@ -1675,8 +1695,10 @@ def _build_intraday_bar_data() -> dict:
     Used by auto_settle_intraday() and force_flat_all_intraday().
     Falls back to last known price from the DB if a live fetch fails.
 
-    v3.7: STALE BAR detection — bars >5 minutes old during market hours
-    are flagged as stale. Uses MY time (server timezone) for consistency.
+    v3.7: STALE BAR detection — bars >5 minutes old during US RTH are flagged.
+    BUGFIX 2026-07: Previously used MYT 09:00-16:00 as market-hours check for US
+    tickers, which meant stale detection never fired during US session
+    (21:30-04:00 MYT). Now uses ET (America/New_York) for US RTH.
     Test data with old dates is accepted (overnight gap is expected).
     """
     bar_data: dict = {}
@@ -1692,9 +1714,10 @@ def _build_intraday_bar_data() -> dict:
     try:
         from data_provider import get_history
         from datetime import datetime, timezone, time as dtime
-        # Use MY time (server timezone) for all date comparisons
-        now_myt = get_myt_now()
-        today_myt = now_myt.date()
+        from zoneinfo import ZoneInfo
+        US_EASTERN = ZoneInfo("America/New_York")
+        now_et = datetime.now(US_EASTERN)
+        today_et = now_et.date()
 
         for tk in tickers:
             age_min = None
@@ -1705,24 +1728,27 @@ def _build_intraday_bar_data() -> dict:
                 last_ts = df.index[-1]
                 last = df.iloc[-1]
 
-                # v3.7: STALE BAR CHECK
-                # Only check during market hours AND when bar is from today.
-                # Outside market hours: accept whatever data we have (overnight gap)
-                # Test data (old dates): accept it — not real market hours data
+                # STALE BAR CHECK — US RTH only (09:30-16:00 ET)
                 bar_date = last_ts.date() if hasattr(last_ts, 'date') else None
-                is_today = (bar_date == today_myt) if bar_date else False
+                # Convert bar timestamp to ET date for comparison
+                try:
+                    if hasattr(last_ts, 'tzinfo') and last_ts.tzinfo is not None:
+                        bar_et_date = last_ts.astimezone(US_EASTERN).date()
+                    else:
+                        # yfinance intraday is usually tz-aware (US Eastern)
+                        bar_et_date = bar_date
+                except Exception:
+                    bar_et_date = bar_date
 
-                if is_today:
-                    # Check if inside MY market hours (09:30-16:00 MYT)
-                    # Approximate: MY is UTC+8, market hours are 09:30-16:00 MYT
-                    myt_hour = now_myt.hour
-                    is_market_hours_myt = (9 <= myt_hour < 16)
+                is_today_et = (bar_et_date == today_et) if bar_et_date else False
 
-                    if is_market_hours_myt:
-                        # Market is open in MY time — check bar freshness
+                if is_today_et:
+                    # Check if inside US RTH (09:30-16:00 ET)
+                    is_us_rth = (dtime(9, 30) <= now_et.time() < dtime(16, 0))
+                    if is_us_rth:
                         now_utc = datetime.now(timezone.utc)
-                        bar_ts = last_ts.to_pydatetime()
-                        if bar_ts.tzinfo is None:
+                        bar_ts = last_ts.to_pydatetime() if hasattr(last_ts, 'to_pydatetime') else last_ts
+                        if getattr(bar_ts, 'tzinfo', None) is None:
                             bar_ts = bar_ts.replace(tzinfo=timezone.utc)
                         age_min = (now_utc - bar_ts).total_seconds() / 60
 

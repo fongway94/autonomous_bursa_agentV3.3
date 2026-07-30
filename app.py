@@ -47,7 +47,7 @@ from repository import (
 )
 from trading_engine import (
     execute_entry, execute_partial_exit, execute_full_exit,
-    calculate_trade_cost, round_to_lot, LOT_SIZE,
+    calculate_trade_cost, round_to_lot, lot_size as _lot_size_fn, LOT_SIZE,
 )
 from learner import (
     learn_from_trade_outcome, run_walk_forward_optimization,
@@ -673,6 +673,25 @@ with tab_scanner:
                 st.session_state["screener_df"] = df
                 st.session_state["market_regime"] = mr
                 save_scan_cache(df.to_dict("records") if not df.empty else [], mr)
+                # BUGFIX: intraday manual scan also triggers force-flat/settle
+                try:
+                    from intraday_engine import auto_settle_intraday, force_flat_all_intraday, intraday_session_status as _iss
+                    from repository import active_trades as _at2
+                    _status = _iss()
+                    # Build bar data for active intraday trades
+                    import scheduler as _sched2
+                    bar_data = _sched2._build_intraday_bar_data()
+                    if bar_data:
+                        if _status.get("should_force_flat"):
+                            closed = force_flat_all_intraday(bar_data, actor="USER_SCAN")
+                            if closed:
+                                st.toast(f"Force-flat {closed} intraday position(s)", icon="⚠️")
+                        else:
+                            res = auto_settle_intraday(bar_data, actor="USER_SCAN")
+                            if res.get("settled"):
+                                st.toast(f"Auto-settled {len(res['settled'])} intraday position(s)", icon="⚠️")
+                except Exception as _e:
+                    st.caption(f"Intraday settle on scan skipped: {_e}")
                 st.rerun()
         else:
             with st.spinner(f"Scanning {_current_profile.display_name}…"):
@@ -684,6 +703,50 @@ with tab_scanner:
             st.session_state["market_regime"] = mr
             if not df.empty:
                 save_scan_cache(df.to_dict("records"), mr)
+            # BUGFIX 2026-07: Manual scan must also trigger auto-settle, otherwise
+            # user sees live price below SL but trade stays open.
+            try:
+                ss = get_scheduler_state()
+                if ss.get("autoexit_enabled", 1):
+                    from trading_engine import auto_settle_trades
+                    from repository import active_trades as _at
+                    # Build price_lookup from scan results
+                    _pl = {}
+                    if not df.empty:
+                        for _, r in df.iterrows():
+                            _pl[r["ticker"]] = {"price": float(r["price"]), "high": float(r["price"]), "low": float(r["price"])}
+                    # Fetch fresh prices for active trades not in scan (or to get true high/low)
+                    _active = _at()
+                    if _active:
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        import scheduler as _sched
+                        def _fetch(tkr):
+                            try:
+                                return _sched._fetch_ticker_price_data(tkr)
+                            except Exception:
+                                return tkr, None
+                        with ThreadPoolExecutor(max_workers=8) as ex:
+                            futs = {ex.submit(_fetch, t["ticker"]): t["ticker"] for t in _active}
+                            for fut in as_completed(futs):
+                                tkr, data = fut.result()
+                                if data is not None:
+                                    _pl[tkr] = data
+                    if _pl:
+                        res = auto_settle_trades(_pl, mr, actor="USER_SCAN")
+                        if res.get("settled"):
+                            st.toast(f"🛡️ Auto-settled {len(res['settled'])} position(s) on scan (SL/TP hit)", icon="⚠️")
+                            # Feed closed trades to learner
+                            from repository import get_trade as _gt
+                            from learner import learn_from_trade_outcome as _learn
+                            for ev in res.get("settled", []):
+                                ct = _gt(ev["trade_id"])
+                                if ct:
+                                    try:
+                                        _learn(ct)
+                                    except Exception:
+                                        pass
+            except Exception as _e:
+                st.caption(f"Auto-settle on scan skipped: {_e}")
             st.rerun()
 
     mr = st.session_state.get("market_regime", {}) or {}
@@ -886,11 +949,15 @@ with tab_scanner:
                     if is_buy:
                         risk_per_share = max(row["entry"] - row["stop_loss"], 0.001)
                         suggested_shares = round_to_lot(int(risk_amount / risk_per_share))
+                        try:
+                            _lot = int(_lot_size_fn())
+                        except Exception:
+                            _lot = 100
                         shares = st.number_input(
-                            "Shares (multiples of 100)",
-                            min_value=LOT_SIZE, max_value=1_000_000,
-                            value=max(suggested_shares, LOT_SIZE),
-                            step=LOT_SIZE,
+                            f"Shares (lot size {_lot})",
+                            min_value=int(_lot), max_value=1_000_000,
+                            value=max(suggested_shares, int(_lot)),
+                            step=int(_lot),
                         )
                         shares = round_to_lot(int(shares))
                         cost_info = calculate_trade_cost(shares, row["entry"])
@@ -921,8 +988,12 @@ with tab_scanner:
                             )
                             if rc["pass"]:
                                 sized = int(round_to_lot(int(shares * rc["size_multiplier"])))
-                                if sized < LOT_SIZE:
-                                    st.error("Risk check reduced size below 100-share lot.")
+                                try:
+                                    _lot_chk = int(_lot_size_fn())
+                                except Exception:
+                                    _lot_chk = 100
+                                if sized < _lot_chk:
+                                    st.error(f"Risk check reduced size below {_lot_chk}-share lot.")
                                 else:
                                     ok, tid, msg = execute_entry(
                                         sel, row["name"], row["sector"],
@@ -1099,6 +1170,104 @@ with tab_portfolio:
                                    "change_pct": float(r.get("change_pct", 0))}
                      for _, r in scan_df.iterrows()}
                     if not scan_df.empty else {})
+
+    # BUGFIX 2026-07: Add emergency settle check — if autoexit is ON and live price
+    # is below SL, we must auto-close even if scheduler is stopped.
+    ss_port = get_scheduler_state()
+    if ss_port.get("autoexit_enabled", 1) and trades:
+        c_settle, c_skip = st.columns([1,3])
+        if c_settle.button("🛡️ Check Stops & Settle Now", type="primary", use_container_width=True):
+            with st.spinner("Checking stops vs live prices…"):
+                try:
+                    from trading_engine import auto_settle_trades
+                    from market_analyzer import get_full_market_analysis
+                    import scheduler as _sched_p
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    mr_p = {}
+                    try:
+                        mr_p = get_full_market_analysis()
+                    except Exception:
+                        mr_p = {"regime_data": {"regime": "NEUTRAL"}}
+                    # Merge scan cache prices + fresh fetch for active trades
+                    pl_p = {}
+                    if not scan_df.empty:
+                        for _, r in scan_df.iterrows():
+                            pl_p[r["ticker"]] = {"price": float(r["price"]), "high": float(r["price"]), "low": float(r["price"])}
+                    active_only = [t for t in trades if t["status"]=="ACTIVE"]
+                    if active_only:
+                        def _fetch_p(tkr):
+                            try:
+                                return _sched_p._fetch_ticker_price_data(tkr)
+                            except Exception:
+                                return tkr, None
+                        with ThreadPoolExecutor(max_workers=8) as ex:
+                            futs = {ex.submit(_fetch_p, t["ticker"]): t["ticker"] for t in active_only}
+                            for fut in as_completed(futs):
+                                tkr, data = fut.result()
+                                if data is not None:
+                                    pl_p[tkr] = data
+                    if pl_p:
+                        res_p = auto_settle_trades(pl_p, mr_p, actor="USER_PORTFOLIO")
+                        if res_p.get("settled"):
+                            st.success(f"Settled {len(res_p['settled'])} position(s): " + ", ".join([f"{ev['ticker']} {ev['type']}" for ev in res_p['settled']]))
+                            from repository import get_trade as _gt_p
+                            from learner import learn_from_trade_outcome as _learn_p
+                            for ev in res_p.get("settled", []):
+                                ct = _gt_p(ev["trade_id"])
+                                if ct:
+                                    try:
+                                        _learn_p(ct)
+                                    except Exception:
+                                        pass
+                            st.rerun()
+                        else:
+                            st.info("No stops hit — all positions still valid vs live prices.")
+                    else:
+                        st.warning("No price data to check stops.")
+                except Exception as _e_p:
+                    st.error(f"Settle check failed: {_e_p}")
+        c_skip.caption("If scheduler is STOPPED, live price may drop below SL without auto-exit. Use this button to force a check, or click **SCAN MARKET** which now also checks stops.")
+
+        # AUTO-SETTLE ON PORTFOLIO LOAD: if enabled, silently check if any active trade's live price is already below SL
+        # This is a safety net — does NOT require user click, just runs once per portfolio view if scan cache is recent.
+        try:
+            if "portfolio_auto_settled_at" not in st.session_state:
+                st.session_state["portfolio_auto_settled_at"] = 0
+            import time as _time
+            now_ts = _time.time()
+            # Throttle to once per 60s to avoid spamming on reruns
+            if now_ts - st.session_state["portfolio_auto_settled_at"] > 60:
+                _needs_settle = False
+                for t in trades:
+                    if t["status"] != "ACTIVE":
+                        continue
+                    live = price_lookup.get(t["ticker"], {}).get("price")
+                    if live is not None and live <= float(t["stop_loss"]):
+                        _needs_settle = True
+                        break
+                if _needs_settle:
+                    from trading_engine import auto_settle_trades
+                    from market_analyzer import get_full_market_analysis
+                    mr_auto = {}
+                    try:
+                        mr_auto = get_full_market_analysis()
+                    except Exception:
+                        mr_auto = {"regime_data": {"regime": "NEUTRAL"}}
+                    # Reuse price_lookup already has live price, but need high/low for settlement
+                    pl_auto = {}
+                    for k, v in price_lookup.items():
+                        pl_auto[k] = {"price": float(v["price"]), "high": float(v["price"]), "low": float(v["price"])}
+                    if pl_auto:
+                        res_auto = auto_settle_trades(pl_auto, mr_auto, actor="AUTO_PORTFOLIO")
+                        if res_auto.get("settled"):
+                            st.warning(f"⚠️ Auto-closed {len(res_auto['settled'])} position(s) that were below stop-loss: " + ", ".join([ev['ticker'] for ev in res_auto['settled']]))
+                            st.session_state["portfolio_auto_settled_at"] = now_ts
+                            st.rerun()
+                        else:
+                            st.session_state["portfolio_auto_settled_at"] = now_ts
+        except Exception:
+            pass
+
 
     active = [t for t in trades if t["status"] == "ACTIVE"]
     total_active_cost = sum((t.get("cost") or 0) for t in active)

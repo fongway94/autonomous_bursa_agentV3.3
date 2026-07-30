@@ -25,6 +25,12 @@ sys.path.insert(0, _PROJ)
 def _isolate_data_dir():
     tmp = tempfile.mkdtemp(prefix="bursa_test_")
     os.environ["HOME"] = tmp  # makes DATA_DIR resolve to <tmp>/.bursa_agent_data
+    # BUGFIX 2026-07: Allow broker factory tests to run by disabling NOOP safety gate
+    # The NOOP phase forbids any execution by default, causing test_moomoo_us_adapter
+    # to get NoopAdapter instead of MoomooUSAdapter. For test suite we explicitly
+    # enable paper trading and disable NOOP so factory can return real adapter mocks.
+    os.environ["NOOP_MODE"] = "false"
+    os.environ["PAPER_TRADING_ENABLED"] = "true"
 
     # v3.6: also redirect the market_profiles marker file into the temp dir
     # and ensure the active-market cache starts fresh.

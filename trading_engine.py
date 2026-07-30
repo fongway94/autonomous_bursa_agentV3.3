@@ -278,7 +278,16 @@ def execute_entry(ticker, name, sector, entry_price, stop_loss,
         "tags": [market_regime.get("regime_data", {}).get("regime", "UNKNOWN")],
     }
     trade_id = insert_trade(trade)
-    save_account(cash_balance=cash - total_outlay)
+    # BUGFIX 2026-07: update total_equity = cash_after + sum(active MV) including new trade
+    # Previously only cash_balance was saved, total_equity went stale until next settle.
+    try:
+        remaining_cash = cash - total_outlay
+        # Active trades after insert includes this new trade plus existing
+        active_now = active_trades()
+        mv = sum(float(t.get("entry_price", 0)) * int(t.get("shares_remaining", 0)) for t in active_now)
+        save_account(cash_balance=remaining_cash, total_equity=remaining_cash + mv)
+    except Exception:
+        save_account(cash_balance=cash - total_outlay)
 
     log_trade_event(
         "ENTRY_EXECUTED", trade_id=trade_id, ticker=ticker, actor=actor,
@@ -385,9 +394,15 @@ def execute_partial_exit(trade_id: int, tp_level: str, current_price: float,
         })
     update_trade(trade_id, fields)
 
-    # Cash: we receive net_proceeds (gross − fee)
+    # Cash: we receive net_proceeds (gross − fee) — BUGFIX update equity too
     acc = load_account()
-    save_account(cash_balance=acc["cash_balance"] + net_proceeds)
+    try:
+        new_cash = acc["cash_balance"] + net_proceeds
+        active_now = active_trades()
+        mv = sum(float(tt.get("entry_price", 0)) * int(tt.get("shares_remaining", 0)) for tt in active_now)
+        save_account(cash_balance=new_cash, total_equity=new_cash + mv)
+    except Exception:
+        save_account(cash_balance=acc["cash_balance"] + net_proceeds)
 
     log_trade_event(
         "PARTIAL_EXIT", trade_id=trade_id, ticker=t["ticker"], actor=actor,
@@ -487,7 +502,13 @@ def execute_full_exit(trade_id: int, current_price: float,
     })
 
     acc = load_account()
-    save_account(cash_balance=acc["cash_balance"] + net_proceeds)
+    try:
+        new_cash = acc["cash_balance"] + net_proceeds
+        active_now = active_trades()
+        mv = sum(float(tt.get("entry_price", 0)) * int(tt.get("shares_remaining", 0)) for tt in active_now)
+        save_account(cash_balance=new_cash, total_equity=new_cash + mv)
+    except Exception:
+        save_account(cash_balance=acc["cash_balance"] + net_proceeds)
 
     log_trade_event(
         "FULL_EXIT", trade_id=trade_id, ticker=t["ticker"], actor=actor,
@@ -540,12 +561,33 @@ def execute_full_exit(trade_id: int, current_price: float,
 # AUTO-SETTLE LOOP (called by scheduler)
 # -------------------------------------------------------------------------
 
+def _is_same_day_trade(trade: dict) -> bool:
+    """True if trade was opened today (MYT date), to avoid pre-entry high/low false triggers."""
+    try:
+        logged = pd.to_datetime(trade.get("logged_at"))
+        if logged.tzinfo is not None:
+            logged = logged.tz_localize(None)
+        today = get_myt_now().replace(tzinfo=None).date()
+        return logged.date() == today
+    except Exception:
+        return False
+
+
 def auto_settle_trades(price_lookup: dict, market_regime: dict,
                        actor: str = "AGENT") -> dict:
     """
     Idempotent settlement.
 
     price_lookup: {ticker: {"price": float, "high": float, "low": float}}
+
+    BUGFIX 2026-07 (user report: live price already way low than stop loss, but did not sell):
+      - Previously price_lookup high/low came from yesterday's bar (df.iloc[-2]),
+        causing 1-day delayed SL/TP.
+      - Now price_lookup uses today's bar, and this function uses:
+        * For same-day trades: ONLY current_price triggers SL/TP (avoid pre-entry
+          daily low/high contamination).
+        * For older trades: current_price OR day's high/low triggers, so live price
+          below SL immediately closes.
     """
     regime = market_regime.get("regime_data", {}).get("regime", "NEUTRAL")
     max_hold_days = {"BULL": 14, "NEUTRAL": 7, "BEAR": 5}.get(regime, 7)
@@ -565,6 +607,7 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
         sl = t["stop_loss"]
         tp1, tp2, tp3 = t["tp1"], t["tp2"], t["tp3"]
         trailing = t.get("trailing_stop")
+        is_same_day = _is_same_day_trade(t)
 
         # Track MAE/MFE
         highest = max(t.get("highest_price") or entry, high_today)
@@ -600,8 +643,8 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
                                     "ticker": ticker, "outcome": "WIN"})
                 continue
 
-        # 1. TP3
-        if high_today >= tp3:
+        # 1. TP3 — for same-day trades only trigger if current_price >= tp3
+        if (high_today >= tp3 and not is_same_day) or (current_price >= tp3):
             ok, msg = execute_full_exit(t["id"], tp3,
                                         reason="TP3 hit", outcome="WIN",
                                         actor=actor)
@@ -610,8 +653,8 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
                                 "ticker": ticker, "outcome": "WIN"})
             continue
 
-        # 2. Trailing stop
-        if trailing is not None and low_today <= trailing:
+        # 2. Trailing stop — same-day uses current_price only
+        if trailing is not None and ((low_today <= trailing and not is_same_day) or (current_price <= trailing)):
             outcome = "WIN" if trailing > entry else \
                       ("BREAKEVEN" if abs(trailing - entry) / entry < 0.005
                        else "LOSS")
@@ -624,8 +667,8 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
                                 "ticker": ticker, "outcome": outcome})
             continue
 
-        # 3. Hard stop
-        if low_today <= sl:
+        # 3. Hard stop — CRITICAL FIX: live price below SL must trigger immediately
+        if (low_today <= sl and not is_same_day) or (current_price <= sl):
             ok, msg = execute_full_exit(t["id"], sl,
                                         reason="Hard SL hit", outcome="LOSS",
                                         actor=actor)
@@ -634,8 +677,8 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
                                 "ticker": ticker, "outcome": "LOSS"})
             continue
 
-        # 4. TP2 — partial 50%, set trailing if not yet set
-        if high_today >= tp2 and t.get("phase") == "FULL":
+        # 4. TP2 — partial 50%
+        if ((high_today >= tp2 and not is_same_day) or (current_price >= tp2)) and t.get("phase") == "FULL":
             shares_part = round_to_lot(t["shares_remaining"] // 2)
             if shares_part > 0:
                 ok, msg = execute_partial_exit(
@@ -648,7 +691,7 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
                 t = get_trade(t["id"])
 
         # 5. TP1 — set trailing stop (once)
-        if high_today >= tp1 and t.get("trailing_stop") is None:
+        if ((high_today >= tp1 and not is_same_day) or (current_price >= tp1)) and t.get("trailing_stop") is None:
             buffer_pct = 0.5
             new_trail = max(entry * (1 + buffer_pct / 100),
                             current_price * (1 - buffer_pct / 100))
