@@ -171,30 +171,63 @@ def _icon(event: str) -> str:
 
 
 def _format_entry(t: dict, ss: dict) -> tuple[str, str, str]:
-    """Returns (text, html, subject)."""
+    """Returns (text, html, subject) — Professional Swing Edition."""
     regime = t.get("market_regime") or "—"
     brain = "🎯 EXPLOIT" if not ss.get("exploration_mode") else "🔬 EXPLORE"
     conf = t.get("confidence_score") or 0
     risk_pct = t.get("actual_risk_pct") or 0
     sector = t.get("sector") or "—"
+    # Professional additions
+    exp_target = ss.get("exploration_trades_target", 50)
+    from repository import closed_trades as _ct
+    try:
+        closed_n = len(_ct())
+    except Exception:
+        closed_n = 0
+    progress = f"{closed_n}/{exp_target}" if ss.get("exploration_mode") else f"{closed_n} trades learned"
+
+    # Entry indicators for pro context
+    ind = {}
+    try:
+        import json
+        ind = json.loads(t.get("entry_indicators_json") or "{}") if isinstance(t.get("entry_indicators_json"), str) else (t.get("entry_indicators") or {})
+    except Exception:
+        ind = t.get("entry_indicators") or {}
+    rsi = ind.get("rsi", "—")
+    vol_ratio = ind.get("vol_ratio", "—")
+    atr = ind.get("atr", "—")
+
+    # Risk R-multiple calc
+    entry = float(t.get("entry_price", 0))
+    sl = float(t.get("stop_loss", 0))
+    tp1 = float(t.get("tp1", 0))
+    tp2 = float(t.get("tp2", 0))
+    tp3 = float(t.get("tp3", 0))
+    risk_per_share = max(entry - sl, 0.001)
+    r_tp1 = (tp1 - entry) / risk_per_share if risk_per_share else 0
+    r_tp2 = (tp2 - entry) / risk_per_share if risk_per_share else 0
+    r_tp3 = (tp3 - entry) / risk_per_share if risk_per_share else 0
 
     cur = _ccy()
+    # Professional swing template
     text = (
-        f"{_icon('ENTRY')} ENTRY ALERT — {t['ticker']} {t.get('name','')}\n"
-        f"Time: {t.get('logged_at','')} MYT\n"
-        f"Setup: {t.get('signal_type','')} | Confidence: {conf:.0f}/100\n"
-        f"Brain mode: {brain}\n\n"
-        f"Action: BUY {t.get('shares',0):,} shares @ {cur} {t.get('entry_price',0):.3f}\n"
-        f"Stop Loss: {cur} {t.get('stop_loss',0):.3f} (-{risk_pct:.1f}% risk)\n"
-        f"TP1: {cur} {t.get('tp1',0):.3f} | TP2: {cur} {t.get('tp2',0):.3f} "
-        f"| TP3: {cur} {t.get('tp3',0):.3f}\n"
-        f"Sector: {sector} | Regime: {regime}\n\n"
-        f"Reasoning: {(t.get('entry_reasoning') or '')[:300]}"
+        f"{_icon('ENTRY')} {t.get('signal_type','ENTRY')} — {t['ticker']} {t.get('name','')}\n"
+        f"⏰ {t.get('logged_at','')} MYT | 🧠 {brain} {progress} | 📊 Regime {regime} | Sector {sector}\n"
+        f"🎯 Confidence {conf:.0f}/100 | RSI {rsi} | Vol {vol_ratio}x | ATR {atr}\n"
+        f"----------------------------------------\n"
+        f"BUY {t.get('shares',0):,} @ {cur}{entry:.3f} | SL {cur}{sl:.3f} (-{risk_pct:.1f}%) | Risk {cur}{risk_per_share * t.get('shares',0):,.0f}\n"
+        f"TP1 {cur}{tp1:.3f} ({r_tp1:.1f}R) | TP2 {cur}{tp2:.3f} ({r_tp2:.1f}R) | TP3 {cur}{tp3:.3f} ({r_tp3:.1f}R)\n"
+        f"----------------------------------------\n"
+        f"🧠 Brain: {(t.get('entry_reasoning') or '')[:500]}\n"
+        f"----------------------------------------\n"
+        f"📝 How to trade (manual): Place LIMIT/MARKET in your broker at {cur}{entry:.3f}, "
+        f"stop {cur}{sl:.3f}, targets as above. Position size already risk-adjusted (1% of capital). "
+        f"If you close early in broker, also close in Dashboard → Portfolio → Manual Close so brain learns."
     )
-    html = ("<pre style=\"font-family:monospace;font-size:13px;\">"
+    html = ("<pre style=\"font-family:monospace;font-size:13px;white-space:pre-wrap;\">"
             + text.replace("<", "&lt;").replace(">", "&gt;")
             + "</pre>")
-    subject = f"[BursaAI] ENTRY — {t['ticker']} (conf {conf:.0f})"
+    subject = f"[BursaAI US-SWING] {t['ticker']} {t.get('signal_type','')} conf {conf:.0f} | {progress}"
     return text, html, subject
 
 
@@ -202,6 +235,11 @@ def _format_exit(t: dict, event_type: str, exit_price: float,
                  pnl: float) -> tuple[str, str, str]:
     cost = t.get("cost") or 1
     pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+    # R-multiple
+    risk_per_share = float(t.get("risk_per_share") or 0)
+    shares = int(t.get("shares") or 0)
+    risk_amount = risk_per_share * shares if risk_per_share and shares else 1
+    r_mult = pnl / risk_amount if risk_amount else 0
     try:
         logged = datetime.strptime(t["logged_at"], "%Y-%m-%d %H:%M:%S")
         closed = datetime.strptime(t.get("closed_at") or myt_iso(),
@@ -216,19 +254,24 @@ def _format_exit(t: dict, event_type: str, exit_price: float,
     }
     label = label_map.get(event_type, event_type)
     outcome = t.get("outcome") or ("WIN" if pnl > 0 else "LOSS")
+    # Professional exit quality
+    exit_type = t.get("exit_type") or event_type
 
     cur = _ccy()
     text = (
-        f"{_icon(event_type)} {label} — {t['ticker']}\n"
-        f"Time: {t.get('closed_at','')} MYT\n"
-        f"Action: SELL {t.get('shares',0):,} shares @ {cur} {exit_price:.3f}\n"
-        f"Result: {outcome} {cur} {pnl:+,.2f} | {pnl_pct:+.2f}% on cost\n"
-        f"Held: {held} days"
+        f"{_icon(event_type)} {label} — {t['ticker']} {t.get('name','')} | Exit: {exit_type} | {outcome}\n"
+        f"⏰ {t.get('closed_at','')} MYT | Held {held}d | Conf {t.get('confidence_score',0):.0f} | Regime {t.get('market_regime','—')}\n"
+        f"----------------------------------------\n"
+        f"Entry {cur}{t.get('entry_price',0):.3f} → Exit {cur}{exit_price:.3f} | {cur}{pnl:+,.2f} ({pnl_pct:+.2f}%) | {r_mult:+.2f}R\n"
+        f"Shares {shares:,} | Risk was {cur}{risk_amount:,.0f} | Cost {cur}{cost:,.0f}\n"
+        f"SL {cur}{t.get('stop_loss',0):.3f} | TP1 {cur}{t.get('tp1',0):.3f} TP2 {cur}{t.get('tp2',0):.3f} TP3 {cur}{t.get('tp3',0):.3f}\n"
+        f"----------------------------------------\n"
+        f"🧠 Brain learns from this R={r_mult:.2f} outcome — state priors updated."
     )
-    html = ("<pre style=\"font-family:monospace;font-size:13px;\">"
+    html = ("<pre style=\"font-family:monospace;font-size:13px;white-space:pre-wrap;\">"
             + text.replace("<", "&lt;").replace(">", "&gt;")
             + "</pre>")
-    subject = f"[BursaAI] {label} — {t['ticker']} ({outcome} {pnl:+,.0f})"
+    subject = f"[BursaAI US-SWING] {label} {t['ticker']} {outcome} {r_mult:+.2f}R | {cur}{pnl:+,.0f}"
     return text, html, subject
 
 

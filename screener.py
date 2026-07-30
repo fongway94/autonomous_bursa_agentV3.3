@@ -258,11 +258,26 @@ def analyze_stock_setup(ticker, df, params,
     # We ALSO check a fast EMA100 as early warning before a full bear develops.
     is_below_ema100 = close < float(last.get("EMA100", close * 0.99)) if "EMA100" in last.index else False
     
-    if regime == "BEAR":
+    # Professional US swing: inverse/bear/volatility ETFs should be tradable in BEAR, blocked in BULL
+    # SQQQ/SPXS/SOXS go UP when market goes DOWN — blocking them in BEAR is wrong.
+    # Conversely, longing them in BULL is a decay trap.
+    INVERSE_BEAR_TICKERS = {"SQQQ", "SPXS", "SOXS", "SPXU", "SH", "SDS", "TZA", "FAZ", "UVXY", "VXX"}
+    is_inverse_bear = ticker.upper() in INVERSE_BEAR_TICKERS
+
+    if regime == "BEAR" and not is_inverse_bear:
         signal_type = "REDUCE / AVOID"
         reasoning.append(
-            "🚨 BEAR REGIME — all long entries blocked. "
-            "Bear market validation: Avg R=-0.067 in BEAR vs +0.078 in BULL."
+            "🚨 BEAR REGIME — all long entries blocked for regular longs. "
+            "Bear market validation: Avg R=-0.067 in BEAR vs +0.078 in BULL. "
+            "Inverse ETFs (SQQQ/SPXS/SOXS) are exempt — they thrive in BEAR."
+        )
+        base_confidence = 10.0
+    elif regime == "BULL" and is_inverse_bear:
+        # Professional: don't long inverse/bear ETFs in BULL — decay + downtrend
+        signal_type = "REDUCE / AVOID"
+        reasoning.append(
+            "🚨 BULL REGIME — inverse/bear ETF long blocked. "
+            "SQQQ/SPXS/SOXS/UVXY decay in BULL and are in downtrend — avoid."
         )
         base_confidence = 10.0
     elif is_below_ema100:

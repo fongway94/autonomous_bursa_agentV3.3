@@ -178,12 +178,23 @@ def check_position_limits(trades: list, new_trade_cost: float,
                 "reason": f"Max {max_pos} concurrent positions reached.",
                 "size_reduction_pct": 0}
 
-    # Correlation Shield: limit maximum active positions in a single sector to 2
+    # Correlation Shield: professional swing — limit sector concentration
+    # For MY and general: max 2 per sector
+    # For US Leveraged ETF / Leveraged Sector: max 1 (they are 90%+ correlated, e.g. SPXL+UPRO+TQQQ)
+    # For Crypto: max 1 (BTC beta)
     sector_active_count = sum(1 for t in active if t.get("sector") == sector)
-    if sector_active_count >= 2:
+    sector_cap = 2
+    if sector in ("Leveraged ETF", "Leveraged Sector"):
+        sector_cap = 1
+    elif sector in ("Crypto",):
+        sector_cap = 1
+    elif sector in ("Volatility",):
+        sector_cap = 1  # UVXY/VXX decay — max 1 hedge at a time
+    if sector_active_count >= sector_cap:
         return {"allowed": False,
                 "reason": f"Correlation Shield: Sector '{sector}' already has "
-                          f"{sector_active_count} active positions (max 2 allowed).",
+                          f"{sector_active_count} active (max {sector_cap} for {sector}). "
+                          f"Highly correlated leveraged ETFs capped at 1 to avoid double exposure.",
                 "size_reduction_pct": 100}
 
     max_cost = capital * (max_cost_pct / 100)
