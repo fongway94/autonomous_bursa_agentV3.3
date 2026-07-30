@@ -246,6 +246,10 @@ def analyze_stock_setup(ticker, df, params,
 
     q_override = (q_action or {}).get("action", "HOLD")
     q_modifier = (q_action or {}).get("confidence_modifier", 1.0)
+    q_scores = (q_action or {}).get("q_scores", {})
+    buy_score = q_scores.get("BUY", 50)
+    avoid_score = q_scores.get("AVOID", 50)
+    brain_reasoning = (q_action or {}).get("reasoning", "")
 
     # v3.7 CRITICAL FIX: Block ALL long entries when market_analyzer says BEAR.
     # Bear market validation showed: Avg R=-0.067 in BEAR regime (vs +0.078 in BULL).
@@ -341,11 +345,6 @@ def analyze_stock_setup(ticker, df, params,
             # conviction (q_scores['BUY'] < 30), skip the trade entirely.
             # This makes the brain a gatekeeper, not just a confidence adjuster.
             # Only relevant for BUY signals (SELL signals are already blocked by rules).
-            q_scores = (q_action or {}).get("q_scores", {})
-            buy_score = q_scores.get("BUY", 50)
-            avoid_score = q_scores.get("AVOID", 50)
-            brain_reasoning = (q_action or {}).get("reasoning", "")
-
             if q_override == "AVOID":
                 # Hard veto: brain has seen losses in this state
                 if avoid_score > buy_score + 15:
