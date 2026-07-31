@@ -231,7 +231,10 @@ def _ensure_custom_table():
             pass
 
 
-_ensure_custom_table()
+try:
+    _ensure_custom_table()
+except Exception as e:
+    print(f"[watchlist] init warning: {e}")
 
 
 def load_custom_watchlist_tickers() -> dict:
