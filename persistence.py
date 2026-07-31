@@ -623,3 +623,183 @@ def boot_restore_once() -> dict:
         log.warning(f"boot-restore precheck failed (will attempt restore): {e}")
 
     return restore()
+
+
+# ---------------------------------------------------------------------------
+# Corrupt-DB auto-recovery (v3.8)
+# ---------------------------------------------------------------------------
+
+def recover_corrupt_db(path: str | None = None) -> dict:
+    """Detect and repair a malformed SQLite DB — the fix for the classic
+    ``Scheduler did not start: database disk image is malformed`` boot error.
+
+    Called on every app boot BEFORE the scheduler starts (and available as a
+    manual button in Settings). Never raises — returns a report dict::
+
+        {"ok": bool, "recovered": bool, "healthy": bool,
+         "action": "none"|"sidecar_removed"|"gist_restore"|"salvaged"|"rebuilt",
+         "reason": str, "path": str}
+
+    Repair ladder — each stage only runs if the previous one failed:
+
+      1. ``sidecar_removed`` — move the ``-wal`` / ``-shm`` sidecars aside and
+         re-test. A stale/corrupt WAL left behind by a killed container is the
+         #1 cause of "database disk image is malformed"; the main DB file is
+         often perfectly intact and no data is lost.
+      2. ``gist_restore``   — quarantine the corrupt file, then pull the latest
+         backup from the configured Gist (restore() re-runs init_db() after).
+      3. ``salvaged``       — ``iterdump()`` whatever readable rows remain into
+         a brand-new DB, then apply schema migrations on top.
+      4. ``rebuilt``        — ``init_db()`` a fresh empty brain so the app
+         boots again (trade/brain data lost, but the agent keeps running; the
+         corrupt file is preserved and Gist history may still hold a copy).
+
+    The original corrupt file is ALWAYS preserved as
+    ``<path>.corrupt-<YYYYmmdd-HHMMSS>`` so nothing is ever silently destroyed.
+    """
+    from datetime import datetime as _dt
+    from db import db_health as _health
+
+    p = path or _db_path()
+    stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+    base = {"ok": True, "recovered": False, "healthy": False,
+            "action": "none", "reason": "", "path": p}
+
+    if not os.path.exists(p):
+        return {**base, "healthy": True,
+                "reason": "no DB file yet — first boot, nothing to repair"}
+
+    h = _health(p)
+    if h["healthy"]:
+        return {**base, "healthy": True, "reason": "DB is healthy"}
+    reason = h.get("error") or "corrupt"
+    log.error(f"corrupt-DB recovery: {p} is unhealthy ({reason})")
+
+    # ---- Stage 1: stale / corrupt -wal or -shm sidecars? ----
+    moved_sidecars = []
+    for suffix in ("-wal", "-shm"):
+        sc = p + suffix
+        if os.path.exists(sc):
+            try:
+                os.rename(sc, f"{sc}.corrupt-{stamp}")
+                moved_sidecars.append(sc)
+            except Exception:
+                pass
+    if moved_sidecars:
+        h2 = _health(p)
+        if h2["healthy"]:
+            log.warning(
+                f"corrupt-DB recovery: removed {len(moved_sidecars)} stale "
+                f"sidecar(s); main DB intact — no data lost"
+            )
+            return {**base, "recovered": True, "healthy": True,
+                    "action": "sidecar_removed",
+                    "reason": ("removed stale WAL/shm sidecar(s) from a killed "
+                               "container; main DB intact, no data lost")}
+
+    # ---- Quarantine the corrupt file (and any remaining sidecars) ----
+    quarantine = f"{p}.corrupt-{stamp}"
+    try:
+        os.rename(p, quarantine)
+    except Exception as e:
+        return {**base,
+                "reason": f"could not quarantine corrupt DB ({e}); "
+                          f"original error: {reason}"}
+    for suffix in ("-wal", "-shm"):
+        sc = p + suffix
+        if os.path.exists(sc):
+            try:
+                os.rename(sc, f"{sc}.corrupt-{stamp}")
+            except Exception:
+                pass
+
+    # ---- Stage 2: restore from the configured Gist backup ----
+    if is_configured():
+        r = restore()
+        if r.get("ok"):
+            log.info(f"corrupt-DB recovery: restored from gist {r.get('gist_id')}")
+            return {**base, "recovered": True, "healthy": True,
+                    "action": "gist_restore",
+                    "reason": (f"restored {r.get('bytes_restored', 0):,} bytes "
+                               f"from Gist backup ({r.get('source_file', '?')})")}
+        log.warning(f"corrupt-DB recovery: gist restore unavailable "
+                    f"({r.get('reason')})")
+
+    # ---- Stage 3: salvage whatever readable rows remain ----
+    if _salvage_db(quarantine, p):
+        try:
+            _fresh_db_at(p)   # apply schema migrations + seeds on top
+        except Exception:
+            pass
+        log.warning("corrupt-DB recovery: salvaged readable data into a new DB")
+        return {**base, "recovered": True, "healthy": True,
+                "action": "salvaged",
+                "reason": ("recovered readable rows from the corrupt DB into "
+                           "a new DB (best effort)")}
+
+    # ---- Stage 4: fresh rebuild so the app can boot ----
+    try:
+        _fresh_db_at(p)
+        h3 = _health(p)
+        if h3["healthy"]:
+            log.warning("corrupt-DB recovery: rebuilt a fresh DB "
+                        "(no backup / salvage available)")
+            return {**base, "recovered": True, "healthy": True,
+                    "action": "rebuilt",
+                    "reason": ("no backup available — rebuilt a fresh DB. "
+                               f"Corrupt file preserved at "
+                               f"{os.path.basename(quarantine)}")}
+        return {**base,
+                "reason": f"rebuilt DB still failing health check: "
+                          f"{h3.get('error')}"}
+    except Exception as e:
+        return {**base, "reason": f"fresh rebuild failed: {e}"}
+
+
+def _salvage_db(corrupt_path: str, target_path: str) -> bool:
+    """Copy whatever readable rows remain into a new DB via SQL text dump.
+
+    Best effort: corrupted tables may be missing from the result. Returns
+    False (and cleans up the partial target) on any failure so the caller
+    can fall through to a fresh rebuild.
+    """
+    import sqlite3
+    try:
+        src = sqlite3.connect(f"file:{corrupt_path}?mode=ro", uri=True,
+                              timeout=5.0)
+        dst = sqlite3.connect(target_path, timeout=10.0)
+        try:
+            dst.execute("PRAGMA journal_mode=WAL;")
+            for line in src.iterdump():
+                dst.execute(line)
+            dst.commit()
+        finally:
+            src.close()
+            dst.close()
+        return True
+    except Exception:
+        try:
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            for suffix in ("-wal", "-shm"):
+                sc = target_path + suffix
+                if os.path.exists(sc):
+                    os.remove(sc)
+        except Exception:
+            pass
+        return False
+
+
+def _fresh_db_at(path: str) -> None:
+    """Run the full init_db() (schema + migrations + seeds) on an explicit path.
+
+    Briefly redirects ``db.current_db_path()`` so every connection inside
+    ``init_db()`` lands on `path` regardless of the active market/mode.
+    """
+    import db as db_module
+    real = db_module.current_db_path
+    db_module.current_db_path = lambda: path
+    try:
+        db_module.init_db()
+    finally:
+        db_module.current_db_path = real

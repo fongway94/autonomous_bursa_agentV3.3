@@ -6,7 +6,40 @@ Complete changelog from v1 through the current release.
 
 ---
 
-## v3.7 (current) — Intraday Mode
+## v3.8 — Corrupt-DB Auto-Recovery ("database disk image is malformed")
+
+**Focus:** Fix the boot failure where Streamlit Cloud (or a local PC) shows
+**"Scheduler did not start: database disk image is malformed"** on every
+startup. That error is SQLite's way of saying the local DB file — or its
+`-wal` / `-shm` sidecars — was left in a bad state, typically by a container
+killed mid-write. Previously nothing in the app repaired it, so the scheduler
+never started and the dashboard hard-crashed on DB reads.
+
+- **`db.db_health()`** — fast read-only structural check (`PRAGMA quick_check`)
+  that flags a corrupt DB before anything else reads it. Missing file counts as
+  healthy (first boot).
+- **`persistence.recover_corrupt_db()`** — automatic repair ladder, called at
+  app boot BEFORE the scheduler starts (and as a manual button):
+  1. `sidecar_removed` — stale/corrupt `-wal`/`-shm` sidecars moved aside;
+     main DB intact → **no data lost**.
+  2. `gist_restore` — corrupt file quarantined, latest backup pulled from the
+     configured Gist.
+  3. `salvaged` — `iterdump()` of whatever readable rows remain into a new DB.
+  4. `rebuilt` — fresh `init_db()` so the app boots again (data lost, but the
+     corrupt file is always preserved as `<db>.corrupt-<timestamp>`).
+- **Boot wiring in `app.py`** — recovery runs once per process before the Gist
+  boot-restore and before `scheduler.ensure_started()`, with a toast reporting
+  what was repaired. The "Scheduler did not start" message now explains the
+  fix path instead of dumping the raw SQLite error.
+- **Settings → 🛠️ Database Health** — new panel showing live DB health with a
+  **"Check + Repair now"** button.
+- **Regression tests** — `tests/test_db_recovery.py` (10 tests): health
+  detection, no-op on healthy/missing DBs, quarantine+rebuild, Gist-restore
+  preference, stale-WAL sidecar stage, and `iterdump` salvage.
+
+---
+
+## v3.7 — Intraday Mode
 
 **Focus:** Add a second trading mode — **INTRADAY** — as a 5-minute Opening
 Range Breakout (ORB) engine for US markets, running alongside the existing
