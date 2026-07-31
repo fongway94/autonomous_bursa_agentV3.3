@@ -267,6 +267,39 @@ def connect(readonly: bool = False):
             conn.close()
 
 
+def db_health(path: str | None = None) -> dict:
+    """Fast structural health check of a SQLite file (read-only, no locks).
+
+    This is the detector for the classic Streamlit Cloud failure mode where
+    the container is killed mid-write and the DB file (or its -wal/-shm
+    sidecars) ends up corrupt — every later read then raises
+    ``sqlite3.DatabaseError: database disk image is malformed``.
+
+    Returns::
+
+        {"healthy": bool, "error": str | None, "path": str, "missing": bool}
+
+    A missing file counts as healthy — there is nothing to repair and
+    ``init_db()`` will create it on first use.
+    """
+    p = path or current_db_path()
+    if not os.path.exists(p):
+        return {"healthy": True, "error": None, "path": p, "missing": True}
+    try:
+        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+        finally:
+            conn.close()
+        if row and row[0] == "ok":
+            return {"healthy": True, "error": None, "path": p, "missing": False}
+        return {"healthy": False,
+                "error": row[0] if row else "PRAGMA quick_check failed",
+                "path": p, "missing": False}
+    except Exception as e:
+        return {"healthy": False, "error": str(e), "path": p, "missing": False}
+
+
 # ---------------------------------------------------------------------------
 # SCHEMA
 # ---------------------------------------------------------------------------

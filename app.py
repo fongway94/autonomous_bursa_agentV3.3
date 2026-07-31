@@ -192,6 +192,32 @@ PLOTLY_LAYOUT = dict(
 # Bootstrap — start scheduler on app launch
 # =========================================================================
 
+# v3.8: Auto-repair a corrupt local SQLite DB BEFORE anything reads it.
+# Fixes the classic "database disk image is malformed" boot failure
+# (SQLite's way of saying the DB file or its -wal/-shm sidecars were left
+# in a bad state, typically by a container killed mid-write on Streamlit
+# Cloud). Runs once per process; never raises.
+if "db_recovery_attempted" not in st.session_state:
+    try:
+        from persistence import recover_corrupt_db
+        _db_rec = recover_corrupt_db()
+        if _db_rec.get("recovered"):
+            st.toast(
+                f"🛠️ DB repaired ({_db_rec['action']}): {_db_rec['reason']}",
+                icon="🛠️",
+            )
+        elif not _db_rec.get("healthy"):
+            st.error(
+                f"❌ Database repair failed: {_db_rec.get('reason')}. "
+                "Your local SQLite DB is corrupt and could not be rebuilt. "
+                "Reboot the app once; if it persists, restore from backup "
+                "in ⚙️ Settings → Persistent Backup."
+            )
+            st.stop()
+    except Exception as e:
+        st.warning(f"DB repair skipped: {e}")
+    st.session_state["db_recovery_attempted"] = True
+
 # v3.1.5: BEFORE anything else, try to restore the DB from the configured
 # GitHub Gist backup. Idempotent — only runs once per Python process, and
 # only when local DB is empty (won't overwrite live data on every rerun).
@@ -263,7 +289,13 @@ try:
     )
     sched.ensure_started(interval_sec=_boot_interval_sec)
 except Exception as e:
-    st.warning(f"Scheduler did not start: {e}")
+    st.warning(
+        f"Scheduler did not start: {e}. "
+        "If this mentions 'database disk image is malformed', the local "
+        "SQLite DB was corrupt — this build auto-repairs it on boot. "
+        "If the problem persists, reboot the app once, or use "
+        "⚙️ Settings → Database Health → Check + Repair now."
+    )
 
 # v3.1 hotfix: one-time dedup of historical duplicate scheduler_log rows
 # (from the ghost-thread bug). Cheap, idempotent, runs once per session.
@@ -2504,6 +2536,36 @@ with tab_settings:
                     "icon": "ℹ️"
                 }
                 st.rerun()
+
+    # -----------------------------------------------------------------
+    # v3.8 — Database Health (fixes "database disk image is malformed")
+    # -----------------------------------------------------------------
+    st.markdown("### 🛠️ Database Health")
+    st.caption(
+        "Checks the active DB for corruption and repairs it automatically. "
+        "The classic **'database disk image is malformed'** error means the "
+        "SQLite file (or its WAL sidecars) was left in a bad state — usually "
+        "by a container killed mid-write. Repair ladder: remove stale WAL "
+        "sidecars → restore from Gist backup → salvage readable rows → "
+        "rebuild a fresh DB. The corrupt file is always preserved as "
+        "`<db>.corrupt-<timestamp>`."
+    )
+    from db import db_health as _db_health
+    _h = _db_health()
+    if _h["healthy"]:
+        st.success("✅ Database is healthy.")
+    else:
+        st.error(f"❌ Database is corrupt: `{_h.get('error')}`")
+    if st.button("🔍 Check + Repair now", type="primary"):
+        from persistence import recover_corrupt_db as _repair_db
+        _rr = _repair_db()
+        if _rr.get("recovered"):
+            st.success(f"✅ Repaired via `{_rr['action']}`: {_rr['reason']}")
+            st.rerun()
+        elif _rr.get("healthy"):
+            st.success("✅ Database is healthy — nothing to do.")
+        else:
+            st.error(f"❌ Repair failed: {_rr.get('reason')}")
 
     st.markdown("### Kill-Switch")
     ss = get_scheduler_state()
