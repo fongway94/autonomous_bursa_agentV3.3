@@ -99,7 +99,7 @@ jobs:
             echo "::error::cannot be restored or saved. Refusing to run."
             exit 1
           fi
-          echo "Token present. GIST_ID=${GIST_ID:-<unset, will resolve from DB meta>}"
+          echo "Token present. GIST_ID_US=${GIST_ID_US:-<unset>}"
 
       - name: Run trading cycle
         run: |
