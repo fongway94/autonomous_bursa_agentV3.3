@@ -215,7 +215,11 @@ def _format_exit(t: dict, event_type: str, exit_price: float,
         "FULL_EXIT": "FULL EXIT", "PARTIAL_EXIT": "PARTIAL EXIT",
     }
     label = label_map.get(event_type, event_type)
-    outcome = t.get("outcome") or ("WIN" if pnl > 0 else "LOSS")
+    # Compute outcome from actual PNL, not blindly from DB value.
+    # If DB says something different, note it but show reality.
+    computed_outcome = "WIN" if pnl > 0 else ("BREAKEVEN" if abs(pnl / (t.get("cost") or 1)) < 0.01 else "LOSS")
+    # Always display reality (computed from PNL), not the DB override.
+    outcome = computed_outcome
 
     cur = _ccy()
     text = (
