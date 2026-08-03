@@ -1,0 +1,23 @@
+ticker,code,sector,watchlist_type
+SPY,SPY,Index ETF,bull20
+QQQ,QQQ,Index ETF,bull20
+TQQQ,TQQQ,Leveraged ETF,bull20
+NVDA,NVDA,Technology,bull20
+SPXL,SPXL,Leveraged ETF,bull20
+SOXL,SOXL,Leveraged Sector,bull20
+UPRO,UPRO,Leveraged ETF,bull20
+FNGU,FNGU,Leveraged Sector,bull20
+TNA,TNA,Leveraged Sector,bull20
+IBIT,IBIT,Crypto,bull20
+MSTR,MSTR,Crypto,bull20
+COIN,COIN,Crypto,bull20
+MARA,MARA,Crypto,bull20
+TSLA,TSLA,Technology,bull20
+AMD,AMD,Technology,bull20
+META,META,Technology,bull20
+AAPL,AAPL,Technology,bull20
+MSFT,MSFT,Technology,bull20
+GOOGL,GOOGL,Technology,bull20
+AMZN,AMZN,Consumer Disc.,bull20
+PLTR,PLTR,Technology,bull20
+UVXY,UVXY,Volatility,bull20
