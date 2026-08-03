@@ -60,6 +60,15 @@ on:
         description: 'Restore + report only, run no cycle'
         type: boolean
         default: false
+  # Self-healing + schedule re-registration: GitHub only evaluates `schedule`
+  # from the default branch, and a known GitHub-side issue can leave a
+  # newly-created schedule silently dead until the workflow file is touched
+  # again on main. Every push/merge to main therefore re-registers the cron
+  # AND runs an instant verification cycle — a green run proves the whole
+  # restore→cycle→backup chain works even when cron delivery is delayed.
+  # When the market is shut the cycle exits 2 and is swallowed as a no-op.
+  push:
+    branches: [main]
 
 # Never let two cycles touch the same gist at once.
 concurrency:
@@ -126,20 +135,3 @@ jobs:
             echo "::error::Trading cycle failed with exit code $code."
           fi
           exit $code
-
-# ---------------------------------------------------------------------------
-# NOTE ON THIS FILE'S LOCATION
-# ---------------------------------------------------------------------------
-# This lives at scripts/trading-cycle.workflow.yml rather than
-# .github/workflows/trading-cycle.yml because the GitHub App used to push this
-# branch lacks the `workflows` permission, so the push is rejected.
-#
-# To activate (one command, from the repo root):
-#
-#     git mv scripts/trading-cycle.workflow.yml .github/workflows/trading-cycle.yml
-#     git commit -m "ci: enable headless trading cycle"
-#     git push
-#
-# Then run it once via Actions -> Trading cycle (MY swing) -> Run workflow,
-# with dry_run = true, to confirm the Gist restore works before letting the
-# cron drive real cycles.
