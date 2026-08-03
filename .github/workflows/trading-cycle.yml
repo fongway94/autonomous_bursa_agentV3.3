@@ -76,7 +76,7 @@ jobs:
       MARKET_MODE: MY
       TRADING_MODE: SWING
       GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
-      GIST_ID: ${{ vars.GIST_ID }}
+      GIST_ID_MY: ${{ vars.GIST_ID_MY }}
       # Optional — uncomment the matching secrets to get alerts from the
       # runner itself, not just from the Streamlit app.
       # TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
