@@ -73,7 +73,7 @@ jobs:
       MARKET_MODE: US
       TRADING_MODE: SWING
       GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
-      GIST_ID: ${{ vars.GIST_ID }}
+      GIST_ID_US: ${{ vars.GIST_ID_US }}
       # Force yfinance: Moomoo OpenD cannot run on a GitHub runner, and this
       # skips a pointless TCP probe to 127.0.0.1:11111 on every fetch.
       BURSA_DATA_PROVIDER: yfinance
