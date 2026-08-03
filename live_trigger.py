@@ -139,14 +139,24 @@ def _should_fire(event_type: str, trade: dict | None, actor: str,
         return False, "actor_not_agent"
 
     # ---- Stricter evidence-based filter (new) ----
-    # Only applies when trigger_filter module is available.
-    # If unavailable, fall back to original behavior (safe).
-    if strict_trigger_check is not None and event_type == "ENTRY" and trade:
+    # Only applies when trigger_filter module is available AND the trade
+    # actually carries the evidence the filter needs (signal + RSI + volume
+    # ratio). Minimal/legacy trade dicts without that evidence fall through
+    # to the base confidence / EXPLOIT-mode checks below, preserving the
+    # original filter contract.
+    indicators = (trade or {}).get("entry_indicators") or {}
+    has_evidence = bool(
+        trade
+        and trade.get("signal_type")
+        and indicators.get("rsi") is not None
+        and indicators.get("vol_ratio") is not None
+    )
+    if strict_trigger_check is not None and event_type == "ENTRY" and has_evidence:
         setup_for_filter = {
             "signal": trade.get("signal_type", ""),
             "confidence": trade.get("confidence_score"),
-            "rsi": trade.get("entry_indicators", {}).get("rsi"),
-            "vol_ratio": trade.get("entry_indicators", {}).get("vol_ratio"),
+            "rsi": indicators.get("rsi"),
+            "vol_ratio": indicators.get("vol_ratio"),
         }
         brain_action = None
         brain_buy = None
@@ -174,7 +184,8 @@ def _should_fire(event_type: str, trade: dict | None, actor: str,
                         "INSERT INTO alert_log "
                         "(timestamp, event_type, trade_id, ticker, channel, "
                         " status, message, payload_json) VALUES (?,?,?,?,?,?,?,?)",
-                        (myt_iso(), event_type, trade_id, ticker,
+                        (myt_iso(), event_type, trade.get("id"),
+                         trade.get("ticker"),
                          "FILTER_STRICT", "SKIPPED_STRICT_FILTER",
                          f"strict_filter_rejected: {reason_strict}",
                          json.dumps({"strict_reason": reason_strict}, default=str)),
