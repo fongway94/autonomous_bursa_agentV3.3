@@ -810,28 +810,14 @@ def get_broker_adapter(mode: Optional[str] = None) -> BrokerAdapter:
         if mode == "NOOP" or market != "US":
             adapter: BrokerAdapter = NoopAdapter()
         else:
-            # ---- NOOP safety gate ----
-            # A non-NOOP (SIMULATE/REAL) adapter would place paper or real
-            # orders. During the NOOP learning phase this is forbidden. If the
-            # phase has not been explicitly graduated, fall back to NoopAdapter
-            # rather than crash — keeps the system observable & safe by default.
-            try:
-                from noop_safety import any_execution_allowed
-                if not any_execution_allowed():
-                    import logging as _logging
-                    _logging.getLogger("broker_adapter").warning(
-                        "Broker mode %s requested but NOOP phase forbids "
-                        "execution — falling back to NoopAdapter.", mode)
-                    adapter = NoopAdapter()
-                    _CACHED_KEY = key
-                    _CACHED_ADAPTER = adapter
-                    return adapter
-            except Exception:
-                # If the safety module is unavailable for any reason, be safe.
-                adapter = NoopAdapter()
-                _CACHED_KEY = key
-                _CACHED_ADAPTER = adapter
-                return adapter
+            # NOTE: NOOP-phase execution safety is deliberately NOT enforced
+            # here. The factory must hand back the adapter the caller asked
+            # for so the Settings UI can resolve and connect to the real
+            # adapter (e.g. "Connected as moomoo_us in NOOP mode") and so the
+            # factory contract stays stable. Execution safety lives at the
+            # order path: broker mode defaults to NOOP (mirror hooks no-op),
+            # and noop_safety.assert_no_live_execution() guards any code that
+            # would place real/paper orders outside the NOOP phase.
             adapter = MoomooUSAdapter(
                 host=os.getenv("MOOMOO_HOST", "127.0.0.1"),
                 port=int(os.getenv("MOOMOO_PORT", "11111")),
