@@ -1,0 +1,125 @@
+# .github/workflows/trading-cycle-us.yml
+#
+# US swing cycle — the NYSE/NASDAQ twin of trading-cycle.yml.
+#
+# Same design as MY: restore brain from Gist -> run one cycle -> back up.
+# Only the market, the schedule and the concurrency group differ.
+#
+# NO EXTRA SETUP NEEDED
+# ---------------------
+# Reuses the SAME GIST_TOKEN secret and GIST_ID variable as the MY workflow.
+# persistence.py stores each market+mode under its own filename inside the one
+# gist, so there is zero conflict:
+#
+#     bursa_agent_MY_SWING_db.b64.gz      <- MY workflow + MY Streamlit app
+#     bursa_agent_US_SWING_db.b64.gz      <- THIS workflow + US Streamlit app
+#     bursa_agent_US_INTRADAY_db.b64.gz   <- your local PC only
+#
+# Just add this file and it works.
+#
+# ⚠️ DAYLIGHT SAVING — THE ONE THING TO KNOW
+# ------------------------------------------
+# GitHub cron is always UTC and does NOT follow US daylight saving. New York is
+# UTC-5 in winter (EST) and UTC-4 in summer (EDT), so any fixed UTC time drifts
+# by an hour across the year.
+#
+# Rather than ask you to edit crons twice a year, this runs the UNION of both
+# windows — an extra cycle or two per day, which costs nothing and never misses
+# the session. run_cycle.py exits cleanly when the market is shut, so the extra
+# runs are harmless no-ops.
+#
+#     EDT (summer, Mar-Nov): 09:30-16:00 ET = 13:30-20:00 UTC
+#     EST (winter, Nov-Mar): 09:30-16:00 ET = 14:30-21:00 UTC
+#     union covered below:                    13:00-21:30 UTC
+#
+# WHY THIS IS SWING, NOT INTRADAY
+# -------------------------------
+# US intraday needs Moomoo OpenD, which is a desktop app that cannot run on a
+# GitHub runner. data_provider falls back to yfinance automatically, and
+# scheduler.py refuses intraday entries without OpenD. So intraday stays on your
+# local PC; this workflow handles US SWING only.
+
+name: Trading cycle (US swing)
+
+on:
+  schedule:
+    # Covers both EDT and EST. Hourly through the union window, plus a
+    # post-close settle pass. Weekdays only.
+    #   13:00 UTC = 09:00 EDT / 08:00 EST   (pre-open, EDT session starts 13:30)
+    #   14:00-20:00 UTC                     (main window, both DST states)
+    #   21:30 UTC = 17:30 EDT / 16:30 EST   (post-close settle)
+    - cron: '0 13,14,15,16,17,18,19,20 * * 1-5'
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Restore + report only, run no cycle'
+        type: boolean
+        default: false
+
+# Separate group from MY so the two markets can run at the same time —
+# they write different files inside the gist. But two US cycles never overlap.
+concurrency:
+  group: trading-cycle-us
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    name: Run one cycle (US)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      MARKET_MODE: US
+      TRADING_MODE: SWING
+      GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ vars.GIST_ID }}
+      # Force yfinance: Moomoo OpenD cannot run on a GitHub runner, and this
+      # skips a pointless TCP probe to 127.0.0.1:11111 on every fetch.
+      BURSA_DATA_PROVIDER: yfinance
+      # TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      # TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Preflight — required secrets present
+        run: |
+          if [ -z "${GITHUB_TOKEN}" ]; then
+            echo "::error::GIST_TOKEN secret is not set. Without it the brain"
+            echo "::error::cannot be restored or saved. Refusing to run."
+            exit 1
+          fi
+          echo "Token present. GIST_ID=${GIST_ID:-<unset, will resolve from DB meta>}"
+
+      - name: Run trading cycle
+        run: |
+          set +e
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python run_cycle.py --market US --mode SWING --dry-run
+          else
+            python run_cycle.py --market US --mode SWING
+          fi
+          code=$?
+          set -e
+
+          # Exit 2 = market closed / holiday, or an out-of-DST-window run.
+          # Legitimate skip, not a failure — keep the run green.
+          if [ "$code" = "2" ]; then
+            echo "::notice::US market closed — cycle skipped, not a failure."
+            exit 0
+          fi
+
+          if [ "$code" != "0" ]; then
+            echo "::error::US trading cycle failed with exit code $code."
+          fi
+          exit $code
