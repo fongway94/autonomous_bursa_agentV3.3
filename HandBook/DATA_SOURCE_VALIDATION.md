@@ -23,15 +23,20 @@ limitation combined.
 
 Ranked by how much they damage learning:
 
-| # | Finding | Severity | yfinance's fault? |
-|---|---|---|---|
-| 1 | Brain trains on 10 stocks it is forbidden from trading | 🔴 Critical | No — config bug |
-| 2 | Silent partial scans are indistinguishable from "no setups" | 🔴 Critical | Partly |
-| 3 | EMA200 is computed on 246 bars — 8.6% seed contamination | 🟠 High | No — code bug |
-| 4 | ~351 Yahoo calls/cycle where ~133 would do | 🟠 High | Partly |
-| 5 | `yfinance>=0.2.30` unpinned on a platform that rebuilds on push | 🟠 High | Yes |
-| 6 | Volume not split-adjusted → false `Vol_Ratio` spikes | 🟡 Medium | Yes |
-| 7 | `auto_adjust=True` trains on prices that never traded | 🟡 Medium | Yes |
+| # | Finding | Severity | yfinance's fault? | Status |
+|---|---|---|---|---|
+| 1 | Brain trains on 10 stocks it is forbidden from trading | 🔴 Critical | No — config bug | ✅ Fixed |
+| 2 | Silent partial scans are indistinguishable from "no setups" | 🔴 Critical | Partly | ✅ Fixed |
+| 3 | EMA200 is computed on 246 bars — 8.6% seed contamination | 🟠 High | No — code bug | ✅ Fixed |
+| 4 | ~351 Yahoo calls/cycle where ~133 would do | 🟠 High | Partly | ✅ Fixed |
+| 5 | `yfinance>=0.2.30` unpinned on a platform that rebuilds on push | 🟠 High | Yes | ✅ Fixed |
+| 6 | Volume not split-adjusted → false `Vol_Ratio` spikes | 🟡 Medium | Yes | ⬜ Open |
+| 7 | `auto_adjust=True` trains on prices that never traded | 🟡 Medium | Yes | ⬜ Open |
+
+> **All five actionable findings are now fixed** — see "What was changed" at the
+> bottom. #6 and #7 are documented and tracked but deliberately left alone; both
+> are low-frequency on Bursa large caps and neither has a clean fix that doesn't
+> trade one distortion for another.
 
 ---
 
@@ -268,17 +273,76 @@ mean the current priors, the WFO parameters and the ML classifier were all fitte
 on the wrong universe with a contaminated trend gate. I would clear the learned
 state and restart the 6-month noop period after fixing #1–#4.
 
-**Suggested order:**
+---
 
-1. #1 training universe — nothing else matters until this is right
-2. #2 coverage gate + backoff — stops future corruption
-3. #3 fetch 2y for EMA200 — one-line change, removes a systematic bias
-4. #4 hoist the benchmark fetch — 351 → 133 calls, reduces 429 exposure
-5. #5 pin yfinance
-6. #6/#7 — track, fix opportunistically
+## What was changed
 
-Items 2–5 are small, self-contained diffs. Item 1 needs a decision from you about
-what the training universe *should* be (see the question at the end of the chat).
+All five actionable findings are fixed. 22 new tests in
+`tests/test_data_integrity_v38.py` cover each one; suite went 623 → 645 passing.
+
+### #1 — training universe (`learner.py`)
+
+`_classifier_tickers_for_active_market()` rewritten:
+
+- Sources from `watchlist.get_all_tickers()` — **the same universe the scanner
+  screens** — instead of `profile.default_watchlist[:10]`.
+- Samples **round-robin across sectors**, so 30 names span all 9 sectors rather
+  than being 6 banks + 4 telcos.
+- Honours `shariah_only`.
+- Two-level fallback (profile, then hardcoded) so it can never return empty.
+
+New `_price_band_ok()` drops names outside `min_price`/`max_price`, applied in
+both `run_walk_forward_optimization()` and `train_setup_classifier()`. It uses
+the **median of the last 60 closes**, so one spike can't include or exclude a
+ticker. Both now fetch via `data_provider.get_history()` rather than calling
+`yf.Ticker` directly, so they respect provider dispatch and retry.
+
+Classifier metadata now records `n_tickers_candidate`, `n_tickers_used` and
+`price_band` — without these you can't tell an old 9-large-cap model from a new
+one.
+
+### #2 — partial-scan gate (`data_provider.py`, `screener.py`, `scheduler.py`)
+
+- `_fetch_yfinance()` now retries up to 3 times with jittered exponential
+  backoff. Jitter matters: 8 workers retrying in lockstep re-trigger the throttle.
+- Permanent errors (delisted) are **not** retried — that would triple the rate
+  budget spent on dead tickers every cycle.
+- `_yf_logged_transient_error()` handles a nasty edge case found during live
+  testing: **yfinance often swallows network errors and returns an empty frame
+  instead of raising.** Empty-on-network-error is retried; empty-on-delisted is
+  not.
+- `screen_all_stocks()` stamps `df.attrs` with `coverage`.
+- `scheduler._run_one_cycle()` gates on `MIN_SCAN_COVERAGE = 0.80`. Below it:
+  scan cache is **not** overwritten, auto-entry is suppressed, `SCAN_DEGRADED`
+  is logged and a `DATA_DEGRADED` notification fires. **Exits keep running** —
+  being blind is a reason to stop opening risk, not to stop closing it.
+
+### #3 — EMA200 window (`screener.py`)
+
+`fetch_and_calculate` fetches `period="2y"` instead of `"1y"`. Seed
+contamination drops from **8.63% → 0.72%**. Same one network call.
+
+### #4 — redundant fetches (`market_analyzer.py`, `screener.py`)
+
+`screen_all_stocks` now fetches once into a `frames` dict and passes it to
+`rank_stocks_by_relative_strength(price_frames=...)`. The benchmark is fetched
+once per ranking pass instead of once per ticker.
+
+```
+before: 351 calls/cycle     after: ~133 calls/cycle     (-62%)
+```
+
+### #5 — pinned `yfinance==1.5.2`
+
+---
+
+## Remaining decision
+
+The brain's existing priors, WFO parameters and classifier were all fitted under
+findings #1 and #3. **They should be considered invalid.** Before the next live
+period, clear the learned state so it re-accumulates on the corrected pipeline —
+otherwise good new data is averaged against bad old posteriors. Retrain via the
+Learning tab, or wipe `state_priors` and let the noop period repopulate it.
 
 ---
 
@@ -331,24 +395,67 @@ pip install playwright && playwright install chromium --with-deps
 STREAMLIT_APP_URL="https://your-app.streamlit.app" python scripts/keepalive.py
 ```
 
-### But the real fix is to stop depending on Streamlit for the brain
+### The real fix: stop depending on Streamlit for the brain — now built
 
-Keepalive treats the symptom. The deeper issue is that your **trading scheduler
-lives inside a web UI process** on a free tier with no SLA, unpredictable
-container recycling, and a shared egress IP that worsens finding #4.
+Keepalive treats the symptom. The disease is that your **trading scheduler lives
+inside a web UI process**.
 
-You are already 90% of the way to a better architecture: `persistence.py` backs
-the whole SQLite brain to a private Gist, `scheduler.py` has a `__main__` CLI
-entry, and `run_once()` exists. So a GitHub Actions cron could:
+Today `app.py` calls `sched.ensure_started()` on every rerun, so the scheduler
+thread only exists as long as the Streamlit process does. That means:
+
+- **App asleep → no Python runs at all.** No scan, no exit check, no learning.
+  Not "delayed" — it simply doesn't happen. If price gaps through your stop
+  while the app is hibernating, nothing reacts until someone opens the browser.
+- **Every redeploy kills mid-cycle** and spawns a fresh thread (the PID-ownership
+  and zombie-eviction machinery in `scheduler.py` exists purely to manage this).
+- **Shared egress IP** — you share Yahoo's rate budget with every other app on
+  the node, which is a direct contributor to finding #4.
+- No SLA, on a free tier, deciding trades.
+
+**"Stops depending on Streamlit being awake"** means moving the decision-making
+out of the web process entirely. Each cycle becomes self-contained:
 
 ```
-restore from Gist  →  scheduler.run_once()  →  backup to Gist
+restore brain from Gist  →  run one cycle  →  back up brain to Gist
 ```
 
-That gives you guaranteed execution on a real cron, a fresh IP per run (better
-Yahoo behaviour), free compute, and logs in the Actions tab. Streamlit then
-becomes a pure read-only viewer of the Gist-backed DB — and it no longer matters
-whether it sleeps.
+The brain's state lives in the **Gist**, not in any container. So it doesn't
+matter that a GitHub Actions runner is destroyed after each run — it pulls the
+brain down, thinks, pushes it back. Streamlit becomes a **read-only viewer** of
+that same Gist-backed DB. If it sleeps, you lose the *dashboard*, not the *agent*.
 
-Not built here since it changes where trades actually get decided, which is your
-call. Happy to implement it next.
+**Shipped:** `run_cycle.py` + `scripts/trading-cycle.workflow.yml`.
+
+| | Before | After |
+|---|---|---|
+| Runs when app sleeps | ❌ nothing happens | ✅ cron fires regardless |
+| Survives redeploy | ⚠️ thread restarted | ✅ stateless per run |
+| Yahoo IP | shared Streamlit egress | fresh GitHub IP per run |
+| Execution log | ephemeral container logs | permanent, in Actions tab |
+| Failure alerting | none | GitHub emails you on red |
+
+Safety properties built into `run_cycle.py`:
+
+- **Refuses to start without `GITHUB_TOKEN`.** Otherwise it would begin from an
+  empty DB and then back that emptiness over your real brain — the single most
+  destructive thing this script could do.
+- **Distinguishes "first run, no gist yet" from "restore failed".** The former
+  proceeds; the latter aborts rather than risk the same overwrite.
+- **Backs up even if the cycle crashes** — a partial cycle may still have closed
+  trades and updated priors, and losing those is worse than saving a partial.
+- **Exit 2 = market closed**, so CI stays green and you're only emailed on real
+  failures.
+- **Concurrency group** so two cycles never race on one gist.
+- Uses the **exchange-local date** for the trading-day check (MYT is 12-13h off
+  US, which would otherwise pick the wrong day).
+
+Verified locally: correct exit codes for missing token (1), dry run (0), and a
+full offline cycle (0) — in which the new `SCAN_DEGRADED` gate correctly caught
+0% coverage, suppressed auto-entry, and preserved the previous scan cache.
+
+**Migration is incremental and low-risk.** Run the workflow on `dry_run` first,
+then let cron drive it while the Streamlit scheduler still runs — they use the
+same gist and the concurrency group prevents races. Once you trust it, set the
+app to viewer-only by not calling `ensure_started()` (or set the scheduler
+interval so it never fires) and keep the keepalive purely for dashboard
+convenience.

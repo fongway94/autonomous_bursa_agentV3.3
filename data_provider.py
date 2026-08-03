@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import os
 import time
+import random
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
@@ -87,6 +88,12 @@ _MOOMOO_PORT = int(os.getenv("MOOMOO_PORT", "11111"))
 MOOMOO_MAX_CONSECUTIVE_FAILURES = 5
 
 DEFAULT_TIMEOUT_S = 15
+
+# v3.8: bounded retry for yfinance. Total worst-case added latency per ticker
+# is ~0.8 + ~1.6 + jitter ≈ 3.5s, which stays well inside the scheduler's
+# 600s runaway-cycle watchdog even with 8 workers contending.
+YF_MAX_ATTEMPTS = 3
+YF_BACKOFF_BASE_S = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -531,33 +538,137 @@ def _moomoo_success_signal() -> None:
 # yfinance fetch (fallback / forced)
 # ---------------------------------------------------------------------------
 
+_TRANSIENT_MARKERS = (
+    "429", "too many requests", "rate limit", "rate-limit",
+    "timeout", "timed out", "temporarily unavailable",
+    "connection", "ssl", "503", "502", "504",
+)
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """True if the exception looks like Yahoo throttling / a transient blip.
+
+    yfinance wraps its HTTP layer and does not expose status codes on the
+    exception, so we string-match. Deliberately broad — a false positive
+    costs one extra sleep, a false negative silently drops the ticker from
+    the scan (which is the failure mode we are trying to eliminate).
+    """
+    s = f"{type(exc).__name__}: {exc}".lower()
+    return any(k in s for k in _TRANSIENT_MARKERS)
+
+
+def _yf_logged_transient_error(ticker: str) -> bool:
+    """True if yfinance internally recorded a transient error for `ticker`.
+
+    Why this is needed
+    ------------------
+    yfinance is inconsistent about failures. Sometimes it raises (we catch it
+    in the retry loop); sometimes it swallows the network error, logs
+    "possibly delisted; no price data found", and returns an EMPTY frame.
+
+    An empty frame is genuinely ambiguous: it means either "this ticker is
+    dead" or "the network just failed". Retrying every empty result would
+    burn 3x the rate budget on every delisted symbol, every cycle. So we ask
+    yfinance which one it was, via its module-level error registry.
+
+    `shared._ERRORS` is a private API, hence the defensive wrapper — if it
+    disappears in a future release we simply stop retrying empties rather
+    than crashing.
+    """
+    try:
+        from yfinance import shared
+        err = str(shared._ERRORS.get(ticker, "")).lower()
+        if not err:
+            return False
+        return any(k in err for k in _TRANSIENT_MARKERS)
+    except Exception:
+        return False
+
+
 def _fetch_yfinance(ticker: str,
                     period: Optional[str],
                     start: Optional[str],
                     end: Optional[str],
                     timeout: float,
                     interval: Optional[str] = None) -> pd.DataFrame:
-    iv = (interval or "1d").strip().lower()
-    try:
-        if _is_intraday(iv):
-            # yfinance intraday: must pass interval=, and respect the
-            # provider's look-back cap. If the caller gave explicit
-            # start/end (backtest), honour them; else use a recent window.
-            if start is not None or end is not None:
-                df = yf.Ticker(ticker).history(
-                    start=start, end=end, interval=iv, timeout=timeout)
+    """Fetch from yfinance with bounded retry on transient/throttle errors.
+
+    v3.8 — why retry exists
+    -----------------------
+    This function used to swallow every exception and return an EMPTY frame.
+    Callers treat empty as "no data", so a single Yahoo 429 silently removed
+    that ticker from the scan, and the cycle still reported CYCLE_OK. On a
+    shared Streamlit Cloud egress IP (bursting 8 workers) throttling is
+    routine, so the brain was quietly learning from whichever subset Yahoo
+    felt like serving — biased toward the most liquid names.
+
+    Backoff is short and jittered: the caller holds a worker thread and the
+    scheduler's watchdog kills a cycle at 600s, so we must stay well inside
+    that. Worst case here is ~3.5s of sleeping per ticker.
+    """
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(YF_MAX_ATTEMPTS):
+        retry_reason: Optional[str] = None
+        try:
+            df = _fetch_yfinance_once(ticker, period, start, end,
+                                      timeout, interval)
+            if df is not None and not df.empty:
+                return df
+            # Empty frame: retry ONLY if yfinance logged a transient cause.
+            # Otherwise treat it as a genuinely dead symbol and stop.
+            if _yf_logged_transient_error(ticker):
+                retry_reason = "empty frame after a transient network error"
             else:
-                cap = _INTRADAY_INTERVALS.get(iv, 60)
-                # yfinance accepts e.g. period="60d" with interval="5m"
-                df = yf.Ticker(ticker).history(
-                    period=f"{cap}d", interval=iv, timeout=timeout)
-        elif period is not None and start is None and end is None:
-            df = yf.Ticker(ticker).history(period=period, timeout=timeout)
+                return pd.DataFrame()
+        except Exception as e:                       # noqa: BLE001
+            last_exc = e
+            if not _is_rate_limited(e):
+                break
+            retry_reason = type(e).__name__
+
+        if attempt == YF_MAX_ATTEMPTS - 1:
+            break
+
+        # Exponential backoff with jitter to de-synchronise the 8 workers;
+        # without jitter they retry in lockstep and re-trigger the throttle.
+        delay = YF_BACKOFF_BASE_S * (2 ** attempt) + random.uniform(0, 0.4)
+        log.warning("data_provider: %s attempt %d/%d failed (%s) — "
+                    "retrying in %.1fs", ticker, attempt + 1,
+                    YF_MAX_ATTEMPTS, retry_reason, delay)
+        time.sleep(delay)
+
+    log.warning("data_provider: yfinance fetch failed for %s after %d attempt(s): %s",
+                ticker, YF_MAX_ATTEMPTS, last_exc or "empty frame")
+    return pd.DataFrame()
+
+
+def _fetch_yfinance_once(ticker: str,
+                         period: Optional[str],
+                         start: Optional[str],
+                         end: Optional[str],
+                         timeout: float,
+                         interval: Optional[str] = None) -> pd.DataFrame:
+    """Single yfinance attempt. Raises on failure so the retry wrapper sees it."""
+    iv = (interval or "1d").strip().lower()
+
+    if _is_intraday(iv):
+        # yfinance intraday: must pass interval=, and respect the provider's
+        # look-back cap. If the caller gave explicit start/end (backtest),
+        # honour them; else use a recent window.
+        if start is not None or end is not None:
+            df = yf.Ticker(ticker).history(
+                start=start, end=end, interval=iv, timeout=timeout)
         else:
-            df = yf.Ticker(ticker).history(start=start, end=end, timeout=timeout)
-    except Exception as e:
-        log.warning("data_provider: yfinance fetch failed for %s: %s", ticker, e)
-        return pd.DataFrame()
+            cap = _INTRADAY_INTERVALS.get(iv, 60)
+            # yfinance accepts e.g. period="60d" with interval="5m"
+            df = yf.Ticker(ticker).history(
+                period=f"{cap}d", interval=iv, timeout=timeout)
+    elif period is not None and start is None and end is None:
+        df = yf.Ticker(ticker).history(period=period, timeout=timeout)
+    else:
+        df = yf.Ticker(ticker).history(start=start, end=end, timeout=timeout)
+
     if df is None:
         return pd.DataFrame()
     return df
