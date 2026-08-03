@@ -591,13 +591,17 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
             stretch_pct = (current_price - ema50) / ema50 * 100
             climax_thresh = float(_profile().climax_stretch_pct)
             if stretch_pct >= climax_thresh:
+                # Fix: compute outcome from actual price vs entry (same as time exit),
+                # not hardcoded "WIN" — a climax at a lower price is a loss.
+                climax_outcome = "WIN" if current_price > entry else \
+                                 ("BREAKEVEN" if abs(current_price - entry) / entry < 0.005 else "LOSS")
                 ok, msg = execute_full_exit(
                     t["id"], current_price,
                     reason=f"Climax Run Exit: Price stretched {stretch_pct:.1f}% above 50-day EMA",
-                    outcome="WIN", actor=actor)
+                    outcome=climax_outcome, actor=actor)
                 if ok:
                     settled.append({"trade_id": t["id"], "type": "CLIMAX", "msg": msg,
-                                    "ticker": ticker, "outcome": "WIN"})
+                                    "ticker": ticker, "outcome": climax_outcome})
                 continue
 
         # 1. TP3
