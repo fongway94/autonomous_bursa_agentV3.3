@@ -108,13 +108,22 @@ def _gc_orphaned_thread_ids() -> None:
 # -------------------------------------------------------------------------
 
 def _next_run_at(interval_sec: int) -> datetime:
-    """Next top-of-hour (if interval = 3600) or now + interval."""
-    now = get_myt_now()
+    """Return the next cadence boundary in the active exchange timezone.
+
+    This used to calculate boundaries in MYT unconditionally.  That is mostly
+    invisible for Bursa, but for US it can defer the first cycle to a boundary
+    that is unrelated to New York's trading session (and makes the scheduler
+    appear not to auto-fire at the open).  Keep the returned datetime aware so
+    elapsed-time calculations remain correct across timezones.
+    """
+    try:
+        from market_calendar import _now_local
+        now = _now_local()
+    except Exception:
+        now = get_myt_now()
     if interval_sec == 3600:
-        nxt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    else:
-        nxt = now + timedelta(seconds=interval_sec)
-    return nxt
+        return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return now + timedelta(seconds=interval_sec)
 
 
 def _is_market_hours() -> bool:
