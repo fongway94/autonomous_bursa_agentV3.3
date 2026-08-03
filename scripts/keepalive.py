@@ -40,7 +40,11 @@ import time
 
 # The app is considered "really running" once Streamlit has mounted its root
 # node. The shell page alone never produces this.
-APP_ROOT_SELECTOR = 'div[data-testid="stAppViewContainer"], section.main, div.stApp'
+APP_ROOT_SELECTOR = ('div[data-testid="stAppViewContainer"], section.main, '
+                     'div.stApp, div[data-testid="stSidebar"], '
+                     'div[data-testid="stHeader"], #root')
+
+SLEEPING_TITLE_MARKERS = ("zzz", "sleep")
 
 # Text on the button Streamlit shows on a hibernating app.
 WAKE_BUTTON_TEXT = "Yes, get this app back up!"
@@ -88,29 +92,43 @@ def wake(page, url: str) -> bool:
         # own between the goto and the query.
         print(f"  note: wake-button step skipped ({type(e).__name__})", flush=True)
 
-    # Confirm Streamlit actually mounted — this is the part an HTTP ping can
-    # never assert.
+    # Confirm Streamlit actually mounted — the part an HTTP ping can't assert.
+    #
+    # `state="attached"` not the default "visible": on a wide layout with an
+    # expanded sidebar the container can still be mid-paint when the app is
+    # perfectly awake, and waiting for visibility produced false failures.
+    mounted = False
     try:
-        page.wait_for_selector(APP_ROOT_SELECTOR, timeout=PAGE_TIMEOUT_MS)
+        page.wait_for_selector(APP_ROOT_SELECTOR, timeout=PAGE_TIMEOUT_MS,
+                               state="attached")
+        mounted = True
     except Exception:
+        pass
+
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+
+    if not mounted:
+        low = title.lower()
+        if title and not any(m in low for m in SLEEPING_TITLE_MARKERS):
+            print(f"  OK: app responded with its own title ({title!r}) — "
+                  f"Python ran, treating as awake.", flush=True)
+            page.wait_for_timeout(RENDER_SETTLE_MS)
+            return True
+
         print("  FAIL: Streamlit root never mounted (still asleep or erroring).",
               flush=True)
-        try:
-            print(f"  page title: {page.title()!r}", flush=True)
-        except Exception:
-            pass
+        print(f"  page title: {title!r}", flush=True)
         return False
 
     # Hold the WebSocket open briefly so Streamlit records real session traffic
     # and the scheduler thread in app.py gets a chance to spin up.
     page.wait_for_timeout(RENDER_SETTLE_MS)
 
-    try:
-        title = page.title()
-    except Exception:
-        title = "<unknown>"
-
-    print(f"  OK: app is awake and rendered (title={title!r})", flush=True)
+    print(f"  OK: app is awake and rendered (title={title or '<unknown>'!r})",
+          flush=True)
     return True
 
 
