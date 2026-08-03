@@ -161,23 +161,125 @@ def _exploration_active() -> bool:
     return len(closed_trades()) < target
 
 
-def _classifier_tickers_for_active_market() -> list[str]:
+# v3.8: training-universe size. 30 sector-stratified names balances
+# statistical coverage against wall-clock (each name = one 3y fetch).
+TRAINING_UNIVERSE_SIZE = 30
+
+
+def _classifier_tickers_for_active_market(
+        max_tickers: int = TRAINING_UNIVERSE_SIZE) -> list[str]:
     """
-    FIX #3 & #6: Return the active market's watchlist tickers for
-    walk-forward and ML classifier training.  Uses up to 10 symbols
-    to balance data volume vs. training time.
+    Return the training universe for walk-forward optimisation and the ML
+    setup classifier.
+
+    v3.8 FIX — train on what we actually trade
+    ------------------------------------------
+    The previous implementation returned ``active_profile().default_watchlist[:10]``.
+    For MY that was the first 10 entries of ``MY_PROFILE`` — 6 banks + 4 telcos
+    (and 5347/1023 are both CIMB, so really 9 distinct names). Three problems:
+
+      1. The LIVE scanner screens ``watchlist.get_all_tickers()`` (109 MY
+         symbols), not the 30-name profile list. Every parameter the brain
+         learned was fitted on ~9% of the universe it trades.
+      2. The 10 were 2 sectors out of 9. ATR-based stops and volume-surge
+         ratios do not transfer from a RM 10 bank to a RM 0.50 small cap.
+      3. Most of them trade ABOVE the ``max_price`` band, so the optimiser
+         scored setups the live agent is structurally forbidden from entering
+         (``is_in_price_range`` gates every BUY branch in screener.py).
+
+    Now: same universe as the scanner, sampled round-robin across sectors so
+    no single sector dominates. Price-band filtering happens at fetch time in
+    the callers (``_price_band_ok``), because it needs the actual close and we
+    do not want to spend extra network calls just to pre-filter.
+
+    Honours ``shariah_only`` so the brain never learns from names the scanner
+    would refuse to trade.
     """
+    tickers: list[str] = []
+    try:
+        from watchlist import (
+            get_all_tickers, get_all_tickers_shariah_only, get_ticker_sector,
+        )
+        from repository import load_parameters
+
+        try:
+            shariah_only = bool(load_parameters().get("shariah_only"))
+        except Exception:
+            shariah_only = False
+
+        all_t = (get_all_tickers_shariah_only() if shariah_only
+                 else get_all_tickers())
+
+        if all_t:
+            # Bucket by sector, then round-robin so the sample spans sectors
+            # instead of taking an alphabetical head (which is what [:10] did).
+            by_sector: dict[str, list[str]] = {}
+            for t in all_t:
+                by_sector.setdefault(get_ticker_sector(t), []).append(t)
+            for bucket in by_sector.values():
+                bucket.sort()
+
+            ordered = sorted(by_sector.keys())
+            i = 0
+            while len(tickers) < max_tickers:
+                added = False
+                for sec in ordered:
+                    if i < len(by_sector[sec]):
+                        tickers.append(by_sector[sec][i])
+                        added = True
+                        if len(tickers) >= max_tickers:
+                            break
+                if not added:
+                    break          # every sector exhausted
+                i += 1
+    except Exception as e:
+        log.warning("training universe resolution failed: %s", e)
+
+    if tickers:
+        return tickers
+
+    # Fallback 1: the market profile (previous behaviour, minus the [:10]).
     try:
         from market_profiles import active_profile
-        tickers = [t.yf_symbol for t in active_profile().default_watchlist[:10]]
-        if tickers:
-            return tickers
+        prof_t = [t.yf_symbol
+                  for t in active_profile().default_watchlist[:max_tickers]]
+        if prof_t:
+            log.warning("training universe: falling back to market profile")
+            return prof_t
     except Exception:
         pass
-    # Safe fallback: MY tickers only if profile resolution fails
+
+    # Fallback 2: hardcoded MY names, only if everything above failed.
+    log.warning("training universe: falling back to hardcoded MY list")
     return ["1155.KL", "5347.KL", "6742.KL", "5398.KL",
             "0166.KL", "0138.KL", "5296.KL", "8583.KL",
             "7113.KL", "7108.KL"]
+
+
+def _price_band_ok(df: pd.DataFrame, params: dict) -> bool:
+    """
+    True if the ticker's recent price sits inside the tradeable band.
+
+    ``screener.analyze_stock_setup`` gates EVERY buy branch on
+    ``min_price <= close <= max_price``. Training on names outside that band
+    teaches the brain about setups it can never act on, so we drop them here.
+
+    Uses the MEDIAN of the last 60 closes rather than the last close: a single
+    spike shouldn't include/exclude a whole ticker, and the median reflects
+    where the name spent the training window.
+    """
+    try:
+        if df is None or df.empty or "Close" not in df.columns:
+            return False
+        recent = df["Close"].dropna().iloc[-60:]
+        if recent.empty:
+            return False
+        median_close = float(recent.median())
+        lo = float(params.get("min_price", 0.0))
+        hi = float(params.get("max_price", 1e9))
+        return lo <= median_close <= hi
+    except Exception:
+        return False
 
 
 def compute_state_action_score(state_id: int, confidence_score: float,
@@ -541,17 +643,42 @@ def run_walk_forward_optimization(progress_callback=None) -> tuple[dict, float, 
          "volume_surge_ratio": 1.6, "atr_multiplier_stop": 1.8},
     ]
 
+    base_params = load_parameters()
+
+    # v3.8: fetch via data_provider (respects Moomoo/yfinance dispatch and the
+    # provider's timeout contract) instead of calling yf.Ticker directly, and
+    # drop names outside the tradeable price band — the optimiser must not
+    # score setups the live screener would refuse on price alone.
+    from data_provider import get_history
+
     dfs: dict[str, pd.DataFrame] = {}
+    skipped_band = 0
     for t in tickers:
         try:
-            dfs[t] = yf.Ticker(t).history(period="3y", timeout=15)
+            d = get_history(t, period="3y", timeout=15)
+            if d is None or d.empty:
+                continue
+            if not _price_band_ok(d, base_params):
+                skipped_band += 1
+                continue
+            dfs[t] = d
         except Exception:
             pass
+
+    if skipped_band:
+        log.info("WFO: skipped %d/%d tickers outside price band %.2f-%.2f",
+                 skipped_band, len(tickers),
+                 base_params.get("min_price", 0), base_params.get("max_price", 0))
+
     if not dfs:
+        log_learning_event(
+            "WALK_FORWARD_REJECTED",
+            "No tickers survived the price-band filter — params unchanged.",
+            metrics={"candidates": len(tickers), "skipped_band": skipped_band},
+        )
         return None, 0, 0
 
     grid_scores: dict[int, list[dict]] = {i: [] for i in range(len(search_grid))}
-    base_params = load_parameters()
 
     n_windows = 4
     for w in range(n_windows):
@@ -641,26 +768,40 @@ _clf_model = None
 
 def train_setup_classifier():
     """
-    FIX #6: ML classifier now trains on the active market's watchlist
-    instead of hardcoded MY tickers.
+    Train the ML setup classifier on the active market's TRADEABLE universe.
 
-    US 3× ETFs (TQQQ, SOXL) have entirely different volatility/volume
-    signatures than MY stocks. Training on MY patterns and applying to
-    US was producing misaligned probability estimates.
+    FIX #6 (v3.6): use the active market's watchlist, not hardcoded MY tickers.
+      US 3× ETFs (TQQQ, SOXL) have entirely different volatility/volume
+      signatures than MY stocks; training on MY and applying to US produced
+      misaligned probability estimates.
+
+    v3.8: the universe is now the SCANNER's universe (sector-stratified sample
+      of ``watchlist.get_all_tickers()``), filtered to the active price band —
+      previously it was ``profile.default_watchlist[:10]``, i.e. 9 large-cap
+      banks/telcos that mostly trade above ``max_price`` and so could never be
+      entered live. See ``_classifier_tickers_for_active_market``.
     """
     from screener import compute_indicators
-    # FIX #6: Use active market's watchlist
     tickers = _classifier_tickers_for_active_market()
     params = load_parameters()
     feature_names = ["RSI", "VolRatio", "MACDHist",
                      "EMA_Fast_Dist", "EMA_Slow_Dist", "EMA_Trend_Dist",
                      "BB_Width"]
 
+    # v3.8: route through data_provider and apply the same price-band filter
+    # the live screener applies, so the classifier's calibrated probabilities
+    # describe the distribution the agent actually trades.
+    from data_provider import get_history
+
     rows = []  # (date, features, label)
+    skipped_band = 0
     for t in tickers:
         try:
-            df = yf.Ticker(t).history(period="3y", timeout=15)
+            df = get_history(t, period="3y", timeout=15)
             if df is None or df.empty or len(df) < 250:
+                continue
+            if not _price_band_ok(df, params):
+                skipped_band += 1
                 continue
             df = compute_indicators(df, params)
             if df.empty or "RSI" not in df.columns:
@@ -692,7 +833,12 @@ def train_setup_classifier():
         except Exception:
             continue
 
+    if skipped_band:
+        log.info("ML classifier: skipped %d/%d tickers outside price band",
+                 skipped_band, len(tickers))
+
     if len(rows) < 200:
+        log.warning("ML classifier: only %d samples (<200) — not training", len(rows))
         return None
 
     rows.sort(key=lambda r: r[0])  # ensure chronological for TimeSeriesSplit
@@ -736,6 +882,12 @@ def train_setup_classifier():
         "n_train": len(X_train), "n_test": len(X_test),
         "class_ratio": round(float(np.mean(y_train)), 3),
         "market_code": _active_market_code_from_profile(),
+        # v3.8: record WHICH universe produced this model. Without this you
+        # cannot tell a model trained on the old 9-large-cap list from one
+        # trained on the real scanner universe.
+        "n_tickers_candidate": len(tickers),
+        "n_tickers_used": len(tickers) - skipped_band,
+        "price_band": [params.get("min_price"), params.get("max_price")],
     }
     with open(_CLASSIFIER_META_PATH, "w") as f:
         json.dump(meta, f, indent=2)

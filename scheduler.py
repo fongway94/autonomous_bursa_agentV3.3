@@ -89,6 +89,11 @@ WATCHDOG_CYCLE_TIMEOUT_SEC = 600        # 10 min — cycle is "runaway"
 WATCHDOG_TIMEOUT_OWNER_SENTINEL = -1    # forces owner_pid mismatch
 CYCLE_DURATION_WARN_SEC = 300           # 5 min — soft warn, no action
 
+# v3.8: minimum fraction of the watchlist that must return data for a scan to
+# be trusted for auto-entry and for overwriting scan_cache. 0.80 tolerates a
+# handful of genuinely delisted/suspended tickers while catching real outages.
+MIN_SCAN_COVERAGE = 0.80
+
 
 def _gc_orphaned_thread_ids() -> None:
     """Remove idents from the orphan set whose thread has actually died."""
@@ -480,7 +485,48 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
     try:
         df = screen_all_stocks(market_regime=regime)
         summary["scan_count"] = len(df)
-        save_scan_cache(df.to_dict("records") if not df.empty else [], regime)
+
+        # -----------------------------------------------------------------
+        # v3.8 — SCAN_DEGRADED gate
+        #
+        # screen_all_stocks stamps df.attrs with how many tickers actually
+        # returned data. Before this gate, a throttled/partial fetch was
+        # indistinguishable from "no setups today": the partial result
+        # overwrote scan_cache, auto-entry ran against a biased subset, and
+        # the cycle still logged CYCLE_OK.
+        #
+        # On degradation we do THREE things:
+        #   1. do NOT overwrite scan_cache (keep the last good full scan)
+        #   2. suppress auto-entry for this cycle (exits still run — being
+        #      blind is a reason to stop opening risk, not to stop closing it)
+        #   3. log + notify, so a silent data outage becomes visible
+        # -----------------------------------------------------------------
+        coverage = float(df.attrs.get("coverage", 1.0))
+        fetched = int(df.attrs.get("tickers_fetched", summary["scan_count"]))
+        expected = int(df.attrs.get("tickers_expected", summary["scan_count"]))
+        summary["coverage"] = round(coverage, 4)
+        summary["tickers_fetched"] = fetched
+        summary["tickers_expected"] = expected
+
+        if coverage < MIN_SCAN_COVERAGE:
+            summary["degraded"] = True
+            msg = (f"Scan coverage {coverage*100:.0f}% "
+                   f"({fetched}/{expected} tickers) below "
+                   f"{MIN_SCAN_COVERAGE*100:.0f}% floor — data source likely "
+                   f"throttling. Keeping previous scan cache; auto-entry "
+                   f"suppressed this cycle. Exits still active.")
+            log_scheduler_event("SCAN_DEGRADED", msg, "WARN",
+                                payload={"coverage": coverage,
+                                         "fetched": fetched,
+                                         "expected": expected})
+            autotrade = False          # suppress new risk, keep managing old
+            try:
+                from notifier import dispatch
+                dispatch("DATA_DEGRADED", f"⚠️ BursaAI: {msg}")
+            except Exception:
+                pass
+        else:
+            save_scan_cache(df.to_dict("records") if not df.empty else [], regime)
     except Exception as e:
         log_scheduler_event("ERROR", f"Scan failed: {e}\n{traceback.format_exc()}",
                             "ERROR")
@@ -734,6 +780,17 @@ def _run_one_cycle(autotrade: bool, autoexit: bool,
                 f"{summary['auto_entries']} entries, "
                 f"{summary['rejected']} rejected")
 
+    elif summary.get("degraded"):
+        # v3.8: don't blame the user's toggle for a data outage. autotrade was
+        # forced False by the SCAN_DEGRADED gate above, not by the UI switch.
+        log_scheduler_event(
+            "AUTO_ENTRY_END",
+            f"0 entries — scan coverage "
+            f"{summary.get('coverage', 0) * 100:.0f}% below the "
+            f"{MIN_SCAN_COVERAGE * 100:.0f}% floor. Auto-entry suppressed to "
+            f"avoid trading on a partial view of the market.",
+            payload={"reason": "scan_degraded",
+                     "coverage": summary.get("coverage")})
     elif autotrade:
         log_scheduler_event(
             "AUTO_ENTRY_END",

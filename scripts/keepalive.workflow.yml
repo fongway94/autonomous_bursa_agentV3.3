@@ -1,0 +1,80 @@
+# .github/workflows/keepalive.yml
+#
+# Keeps the Streamlit Community Cloud deployment awake.
+#
+# Why not UptimeRobot
+# -------------------
+# UptimeRobot and every other HTTP-only monitor CANNOT wake a Streamlit app.
+# A plain GET returns a ~4 KB static HTML shell with 200 OK while the Python
+# process stays asleep — the monitor reports "up" and nothing actually runs.
+# Streamlit only boots when JavaScript executes and opens a WebSocket to
+# /_stcore/stream, which requires a real browser.
+#
+# Apps with no traffic for 12 hours hibernate:
+# https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app#app-hibernation
+#
+# This workflow drives headless Chromium via Playwright, which executes the JS,
+# opens the WebSocket, and clicks "Yes, get this app back up!" when needed.
+#
+# ONE-TIME SETUP
+# --------------
+# Settings -> Secrets and variables -> Actions -> Variables -> New variable
+#     Name:  STREAMLIT_APP_URL
+#     Value: https://your-app.streamlit.app
+# (comma-separate if you run more than one app)
+#
+# Schedule note: cron is UTC. MY is UTC+8. The 12-hour hibernation window means
+# a 4-hour cadence gives ~3x headroom against a missed or delayed run — GitHub
+# does not guarantee punctual cron delivery on busy runners.
+
+name: Keepalive (Streamlit Cloud)
+
+on:
+  schedule:
+    # Every 4 hours. 23:00 UTC = 07:00 MYT, so the agent is warm before the
+    # 09:00 MYT Bursa open; 07:00 UTC = 15:00 MYT covers the afternoon session.
+    - cron: '0 3,7,11,15,19,23 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    name: Wake Streamlit app
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install --quiet playwright
+          playwright install chromium --with-deps
+
+      - name: Visit app in a real browser
+        env:
+          STREAMLIT_APP_URL: ${{ vars.STREAMLIT_APP_URL }}
+        run: python scripts/keepalive.py
+
+# ---------------------------------------------------------------------------
+# NOTE ON THIS FILE'S LOCATION
+# ---------------------------------------------------------------------------
+# This file lives at scripts/keepalive.workflow.yml instead of
+# .github/workflows/keepalive.yml because the GitHub App used to push this
+# branch lacks the `workflows` permission and the push is rejected.
+#
+# To activate, move it into place yourself (one command, from the repo root):
+#
+#     git mv scripts/keepalive.workflow.yml .github/workflows/keepalive.yml
+#     git commit -m "ci: enable Streamlit keepalive workflow"
+#     git push
+#
+# Or create .github/workflows/keepalive.yml through the GitHub web UI and
+# paste the contents above.

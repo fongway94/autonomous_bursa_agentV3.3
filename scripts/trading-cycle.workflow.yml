@@ -1,0 +1,145 @@
+# .github/workflows/trading-cycle.yml
+#
+# Runs the trading brain on a real cron, independently of Streamlit.
+#
+# Why this exists
+# ---------------
+# The scheduler used to live inside app.py — i.e. inside the Streamlit web
+# process. That made "does the agent think?" depend on "is the web UI awake?".
+# Streamlit Community Cloud hibernates any app with no traffic for 12 hours,
+# and a sleeping app runs no Python at all: no scan, no exit check, no learning.
+#
+# Here, each run is self-contained:
+#     restore brain from Gist -> run one cycle -> back up brain to Gist
+#
+# The brain lives in the Gist, not in the container, so an ephemeral CI runner
+# is a perfectly safe place to execute it. Streamlit becomes a READ-ONLY viewer
+# and it no longer matters whether it sleeps.
+#
+# Bonus: each run gets a fresh GitHub IP, which behaves far better against
+# Yahoo's rate limiting than Streamlit Cloud's shared egress IP.
+#
+# ONE-TIME SETUP
+# --------------
+# 1. Settings -> Secrets and variables -> Actions -> Secrets:
+#        GIST_TOKEN   classic PAT with the `gist` scope
+#                     (github.com/settings/tokens — NOT fine-grained)
+# 2. Same page -> Variables:
+#        GIST_ID      the id of your existing backup gist
+#                     (find it in the app's Settings tab, or the gist URL)
+#
+# Use the SAME gist the Streamlit app already backs up to, so both see one
+# brain. Verify with a manual `workflow_dispatch` run before trusting the cron.
+#
+# SAFETY
+# ------
+# * MY is in NOOP mode (notification-only) — this does not place real orders.
+# * run_cycle.py refuses to start if the token is missing, so it can never
+#   overwrite a good backup with an empty database.
+# * Concurrency group + cancel-in-progress:false means two cycles never race
+#   on the same gist.
+
+name: Trading cycle (MY swing)
+
+on:
+  schedule:
+    # Bursa: 09:00-12:30 and 14:30-17:00 MYT. MYT = UTC+8, so subtract 8.
+    # Hourly across both sessions, plus one post-close pass for settlement.
+    #   01:00 UTC = 09:00 MYT  (open)
+    #   02:00 UTC = 10:00 MYT
+    #   03:00 UTC = 11:00 MYT
+    #   04:00 UTC = 12:00 MYT  (late morning session)
+    #   07:00 UTC = 15:00 MYT  (afternoon session)
+    #   08:00 UTC = 16:00 MYT
+    #   09:30 UTC = 17:30 MYT  (post-close settle)
+    - cron: '0 1,2,3,4,7,8 * * 1-5'
+    - cron: '30 9 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Restore + report only, run no cycle'
+        type: boolean
+        default: false
+
+# Never let two cycles touch the same gist at once.
+concurrency:
+  group: trading-cycle-my
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    name: Run one cycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      MARKET_MODE: MY
+      TRADING_MODE: SWING
+      GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ vars.GIST_ID }}
+      # Optional — uncomment the matching secrets to get alerts from the
+      # runner itself, not just from the Streamlit app.
+      # TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      # TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Preflight — required secrets present
+        run: |
+          if [ -z "${GITHUB_TOKEN}" ]; then
+            echo "::error::GIST_TOKEN secret is not set. Without it the brain"
+            echo "::error::cannot be restored or saved. Refusing to run."
+            exit 1
+          fi
+          echo "Token present. GIST_ID=${GIST_ID:-<unset, will resolve from DB meta>}"
+
+      - name: Run trading cycle
+        run: |
+          set +e
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python run_cycle.py --dry-run
+          else
+            python run_cycle.py
+          fi
+          code=$?
+          set -e
+
+          # Exit 2 means "market closed / holiday" — a legitimate skip, not a
+          # failure. Swallow it so the run stays green and you only get email
+          # about real breakage.
+          if [ "$code" = "2" ]; then
+            echo "::notice::Market closed today — cycle skipped, not a failure."
+            exit 0
+          fi
+
+          if [ "$code" != "0" ]; then
+            echo "::error::Trading cycle failed with exit code $code."
+          fi
+          exit $code
+
+# ---------------------------------------------------------------------------
+# NOTE ON THIS FILE'S LOCATION
+# ---------------------------------------------------------------------------
+# This lives at scripts/trading-cycle.workflow.yml rather than
+# .github/workflows/trading-cycle.yml because the GitHub App used to push this
+# branch lacks the `workflows` permission, so the push is rejected.
+#
+# To activate (one command, from the repo root):
+#
+#     git mv scripts/trading-cycle.workflow.yml .github/workflows/trading-cycle.yml
+#     git commit -m "ci: enable headless trading cycle"
+#     git push
+#
+# Then run it once via Actions -> Trading cycle (MY swing) -> Run workflow,
+# with dry_run = true, to confirm the Gist restore works before letting the
+# cron drive real cycles.

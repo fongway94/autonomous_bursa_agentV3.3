@@ -360,9 +360,27 @@ def get_sector_momentum() -> dict:
 
 def calculate_relative_strength(ticker: str,
                                 klci_df: pd.DataFrame | None = None,
-                                period: int = 20) -> dict | None:
+                                period: int = 20,
+                                stock_df: pd.DataFrame | None = None) -> dict | None:
+    """Relative strength of `ticker` vs the active market's benchmark.
+
+    v3.8 — two call-saving parameters
+    ---------------------------------
+    ``stock_df``: pass a price frame the caller ALREADY fetched (the screener
+      pulls 2y for every ticker moments earlier) and we skip the network
+      entirely. Only ``Close`` is read, and only the last ``period+5`` bars
+      matter, so any frame >= that length works.
+
+    ``klci_df``: pass the benchmark once. Previously callers left this None,
+      and because the fallback below re-downloads the benchmark on EVERY
+      invocation, a 109-ticker scan pulled ^KLSE 109 times — ~31% of the
+      cycle's entire Yahoo budget spent refetching one identical series.
+      The fallback is kept for standalone/manual callers.
+    """
     try:
-        df = get_history(ticker, period="3mo", timeout=10)
+        df = stock_df
+        if df is None or df.empty or len(df) < period + 5:
+            df = get_history(ticker, period="3mo", timeout=10)
         if df is None or df.empty or len(df) < period + 5:
             return None
         ok, _ = validate_ohlcv(df, ticker, min_rows=period + 5)
@@ -388,10 +406,26 @@ def calculate_relative_strength(ticker: str,
 
 
 def rank_stocks_by_relative_strength(tickers: list,
-                                     klci_df: pd.DataFrame | None = None) -> dict:
+                                     klci_df: pd.DataFrame | None = None,
+                                     price_frames: dict | None = None) -> dict:
+    """Rank tickers by relative strength vs the benchmark.
+
+    v3.8: fetches the benchmark ONCE here instead of letting each
+    ``calculate_relative_strength`` call re-download it (was 1 fetch per
+    ticker). ``price_frames`` optionally supplies already-fetched OHLCV
+    frames — ``{ticker: DataFrame}`` — so a caller that just scanned these
+    names pays zero additional network cost.
+    """
+    # Fetch the benchmark once for the whole ranking pass.
+    if klci_df is None:
+        klci_df = get_regime_benchmark_data()
+
+    price_frames = price_frames or {}
+
     out: dict = {}
     for t in tickers:
-        rs = calculate_relative_strength(t, klci_df, period=20)
+        rs = calculate_relative_strength(t, klci_df, period=20,
+                                         stock_df=price_frames.get(t))
         if rs:
             out[t] = rs
     if not out:

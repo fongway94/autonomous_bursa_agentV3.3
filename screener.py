@@ -155,9 +155,29 @@ def get_recent_5day_analysis(df: pd.DataFrame, params: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def fetch_and_calculate(ticker: str, params: dict):
-    """Fetch 1y of daily bars, validate, compute indicators."""
+    """Fetch daily bars, validate, compute indicators.
+
+    v3.8 — window widened 1y → 2y (EMA200 seed contamination)
+    ---------------------------------------------------------
+    ``compute_indicators`` builds ``EMA_Trend`` with ``span=200, adjust=False``.
+    An ``adjust=False`` EMA is seeded with the FIRST bar's value, and that seed
+    decays as ``(1 - 2/201) ** n``. Over a 1y window (~246 trading bars) the
+    seed still carries **8.63%** of the final EMA200 — i.e. nearly a tenth of
+    the trend line was one arbitrary price from a year ago. At 2y (~494 bars)
+    that drops to 0.72%; at 3y, 0.06%.
+
+    This matters because ``EMA_Trend`` is not cosmetic: ``is_long_term_uptrend``
+    ( ``close > ema_trend`` ) is the master gate on BOTH the breakout and the
+    pullback branch in ``analyze_stock_setup``. A ~1% error in the trend line
+    flips that boolean for any stock hovering near its 200-day EMA — which is
+    exactly where pullback setups live. The brain then books the outcome under
+    a state label that was decided by a fetch-window artefact.
+
+    2y is the sweet spot: it kills the contamination while staying one network
+    call and well inside yfinance's daily-history limits.
+    """
     try:
-        df = get_history(ticker, period="1y", timeout=15)
+        df = get_history(ticker, period="2y", timeout=15)
     except Exception as e:
         log.warning(f"fetch failure {ticker}: {e}")
         return ticker, None
@@ -547,19 +567,32 @@ def screen_all_stocks(progress_callback=None, market_regime=None):
                 "position_rules": {"new_signal_threshold": 0.70},
             }
 
-    rs_data = {}
-    try:
-        from market_analyzer import rank_stocks_by_relative_strength
-        rs_data = rank_stocks_by_relative_strength(tickers)
-    except Exception as e:
-        log.warning(f"RS calculation failed: {e}")
-
     from learner import compute_state_action_score, discretize_state
 
     results = []
     completed = 0
     total = len(tickers)
 
+    # -----------------------------------------------------------------
+    # v3.8 — fetch ONCE, then derive everything from the same frames.
+    #
+    # Previously this function called rank_stocks_by_relative_strength()
+    # BEFORE the scan loop, which fetched a 3mo frame per ticker AND
+    # re-downloaded the benchmark once per ticker. Combined with the scan's
+    # own fetch, a 109-ticker MY cycle spent ~351 Yahoo calls where ~133
+    # suffice:
+    #
+    #     screener        109      <- kept (now 2y, see fetch_and_calculate)
+    #     RS per-stock    109      <- eliminated: reuse the scan frame
+    #     RS benchmark    109      <- eliminated: fetched once in rank_...()
+    #     sector/regime    18
+    #     settle            6
+    #
+    # Fewer calls is not just politeness: bursting 8 workers from Streamlit
+    # Cloud's SHARED egress IP is what triggers Yahoo throttling, and a
+    # throttled fetch silently drops the ticker from the scan.
+    # -----------------------------------------------------------------
+    frames: dict[str, "pd.DataFrame"] = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(fetch_and_calculate, t, params): t for t in tickers}
         for fut in as_completed(futures):
@@ -572,37 +605,75 @@ def screen_all_stocks(progress_callback=None, market_regime=None):
             completed += 1
             if progress_callback:
                 progress_callback(completed / total,
-                                  f"Scanning {ticker} ({completed}/{total})")
-            if df is None or df.empty:
-                continue
+                                  f"Fetching {ticker} ({completed}/{total})")
+            if df is not None and not df.empty:
+                frames[ticker] = df
 
-            try:
-                last = df.iloc[-1]
-                state_id = discretize_state(
-                    float(last["RSI"]),
-                    float(last["Vol_Ratio"]),
-                    float((float(last["Close"]) - float(last["EMA_Slow"])) /
-                          float(last["EMA_Slow"]) * 100),
-                    float(last["MACD_Hist"]),
-                )
-                regime = market_regime.get("regime_data", {}).get("regime", "NEUTRAL")
-                sec_str = market_regime.get("sector_momentum", {}).get(
-                    get_ticker_sector(ticker), {}).get("strength", 0)
-                q_action = compute_state_action_score(
-                    state_id, 50, regime, sec_str)
-            except Exception as e:
-                log.warning(f"state-score error {ticker}: {e}")
-                q_action = None
+    # v3.8: coverage telemetry — the caller decides whether a partial scan is
+    # trustworthy. See scheduler._run_one_cycle's SCAN_DEGRADED gate.
+    fetched, expected = len(frames), total
+    coverage = (fetched / expected) if expected else 0.0
+    if coverage < 1.0:
+        log.warning("scan coverage %.0f%% (%d/%d tickers) — data source may be "
+                    "throttling", coverage * 100, fetched, expected)
 
-            analysis = analyze_stock_setup(
-                ticker, df, params,
-                market_regime=market_regime,
-                rs_data=rs_data, q_action=q_action,
+    # RS now reuses the frames above: no per-ticker fetch, benchmark fetched
+    # once inside rank_stocks_by_relative_strength.
+    rs_data = {}
+    try:
+        from market_analyzer import rank_stocks_by_relative_strength
+        rs_data = rank_stocks_by_relative_strength(
+            list(frames.keys()), price_frames=frames)
+    except Exception as e:
+        log.warning(f"RS calculation failed: {e}")
+
+    # Analysis pass — pure CPU, no network.
+    analysed = 0
+    for ticker, df in frames.items():
+        try:
+            last = df.iloc[-1]
+            state_id = discretize_state(
+                float(last["RSI"]),
+                float(last["Vol_Ratio"]),
+                float((float(last["Close"]) - float(last["EMA_Slow"])) /
+                      float(last["EMA_Slow"]) * 100),
+                float(last["MACD_Hist"]),
             )
-            if analysis:
-                results.append(analysis)
+            regime = market_regime.get("regime_data", {}).get("regime", "NEUTRAL")
+            sec_str = market_regime.get("sector_momentum", {}).get(
+                get_ticker_sector(ticker), {}).get("strength", 0)
+            q_action = compute_state_action_score(
+                state_id, 50, regime, sec_str)
+        except Exception as e:
+            log.warning(f"state-score error {ticker}: {e}")
+            q_action = None
 
-    df_results = pd.DataFrame(results)
+        analysis = analyze_stock_setup(
+            ticker, df, params,
+            market_regime=market_regime,
+            rs_data=rs_data, q_action=q_action,
+        )
+        if analysis:
+            results.append(analysis)
+
+        analysed += 1
+        if progress_callback:
+            progress_callback(analysed / max(len(frames), 1),
+                              f"Analysing {ticker} ({analysed}/{len(frames)})")
+
+    # v3.8: coverage metadata so callers can distinguish "scanned everything,
+    # found nothing" from "the data source only gave us half the universe".
+    # Applied via a helper because DataFrame.attrs propagation across
+    # sort_values/drop/reset_index is version-dependent — we re-stamp it on
+    # every return path rather than trusting pandas to carry it.
+    def _stamp(d: pd.DataFrame) -> pd.DataFrame:
+        d.attrs["coverage"] = coverage
+        d.attrs["tickers_fetched"] = fetched
+        d.attrs["tickers_expected"] = expected
+        return d
+
+    df_results = _stamp(pd.DataFrame(results))
+
     if df_results.empty:
         return df_results
 
@@ -630,4 +701,4 @@ def screen_all_stocks(progress_callback=None, market_regime=None):
             if r["confidence"] < 75 and "GOLD BUY" in r["signal"]
             else r["signal"], axis=1)
 
-    return df_results.reset_index(drop=True)
+    return _stamp(df_results.reset_index(drop=True))

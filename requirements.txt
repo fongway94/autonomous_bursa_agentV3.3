@@ -1,5 +1,12 @@
 streamlit>=1.30.0
-yfinance>=0.2.30
+# PINNED (was yfinance>=0.2.30). Streamlit Cloud reinstalls deps on redeploy,
+# so `>=` silently pulled whatever yfinance shipped most recently. Between
+# 0.2.30 and 1.5.x the HTTP stack was swapped from `requests` to `curl_cffi`
+# (Yahoo began TLS-fingerprinting plain requests traffic), and Ticker.history
+# became (*args, **kwargs) so bad kwargs now fail at runtime instead of import.
+# An unnoticed major bump = silent scan degradation. Bump deliberately, after
+# a green CI run.
+yfinance==1.5.2
 pandas>=2.0.0
 numpy>=1.24.0
 plotly>=5.15.0
