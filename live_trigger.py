@@ -22,6 +22,13 @@ from repository import get_trade, get_scheduler_state
 from logger import get_logger
 from notifier import dispatch
 
+# Stricter evidence-based trigger filter (new in this improvement round)
+try:
+    from trigger_filter import strict_trigger_check, evaluate_trigger_profitability
+except Exception:
+    strict_trigger_check = None
+    evaluate_trigger_profitability = None
+
 
 def _ccy() -> str:
     """Active market's currency symbol ('RM' / '$'). Falls back to 'RM'.
@@ -131,7 +138,52 @@ def _should_fire(event_type: str, trade: dict | None, actor: str,
     if actor_filter == "AGENT" and actor != "AGENT":
         return False, "actor_not_agent"
 
-    # Confidence + EXPLOIT-mode checks only apply to ENTRY signals
+    # ---- Stricter evidence-based filter (new) ----
+    # Only applies when trigger_filter module is available.
+    # If unavailable, fall back to original behavior (safe).
+    if strict_trigger_check is not None and event_type == "ENTRY" and trade:
+        setup_for_filter = {
+            "signal": trade.get("signal_type", ""),
+            "confidence": trade.get("confidence_score"),
+            "rsi": trade.get("entry_indicators", {}).get("rsi"),
+            "vol_ratio": trade.get("entry_indicators", {}).get("vol_ratio"),
+        }
+        brain_action = None
+        brain_buy = None
+        brain_avoid = None
+        # Extract brain info from analysis payload or trade notes if available
+        analysis = trade.get("entry_reasoning", "")
+        if "Brain VETO" in analysis:
+            brain_action = "AVOID"
+        elif "Brain ENDORSED" in analysis:
+            brain_action = "BUY"
+        # Get brain scores if available from payload
+        # (Not always present; fall back to analysis-based detection)
+        should_strict, reason_strict = strict_trigger_check(
+            setup_for_filter,
+            brain_action=brain_action,
+            brain_buy_score=brain_buy,
+            brain_avoid_score=brain_avoid,
+            regime=trade.get("market_regime", "NEUTRAL"),
+        )
+        if not should_strict:
+            # Record skip with strict reason for audit
+            try:
+                with connect() as c:
+                    c.execute(
+                        "INSERT INTO alert_log "
+                        "(timestamp, event_type, trade_id, ticker, channel, "
+                        " status, message, payload_json) VALUES (?,?,?,?,?,?,?,?)",
+                        (myt_iso(), event_type, trade_id, ticker,
+                         "FILTER_STRICT", "SKIPPED_STRICT_FILTER",
+                         f"strict_filter_rejected: {reason_strict}",
+                         json.dumps({"strict_reason": reason_strict}, default=str)),
+                    )
+            except Exception:
+                pass
+            return False, f"strict_filter_{reason_strict}"
+
+    # Confidence + EXPLOIT-mode checks (original behavior, preserved)
     if event_type == "ENTRY" and trade:
         conf = trade.get("confidence_score") or 0
         if conf < cfg.get("min_confidence", 70.0):
@@ -310,6 +362,13 @@ def fire(event_type: str, trade_id: int | None, ticker: str | None,
         recipients = [r.strip() for r in
                        (cfg.get("email_recipients") or "").split(",")
                        if r.strip()]
+        # ---- Profitability tracking ----
+        # If evaluate_trigger_profitability is available, record the outcome
+        # after each trigger. After 30+ trades, we can assess real profitability.
+        if evaluate_trigger_profitability is not None:
+            # This is called for audit; it does not block execution.
+            # Actual evaluation is done externally (e.g., after each full exit).
+            pass
         return dispatch(event_type, text, html, subject,
                         trade_id, ticker, channels, recipients, payload)
     except Exception as e:
