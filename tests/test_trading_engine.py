@@ -149,3 +149,159 @@ def test_full_exit_loss_marked_correctly():
     assert t["status"] == "CLOSED"
     assert t["outcome"] == "LOSS"
     assert (t["realized_pnl"] or 0) < 0
+
+
+# ---------------------------------------------------------------------------
+# v3.8 — Ratcheting (chandelier) trailing stop
+# ---------------------------------------------------------------------------
+
+def _settle_lookup(price, high=None, low=None):
+    high = high if high is not None else price
+    low = low if low is not None else price
+    return {"0166.KL": {"price": price, "high": high, "low": low}}
+
+
+def _ratchet_trade(atr=0.05, highest=3.16, trailing=3.134):
+    """An ACTIVE trade as if entered at 3.00 with trail already armed at TP1."""
+    from db import myt_iso
+    from repository import insert_trade
+
+    return insert_trade({
+        "ticker": "0166.KL", "name": "Inari", "sector": "Technology",
+        "signal_type": "TEST", "entry_price": 3.0, "stop_loss": 2.85,
+        "tp1": 3.15, "tp2": 3.60, "tp3": 3.90,  # targets far away — no interference
+        "shares": 100, "lots": 1, "cost": 300.0, "fee": 0.45,
+        "total_outlay": 300.45, "risk_per_share": 0.15, "actual_risk_pct": 5.0,
+        "status": "ACTIVE", "phase": "FULL",
+        "shares_remaining": 100, "logged_at": myt_iso(),
+        "highest_price": highest, "lowest_price": 2.95,
+        "trailing_stop": trailing,
+        "entry_indicators": {"atr": atr} if atr else {},
+    })
+
+
+def test_trail_ratchets_up_only_off_yesterdays_peak():
+    """Chandelier lags one cycle: today's high tightens tomorrow's trail."""
+    from trading_engine import auto_settle_trades, TRAIL_ATR_MULT
+    from repository import get_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=3.16, trailing=3.134)
+
+    # Day A: new high 3.30 — ratchet still uses yesterday's peak (3.16):
+    # candidate 3.16 - 2.5x0.05 = 3.035 < trail 3.134 → no move.
+    auto_settle_trades(_settle_lookup(3.28, high=3.30, low=3.20),
+                       _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "ACTIVE"
+    assert t["trailing_stop"] == 3.134
+    assert t["highest_price"] == 3.30
+
+    # Day B: now the 3.30 peak is "yesterday" → trail tightens to 3.175.
+    auto_settle_trades(_settle_lookup(3.28, high=3.29, low=3.19),
+                       _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "ACTIVE"
+    assert t["trailing_stop"] == round(3.30 - TRAIL_ATR_MULT * 0.05, 3)
+
+
+def test_trail_never_moves_down():
+    from trading_engine import auto_settle_trades
+    from repository import get_trade
+
+    # Candidate from a faded peak (3.20 - 2.5x0.05 = 3.075) is BELOW the
+    # current trail 3.129 — a naive implementation would lower the stop.
+    tid = _ratchet_trade(atr=0.05, highest=3.20, trailing=3.129)
+    auto_settle_trades(_settle_lookup(3.30, high=3.40, low=3.15),
+                       _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "ACTIVE"
+    assert t["trailing_stop"] == 3.129
+
+
+def test_trail_fallback_pct_when_atr_missing():
+    """Trades without entry ATR (e.g. legacy/manual) use fixed % distance."""
+    from trading_engine import auto_settle_trades, TRAIL_FALLBACK_PCT
+    from repository import get_trade
+
+    tid = _ratchet_trade(atr=None, highest=3.60, trailing=3.40)
+    auto_settle_trades(_settle_lookup(3.58, high=3.59, low=3.50),
+                       _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "ACTIVE"
+    assert t["trailing_stop"] == round(3.60 * (1 - TRAIL_FALLBACK_PCT / 100), 3)
+
+
+def test_trail_hit_same_day_uses_tightened_level():
+    """Give-back after a peak fills at the tightened chandelier, a WIN."""
+    from trading_engine import auto_settle_trades
+    from repository import get_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=3.30, trailing=3.134)
+    res = auto_settle_trades(_settle_lookup(3.12, high=3.29, low=3.10),
+                             _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "CLOSED"
+    assert t["outcome"] == "WIN"          # trail 3.175 > entry 3.00
+    assert t["shares_remaining"] == 0
+    # Filled at tightened trail 3.175 minus a touch of sell slippage.
+    assert 3.165 < t["exit_price"] <= 3.175
+    assert any(s["type"] == "TRAIL" for s in res["settled"])
+
+
+def test_tp1_arm_still_sets_trail_once():
+    """Regression: arm-at-TP1 is unchanged; ratchet skips un-armed trades."""
+    from trading_engine import auto_settle_trades
+    from repository import get_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=None, trailing=None)
+    auto_settle_trades(_settle_lookup(3.14, high=3.16, low=3.10),
+                       _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "ACTIVE"
+    assert t["trailing_stop"] == round(max(3.0 * 1.005, 3.14 * 0.995), 3)
+
+
+def test_ratchet_also_protects_partial_runner():
+    """After the TP2 partial, the remaining runner's trail keeps ratcheting."""
+    from trading_engine import auto_settle_trades, TRAIL_ATR_MULT
+    from repository import get_trade, update_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=3.30, trailing=3.134)
+    update_trade(tid, {"phase": "PARTIAL", "shares_remaining": 100})
+    auto_settle_trades(_settle_lookup(3.28, high=3.29, low=3.19),
+                       _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "ACTIVE"
+    assert t["trailing_stop"] == round(3.30 - TRAIL_ATR_MULT * 0.05, 3)
+
+
+def test_split_adjusts_entry_atr_for_chandelier():
+    """A 2:1 split halves all prices — the stored ATR must halve too,
+    or the trail distance would be 2x too wide post-split."""
+    from trading_engine import apply_split_to_trade
+    from repository import get_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=3.16, trailing=3.134)
+    apply_split_to_trade(tid, ratio=2.0, ex_date="2026-08-07")
+    t = get_trade(tid)
+    assert t["entry_price"] == 1.5
+    assert t["trailing_stop"] == round(3.134 / 2, 4)
+    assert t["highest_price"] == round(3.16 / 2, 4)
+    assert t["shares"] == 200
+    assert t["entry_indicators"]["atr"] == round(0.05 / 2, 6)
+
+
+def test_climax_exit_uses_profile_threshold_safely():
+    """ema50 present in lookup must not crash the settle loop (climax path)."""
+    from trading_engine import auto_settle_trades
+    from repository import get_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=3.20, trailing=3.10)
+    res = auto_settle_trades(
+        {"0166.KL": {"price": 3.30, "high": 3.35, "low": 3.25,
+                     "ema50": 2.00}},   # 65% stretch → climax exit
+        _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "CLOSED"
+    assert t["outcome"] == "WIN"
+    assert any(s["type"] == "CLIMAX" for s in res["settled"])

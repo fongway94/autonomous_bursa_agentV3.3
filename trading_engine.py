@@ -21,7 +21,8 @@ Improvements vs v1 (still guarded by tests)
 * Board-lot enforcement (100 for Bursa, 1 for US — both honoured by round_to_lot).
 * Configurable slippage model (linear in trade size / ADV).
 * MAE/MFE tracking per active trade.
-* Trailing stop set exactly once (idempotent).
+* v3.8: Trailing stop now RATCHETS upward as new highs form (chandelier
+  style, volatility-scaled by entry ATR) — it never moves back down.
 * Time-exit handled by regime (5/7/14 days).
 * All state in SQLite via repository — no JSON race conditions.
 * Every action emits a structured trade_log row.
@@ -52,6 +53,20 @@ SLIPPAGE_K_RM = 50_000                 # MY-flavoured legacy constant
 SLIPPAGE_LIQUIDITY_CAP_BPS = 80        # MY hard cap, still applied when MY active
 LOT_SIZE = 100                         # MY default (Bursa board lot)
 
+# -------------------------------------------------------------------------
+# v3.8 — Ratcheting (chandelier) trailing stop
+# -------------------------------------------------------------------------
+# Classic swing-trade management: once the trail is armed (at TP1, unchanged),
+# it ratchets UP as new highs form — distance = k × entry ATR (Chuck LeBeau
+# chandelier; 2.5xATR is the standard swing setting, tighter than position
+# trading's 3x). Volatility-scaling means it self-adapts across MY small caps
+# and US 3x ETFs. NEVER moves back down.
+# The high-water mark lags one cycle (trails off *yesterday's* peak) so the
+# same-bar high can't tighten the stop and trigger it intrabar — no lookahead.
+TRAIL_ATR_MULT = 2.5          # chandelier distance multiplier (swing standard)
+TRAIL_FALLBACK_PCT = 3.0      # % below high-water when entry ATR is unknown
+TRAIL_MIN_MOVE_PCT = 0.10     # skip persists/log churn for <0.1% improvements
+
 
 def _profile():
     """Active MarketProfile or a tiny shim with MY defaults."""
@@ -67,6 +82,7 @@ def _profile():
             lot_size = 100
             fee_rate = 0.0015
             min_fee = 0.0
+            climax_stretch_pct = 20.0   # MY default per FIX #3-2
         return _Shim()
 
 
@@ -565,6 +581,8 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
         sl = t["stop_loss"]
         tp1, tp2, tp3 = t["tp1"], t["tp2"], t["tp3"]
         trailing = t.get("trailing_stop")
+        # High-water mark EXCLUDING today (trails off yesterday's peak).
+        prior_highest = float(t.get("highest_price") or entry)
 
         # Track MAE/MFE
         highest = max(t.get("highest_price") or entry, high_today)
@@ -581,6 +599,33 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
                 (current_price - entry) * t["shares_remaining"], 2),
         })
 
+        # ----- v3.8: Ratchet the trailing stop (never moves down) -----
+        # Distance scales with the stock's own volatility (entry ATR), the
+        # same measure used to size SL/TPs at entry. Runs BEFORE today's
+        # exit checks so a give-back today fills at the tightened level.
+        if trailing is not None:
+            try:
+                atr = float(
+                    (t.get("entry_indicators") or {}).get("atr") or 0)
+            except (TypeError, ValueError):
+                atr = 0.0
+            if atr > 0:
+                dist, basis = TRAIL_ATR_MULT * atr, f"{TRAIL_ATR_MULT}xATR"
+            else:
+                dist = prior_highest * TRAIL_FALLBACK_PCT / 100.0
+                basis = f"{TRAIL_FALLBACK_PCT}% fixed"
+            candidate = round(prior_highest - dist, 3)
+            min_move = trailing * TRAIL_MIN_MOVE_PCT / 100.0
+            if candidate >= trailing + min_move:
+                update_trade(t["id"], {"trailing_stop": candidate})
+                log_trade_event(
+                    "TRAIL_RATCHET", trade_id=t["id"], ticker=ticker,
+                    actor=actor,
+                    payload={"trailing_was": trailing,
+                             "trailing_stop": candidate,
+                             "high_water": prior_highest, "basis": basis})
+                trailing = candidate  # exit checks below use tightened level
+
         # ----- Exit conditions (priority order) -----
 
         # Climax Run: price stretches too far above 50-day EMA
@@ -589,7 +634,7 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
         ema50 = px.get("ema50")
         if ema50 is not None:
             stretch_pct = (current_price - ema50) / ema50 * 100
-            climax_thresh = float(_profile().climax_stretch_pct)
+            climax_thresh = float(getattr(_profile(), "climax_stretch_pct", 20.0))
             if stretch_pct >= climax_thresh:
                 # Fix: compute outcome from actual price vs entry (same as time exit),
                 # not hardcoded "WIN" — a climax at a lower price is a loss.
@@ -653,7 +698,13 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
 
         # 5. TP1 — set trailing stop (once)
         if high_today >= tp1 and t.get("trailing_stop") is None:
-            buffer_pct = 0.5
+            # v3.8: honour the risk-manager param (was hardcoded 0.5)
+            try:
+                from risk_manager import load_risk_params
+                buffer_pct = float(
+                    load_risk_params().get("trailing_stop_buffer_pct", 0.5))
+            except Exception:
+                buffer_pct = 0.5
             new_trail = max(entry * (1 + buffer_pct / 100),
                             current_price * (1 - buffer_pct / 100))
             update_trade(t["id"], {"trailing_stop": round(new_trail, 3)})
@@ -799,6 +850,25 @@ def apply_split_to_trade(trade_id: int, ratio: float,
 
         prev_factor = float(before.get("cumulative_split_factor") or 1.0)
         after["cumulative_split_factor"] = round(prev_factor * ratio, 6)
+
+        # v3.8: price-unit entry indicators must scale with the split too —
+        # the chandelier trail distances itself by entry ATR, which is an
+        # absolute price quantity (RM). Ratio-adjusted prices with an
+        # unadjusted ATR would mis-size the trail by the split ratio.
+        try:
+            import json as _json
+            inds = _json.loads(before.get("entry_indicators_json") or "{}")
+            if isinstance(inds, dict):
+                for key in ("atr", "support", "resistance", "ema_trend"):
+                    v = inds.get(key)
+                    try:
+                        if v is not None and float(v) != 0.0:
+                            inds[key] = round(float(v) / ratio, 6)
+                    except (TypeError, ValueError):
+                        pass
+                after["entry_indicators_json"] = _json.dumps(inds, default=str)
+        except Exception:
+            pass  # never let indicator cosmetics block a real adjustment
 
         old_notes = before.get("notes") or ""
         audit_note = (

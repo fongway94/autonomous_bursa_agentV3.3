@@ -233,6 +233,15 @@ def _icon(event: str) -> str:
     }.get(event, "🔔")
 
 
+def _outcome_icon(outcome: str) -> str:
+    """Leading icon for exit alerts reflects the RESULT, not the event.
+
+    A FULL EXIT or TRAILING STOP can be a win, breakeven, or a loss —
+    the icon should say which at a glance.
+    """
+    return {"WIN": "✅", "BREAKEVEN": "⚪", "LOSS": "❌"}.get(outcome, "🔔")
+
+
 def _format_entry(t: dict, ss: dict) -> tuple[str, str, str]:
     """Returns (text, html, subject)."""
     regime = t.get("market_regime") or "—"
@@ -286,7 +295,7 @@ def _format_exit(t: dict, event_type: str, exit_price: float,
 
     cur = _ccy()
     text = (
-        f"{_icon(event_type)} {label} — {t['ticker']}\n"
+        f"{_outcome_icon(outcome)} {label} — {t['ticker']}\n"
         f"Time: {t.get('closed_at','')} MYT\n"
         f"Action: SELL {t.get('shares',0):,} shares @ {cur} {exit_price:.3f}\n"
         f"Result: {outcome} {cur} {pnl:+,.2f} | {pnl_pct:+.2f}% on cost\n"
