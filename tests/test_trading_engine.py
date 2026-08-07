@@ -259,3 +259,49 @@ def test_tp1_arm_still_sets_trail_once():
     t = get_trade(tid)
     assert t["status"] == "ACTIVE"
     assert t["trailing_stop"] == round(max(3.0 * 1.005, 3.14 * 0.995), 3)
+
+
+def test_ratchet_also_protects_partial_runner():
+    """After the TP2 partial, the remaining runner's trail keeps ratcheting."""
+    from trading_engine import auto_settle_trades, TRAIL_ATR_MULT
+    from repository import get_trade, update_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=3.30, trailing=3.134)
+    update_trade(tid, {"phase": "PARTIAL", "shares_remaining": 100})
+    auto_settle_trades(_settle_lookup(3.28, high=3.29, low=3.19),
+                       _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "ACTIVE"
+    assert t["trailing_stop"] == round(3.30 - TRAIL_ATR_MULT * 0.05, 3)
+
+
+def test_split_adjusts_entry_atr_for_chandelier():
+    """A 2:1 split halves all prices — the stored ATR must halve too,
+    or the trail distance would be 2x too wide post-split."""
+    from trading_engine import apply_split_to_trade
+    from repository import get_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=3.16, trailing=3.134)
+    apply_split_to_trade(tid, ratio=2.0, ex_date="2026-08-07")
+    t = get_trade(tid)
+    assert t["entry_price"] == 1.5
+    assert t["trailing_stop"] == round(3.134 / 2, 4)
+    assert t["highest_price"] == round(3.16 / 2, 4)
+    assert t["shares"] == 200
+    assert t["entry_indicators"]["atr"] == round(0.05 / 2, 6)
+
+
+def test_climax_exit_uses_profile_threshold_safely():
+    """ema50 present in lookup must not crash the settle loop (climax path)."""
+    from trading_engine import auto_settle_trades
+    from repository import get_trade
+
+    tid = _ratchet_trade(atr=0.05, highest=3.20, trailing=3.10)
+    res = auto_settle_trades(
+        {"0166.KL": {"price": 3.30, "high": 3.35, "low": 3.25,
+                     "ema50": 2.00}},   # 65% stretch → climax exit
+        _market_regime(), actor="TEST")
+    t = get_trade(tid)
+    assert t["status"] == "CLOSED"
+    assert t["outcome"] == "WIN"
+    assert any(s["type"] == "CLIMAX" for s in res["settled"])

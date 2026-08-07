@@ -82,6 +82,7 @@ def _profile():
             lot_size = 100
             fee_rate = 0.0015
             min_fee = 0.0
+            climax_stretch_pct = 20.0   # MY default per FIX #3-2
         return _Shim()
 
 
@@ -633,7 +634,7 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
         ema50 = px.get("ema50")
         if ema50 is not None:
             stretch_pct = (current_price - ema50) / ema50 * 100
-            climax_thresh = float(_profile().climax_stretch_pct)
+            climax_thresh = float(getattr(_profile(), "climax_stretch_pct", 20.0))
             if stretch_pct >= climax_thresh:
                 # Fix: compute outcome from actual price vs entry (same as time exit),
                 # not hardcoded "WIN" — a climax at a lower price is a loss.
@@ -697,7 +698,13 @@ def auto_settle_trades(price_lookup: dict, market_regime: dict,
 
         # 5. TP1 — set trailing stop (once)
         if high_today >= tp1 and t.get("trailing_stop") is None:
-            buffer_pct = 0.5
+            # v3.8: honour the risk-manager param (was hardcoded 0.5)
+            try:
+                from risk_manager import load_risk_params
+                buffer_pct = float(
+                    load_risk_params().get("trailing_stop_buffer_pct", 0.5))
+            except Exception:
+                buffer_pct = 0.5
             new_trail = max(entry * (1 + buffer_pct / 100),
                             current_price * (1 - buffer_pct / 100))
             update_trade(t["id"], {"trailing_stop": round(new_trail, 3)})
@@ -843,6 +850,25 @@ def apply_split_to_trade(trade_id: int, ratio: float,
 
         prev_factor = float(before.get("cumulative_split_factor") or 1.0)
         after["cumulative_split_factor"] = round(prev_factor * ratio, 6)
+
+        # v3.8: price-unit entry indicators must scale with the split too —
+        # the chandelier trail distances itself by entry ATR, which is an
+        # absolute price quantity (RM). Ratio-adjusted prices with an
+        # unadjusted ATR would mis-size the trail by the split ratio.
+        try:
+            import json as _json
+            inds = _json.loads(before.get("entry_indicators_json") or "{}")
+            if isinstance(inds, dict):
+                for key in ("atr", "support", "resistance", "ema_trend"):
+                    v = inds.get(key)
+                    try:
+                        if v is not None and float(v) != 0.0:
+                            inds[key] = round(float(v) / ratio, 6)
+                    except (TypeError, ValueError):
+                        pass
+                after["entry_indicators_json"] = _json.dumps(inds, default=str)
+        except Exception:
+            pass  # never let indicator cosmetics block a real adjustment
 
         old_notes = before.get("notes") or ""
         audit_note = (
