@@ -2238,11 +2238,11 @@ with tab_settings:
     atr_mult = c1.number_input("ATR Stop Multiplier",
                                 value=float(p.get("atr_multiplier_stop", 1.5)),
                                 step=0.1)
-    min_price = c2.number_input("Min Price (RM)",
+    min_price = c2.number_input(f"Min Price ({_ccy})",
                                  value=float(p.get("min_price", 0.30)),
                                  step=0.05)
-    max_price = c3.number_input("Max Price (RM)",
-                                 value=float(p.get("max_price", 4.00)),
+    max_price = c3.number_input(f"Max Price ({_ccy})",
+                                 value=float(p.get("max_price", 200.00)),
                                  step=0.5)
     shariah_only = st.checkbox(
         "🕌 Shariah-compliant only (filter out conventional banks, brewers, gaming)",

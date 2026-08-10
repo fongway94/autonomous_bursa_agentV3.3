@@ -90,9 +90,12 @@ WATCHDOG_TIMEOUT_OWNER_SENTINEL = -1    # forces owner_pid mismatch
 CYCLE_DURATION_WARN_SEC = 300           # 5 min — soft warn, no action
 
 # v3.8: minimum fraction of the watchlist that must return data for a scan to
-# be trusted for auto-entry and for overwriting scan_cache. 0.80 tolerates a
-# handful of genuinely delisted/suspended tickers while catching real outages.
-MIN_SCAN_COVERAGE = 0.80
+# be trusted for auto-entry and for overwriting scan_cache. 0.65 tolerates
+# yfinance throttling on shared egress IPs while still catching genuine
+# outages. The previous 0.80 was too aggressive: bursting 8 workers to fetch
+# 2y of data routinely hit Yahoo's rate limit, dropping 15-25% of tickers,
+# which killed auto-entry even though the surviving 75% was tradeable.
+MIN_SCAN_COVERAGE = 0.65
 
 
 def _gc_orphaned_thread_ids() -> None:

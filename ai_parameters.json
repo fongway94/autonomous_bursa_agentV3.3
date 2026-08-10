@@ -9,5 +9,5 @@
     "atr_period": 14,
     "atr_multiplier_stop": 1.5,
     "min_price": 0.30,
-    "max_price": 4.00
+    "max_price": 200.00
 }
