@@ -733,12 +733,23 @@ def init_db():
                     default_params.update(json.load(f))
             except Exception:
                 pass
-        # US-specific price-range override: leveraged ETFs run USD 10–200, not RM 0.30–4.00.
+        # Market-specific price-range overrides.
+        # These ensure the screener covers the active market's actual price
+        # levels. ai_parameters.json may carry MY-centric values (e.g.
+        # max_price=4.00) that filter out every blue-chip in other markets.
         try:
             from market_profiles import active_market_code
-            if active_market_code() == "US":
+            _mkt = active_market_code()
+            if _mkt == "US":
+                # Leveraged ETFs run USD 10-900; mega-caps up to ~900.
+                # Cover the full range so SPY/QQQ/META are not filtered.
                 default_params["min_price"] = 5.00
-                default_params["max_price"] = 500.00
+                default_params["max_price"] = 2000.00
+            elif _mkt == "MY":
+                # Bursa blue-chips range RM 1-30+.  The old 0.30-4.00 band
+                # filtered out Maybank, Tenaga, CIMB, IHH — every liquid name.
+                default_params["min_price"] = 0.30
+                default_params["max_price"] = 200.00
         except Exception:
             pass
         c.execute(

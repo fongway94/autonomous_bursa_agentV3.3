@@ -226,6 +226,23 @@ def analyze_stock_setup(ticker, df, params,
 
     min_price = params.get("min_price", 0.30)
     max_price = params.get("max_price", 4.00)
+    # Market-aware price-range safety net: expand the band to cover the active
+    # market's actual price levels.  This prevents a stale ai_parameters.json
+    # (max_price=4.00) or an old Gist restore from silently filtering out
+    # every blue-chip.  The profile doesn't carry price-range fields, so we
+    # use the market code directly.
+    try:
+        from market_profiles import active_market_code
+        _mkt = active_market_code()
+    except Exception:
+        _mkt = "MY"
+    if _mkt == "US":
+        # US mega-caps & leveraged ETFs: $5 – $900+
+        max_price = max(max_price, 2000.0)
+        min_price = min(min_price, 5.0) if min_price > 5.0 else min_price
+    elif _mkt == "MY":
+        # Bursa blue-chips: RM 0.30 – RM 30+
+        max_price = max(max_price, 200.0)
     is_in_price_range = min_price <= close <= max_price
 
     ema_mid = float(last.get("EMA_Mid", close))
@@ -448,14 +465,16 @@ def analyze_stock_setup(ticker, df, params,
                         base_confidence += 4 * q_modifier
         else:
             signal_type = "HOLD / WATCH"
-            if not is_in_price_range:
-                reasoning.append(f"Price {ccy} {close:.2f} outside range "
-                                 f"({min_price:.2f}–{max_price:.2f}).")
-            else:
-                reasoning.append("Uptrend intact, no active trigger.")
+            reasoning.append("Uptrend intact, no active trigger.")
     else:
         signal_type = "NEUTRAL"
-        reasoning.append("No clear directional setup.")
+        if is_long_term_uptrend and not is_in_price_range:
+            reasoning.append(
+                f"Price {ccy} {close:.2f} outside tradeable range "
+                f"({min_price:.2f}–{max_price:.2f}). Uptrend intact but "
+                f"price band blocks entry. Adjust in ⚙️ Settings.")
+        else:
+            reasoning.append("No clear directional setup.")
 
     # Bias multipliers
     biases = load_bias_state()
@@ -673,6 +692,22 @@ def screen_all_stocks(progress_callback=None, market_regime=None):
         return d
 
     df_results = _stamp(pd.DataFrame(results))
+
+    # Diagnostic: count signals by type so the user can see what the screener
+    # found (or didn't find) without digging through individual rows.
+    if not df_results.empty:
+        gold_buys = len(df_results[df_results["signal"].str.contains("GOLD BUY", na=False)])
+        price_blocked = len(df_results[
+            df_results["reasoning"].str.contains("outside tradeable range", na=False)])
+        log.info("screener: %d analysed → %d GOLD BUY, %d price-band blocked, "
+                 "coverage %.0f%%",
+                 len(df_results), gold_buys, price_blocked, coverage * 100)
+        if price_blocked > 0 and gold_buys == 0:
+            log.warning("screener: %d stock(s) in uptrend but ALL blocked by "
+                        "price band (min=%.2f, max=%.2f). Adjust in Settings.",
+                        price_blocked,
+                        params.get("min_price", 0.30),
+                        params.get("max_price", 4.00))
 
     if df_results.empty:
         return df_results

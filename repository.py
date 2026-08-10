@@ -68,13 +68,23 @@ def load_parameters() -> dict:
     with connect(readonly=True) as c:
         row = c.execute("SELECT payload FROM parameters WHERE id=1").fetchone()
     if row is None:
-        return {
+        params = {
             "ema_trend": 200, "ema_fast": 10, "ema_slow": 20,
             "rsi_oversold_pullback": 40.0, "rsi_overbought": 70.0,
             "volume_surge_ratio": 1.5, "breakout_period": 20,
             "atr_period": 14, "atr_multiplier_stop": 1.5,
-            "min_price": 0.30, "max_price": 4.00,
+            "min_price": 0.30, "max_price": 200.00,
         }
+        # Market-aware fallback: expand price band so the active market's
+        # stocks aren't silently filtered out.
+        try:
+            from market_profiles import active_market_code
+            if active_market_code() == "US":
+                params["min_price"] = 5.00
+                params["max_price"] = 2000.00
+        except Exception:
+            pass
+        return params
     return json.loads(row["payload"])
 
 
